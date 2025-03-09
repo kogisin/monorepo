@@ -3,10 +3,10 @@
 //!
 //! # Terminology
 //!
-//! An MMR is a list of perfect binary trees of strictly decreasing height. The roots of these trees
-//! are called the "peaks" of the MMR. Each "element" stored in the MMR is represented by some leaf
-//! node in one of these perfect trees, storing a positioned hash of the element. Non-leaf nodes
-//! store a positioned hash of their children.
+//! An MMR is a list of perfect binary trees (aka "mountains") of strictly decreasing height. The
+//! roots of these trees are called the "peaks" of the MMR. Each "element" stored in the MMR is
+//! represented by some leaf node in one of these perfect trees, storing a positioned hash of the
+//! element. Non-leaf nodes store a positioned hash of their children.
 //!
 //! The "size" of an MMR is the total number of nodes summed over all trees.
 //!
@@ -63,15 +63,26 @@
 //! )
 //! ```
 
+use commonware_utils::array;
+use thiserror::Error;
+
 mod hasher;
 mod iterator;
+pub mod journaled;
 pub mod mem;
 pub mod verification;
 
-use thiserror::Error;
-
+/// Errors that can occur when interacting with an MMR.
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("an element required for this operation has been pruned")]
     ElementPruned,
+    #[error("metadata error: {0}")]
+    MetadataError(#[from] crate::metadata::Error<array::U64>),
+    #[error("journal error: {0}")]
+    JournalError(#[from] crate::journal::Error),
+    #[error("missing peak: {0}")]
+    MissingPeak(u64),
+    #[error("MMR is empty")]
+    Empty,
 }

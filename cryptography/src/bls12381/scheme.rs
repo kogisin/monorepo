@@ -27,7 +27,7 @@ use crate::{Array, Error, Scheme};
 use commonware_utils::{hex, SizedSerialize};
 use rand::{CryptoRng, Rng};
 use std::{
-    fmt::Display,
+    fmt::{Debug, Display},
     hash::{Hash, Hasher},
     ops::Deref,
 };
@@ -85,13 +85,15 @@ impl Scheme for Bls12381 {
 }
 
 /// BLS12-381 private key.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct PrivateKey {
     raw: [u8; group::PRIVATE_KEY_LENGTH],
     key: group::Private,
 }
 
-impl Array for PrivateKey {}
+impl Array for PrivateKey {
+    type Error = Error;
+}
 
 impl SizedSerialize for PrivateKey {
     const SERIALIZED_LEN: usize = group::PRIVATE_KEY_LENGTH;
@@ -160,6 +162,12 @@ impl TryFrom<Vec<u8>> for PrivateKey {
     }
 }
 
+impl Debug for PrivateKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", hex(&self.raw))
+    }
+}
+
 impl Display for PrivateKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", hex(&self.raw))
@@ -167,13 +175,15 @@ impl Display for PrivateKey {
 }
 
 /// BLS12-381 public key.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct PublicKey {
     raw: [u8; group::PUBLIC_KEY_LENGTH],
     key: group::Public,
 }
 
-impl Array for PublicKey {}
+impl Array for PublicKey {
+    type Error = Error;
+}
 
 impl SizedSerialize for PublicKey {
     const SERIALIZED_LEN: usize = group::PUBLIC_KEY_LENGTH;
@@ -242,6 +252,12 @@ impl TryFrom<Vec<u8>> for PublicKey {
     }
 }
 
+impl Debug for PublicKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", hex(&self.raw))
+    }
+}
+
 impl Display for PublicKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", hex(&self.raw))
@@ -249,13 +265,15 @@ impl Display for PublicKey {
 }
 
 /// BLS12-381 signature.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct Signature {
     raw: [u8; group::SIGNATURE_LENGTH],
     signature: group::Signature,
 }
 
-impl Array for Signature {}
+impl Array for Signature {
+    type Error = Error;
+}
 
 impl SizedSerialize for Signature {
     const SERIALIZED_LEN: usize = group::SIGNATURE_LENGTH;
@@ -321,6 +339,12 @@ impl TryFrom<Vec<u8>> for Signature {
     type Error = Error;
     fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
         Self::try_from(value.as_slice())
+    }
+}
+
+impl Debug for Signature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", hex(&self.raw))
     }
 }
 

@@ -1,7 +1,8 @@
 use super::{Config, Error, Translator};
 use crate::journal::variable::Journal;
 use bytes::{Buf, BufMut, Bytes};
-use commonware_runtime::{Blob, Storage};
+use commonware_runtime::{Blob, Metrics, Storage};
+use commonware_utils::{Array, SizedSerialize};
 use futures::{pin_mut, StreamExt};
 use prometheus_client::metrics::{counter::Counter, gauge::Gauge};
 use rangemap::RangeInclusiveSet;
@@ -10,9 +11,9 @@ use tracing::{debug, trace};
 use zstd::bulk::{compress, decompress};
 
 /// Subject of a `get` or `has` operation.
-pub enum Identifier<'a> {
+pub enum Identifier<'a, K: Array> {
     Index(u64),
-    Key(&'a [u8]),
+    Key(&'a K),
 }
 
 /// Location of a record in `Journal`.
@@ -32,7 +33,7 @@ struct Record {
 }
 
 /// Implementation of `Archive` storage.
-pub struct Archive<T: Translator, B: Blob, E: Storage<B>> {
+pub struct Archive<T: Translator, K: Array, B: Blob, E: Storage<B> + Metrics> {
     cfg: Config<T>,
     journal: Journal<B, E>,
 
@@ -56,14 +57,22 @@ pub struct Archive<T: Translator, B: Blob, E: Storage<B>> {
     gets: Counter,
     has: Counter,
     syncs: Counter,
+
+    _phantom: std::marker::PhantomData<K>,
 }
 
-impl<T: Translator, B: Blob, E: Storage<B>> Archive<T, B, E> {
+impl<T: Translator, K: Array, B: Blob, E: Storage<B> + Metrics> Archive<T, K, B, E> {
+    const PREFIX_LEN: u32 = (u64::SERIALIZED_LEN + K::SERIALIZED_LEN + u32::SERIALIZED_LEN) as u32;
+
     /// Initialize a new `Archive` instance.
     ///
     /// The in-memory index for `Archive` is populated during this call
     /// by replaying the journal.
-    pub async fn init(mut journal: Journal<B, E>, cfg: Config<T>) -> Result<Self, Error> {
+    pub async fn init(
+        context: E,
+        mut journal: Journal<B, E>,
+        cfg: Config<T>,
+    ) -> Result<Self, Error> {
         // Initialize keys and run corruption check
         let mut indices = BTreeMap::new();
         let mut keys = HashMap::new();
@@ -72,13 +81,13 @@ impl<T: Translator, B: Blob, E: Storage<B>> Archive<T, B, E> {
         {
             debug!("initializing archive");
             let stream = journal
-                .replay(cfg.replay_concurrency, Some(8 + cfg.key_len + 4))
+                .replay(cfg.replay_concurrency, Some(Self::PREFIX_LEN))
                 .await?;
             pin_mut!(stream);
             while let Some(result) = stream.next().await {
                 // Extract key from record
                 let (_, offset, len, data) = result?;
-                let (index, key) = Self::parse_prefix(cfg.key_len, data)?;
+                let (index, key) = Self::parse_prefix(data)?;
 
                 // Store index
                 indices.insert(index, Location { offset, len });
@@ -115,28 +124,25 @@ impl<T: Translator, B: Blob, E: Storage<B>> Archive<T, B, E> {
         let gets = Counter::default();
         let has = Counter::default();
         let syncs = Counter::default();
-        {
-            let mut registry = cfg.registry.lock().unwrap();
-            registry.register(
-                "items_tracked",
-                "Number of items tracked",
-                items_tracked.clone(),
-            );
-            registry.register(
-                "indices_pruned",
-                "Number of indices pruned",
-                indices_pruned.clone(),
-            );
-            registry.register("keys_pruned", "Number of keys pruned", keys_pruned.clone());
-            registry.register(
-                "unnecessary_reads",
-                "Number of unnecessary reads performed during key lookups",
-                unnecessary_reads.clone(),
-            );
-            registry.register("gets", "Number of gets performed", gets.clone());
-            registry.register("has", "Number of has performed", has.clone());
-            registry.register("syncs", "Number of syncs called", syncs.clone());
-        }
+        context.register(
+            "items_tracked",
+            "Number of items tracked",
+            items_tracked.clone(),
+        );
+        context.register(
+            "indices_pruned",
+            "Number of indices pruned",
+            indices_pruned.clone(),
+        );
+        context.register("keys_pruned", "Number of keys pruned", keys_pruned.clone());
+        context.register(
+            "unnecessary_reads",
+            "Number of unnecessary reads performed during key lookups",
+            unnecessary_reads.clone(),
+        );
+        context.register("gets", "Number of gets performed", gets.clone());
+        context.register("has", "Number of has performed", has.clone());
+        context.register("syncs", "Number of syncs called", syncs.clone());
         items_tracked.set(indices.len() as i64);
 
         // Return populated archive
@@ -155,24 +161,17 @@ impl<T: Translator, B: Blob, E: Storage<B>> Archive<T, B, E> {
             gets,
             has,
             syncs,
+            _phantom: std::marker::PhantomData,
         })
     }
 
-    fn check_key(&self, key: &[u8]) -> Result<(), Error> {
-        if key.len() != self.cfg.key_len as usize {
-            return Err(Error::InvalidKeyLength);
-        }
-        Ok(())
-    }
-
-    fn parse_prefix(key_len: u32, mut data: Bytes) -> Result<(u64, Bytes), Error> {
-        let key_len = key_len as usize;
-        if data.remaining() != 8 + key_len + 4 {
+    fn parse_prefix(mut data: Bytes) -> Result<(u64, Bytes), Error> {
+        if data.remaining() != Self::PREFIX_LEN as usize {
             return Err(Error::RecordCorrupted);
         }
-        let found = crc32fast::hash(&data[..key_len + 8]);
+        let found = crc32fast::hash(&data[..K::SERIALIZED_LEN + u64::SERIALIZED_LEN]);
         let index = data.get_u64();
-        let key = data.copy_to_bytes(key_len);
+        let key = data.copy_to_bytes(K::SERIALIZED_LEN);
         let expected = data.get_u32();
         if found != expected {
             return Err(Error::RecordCorrupted);
@@ -180,9 +179,8 @@ impl<T: Translator, B: Blob, E: Storage<B>> Archive<T, B, E> {
         Ok((index, key))
     }
 
-    fn parse_item(key_len: u32, mut data: Bytes) -> Result<(Bytes, Bytes), Error> {
-        let key_len = key_len as usize;
-        if data.remaining() < 8 + key_len + 4 {
+    fn parse_item(mut data: Bytes) -> Result<(Bytes, Bytes), Error> {
+        if data.remaining() < Self::PREFIX_LEN as usize {
             return Err(Error::RecordCorrupted);
         }
 
@@ -190,7 +188,7 @@ impl<T: Translator, B: Blob, E: Storage<B>> Archive<T, B, E> {
         data.get_u64();
 
         // Read key from data
-        let key = data.copy_to_bytes(key_len);
+        let key = data.copy_to_bytes(K::SERIALIZED_LEN);
 
         // We don't need to compute checksum here as the underlying journal
         // already performs this check for us.
@@ -261,12 +259,9 @@ impl<T: Translator, B: Blob, E: Storage<B>> Archive<T, B, E> {
 
     /// Store an item in `Archive`. Both indices and keys are assumed to both be globally unique.
     ///
-    /// If the index already exists, an error is returned. If the same key is stored multiple times
+    /// If the index already exists, put does nothing and returns. If the same key is stored multiple times
     /// at different indices (not recommended), any value associated with the key may be returned.
-    pub async fn put(&mut self, index: u64, key: &[u8], data: Bytes) -> Result<(), Error> {
-        // Check key length
-        self.check_key(key)?;
-
+    pub async fn put(&mut self, index: u64, key: K, data: Bytes) -> Result<(), Error> {
         // Check last pruned
         let oldest_allowed = self.oldest_allowed.unwrap_or(0);
         if index < oldest_allowed {
@@ -275,7 +270,7 @@ impl<T: Translator, B: Blob, E: Storage<B>> Archive<T, B, E> {
 
         // Check for existing index
         if self.indices.contains_key(&index) {
-            return Err(Error::DuplicateIndex);
+            return Ok(());
         }
 
         // If compression is enabled, compress the data before storing it.
@@ -288,14 +283,14 @@ impl<T: Translator, B: Blob, E: Storage<B>> Archive<T, B, E> {
         };
 
         // Store item in journal
-        let buf_len = 8usize
-            .checked_add(key.len())
-            .and_then(|len| len.checked_add(4))
+        let buf_len = u64::SERIALIZED_LEN
+            .checked_add(K::SERIALIZED_LEN)
+            .and_then(|len| len.checked_add(u32::SERIALIZED_LEN))
             .and_then(|len| len.checked_add(data.len()))
             .ok_or(Error::RecordTooLarge)?;
         let mut buf = Vec::with_capacity(buf_len);
         buf.put_u64(index);
-        buf.put(key);
+        buf.put(key.as_ref());
         // We store the checksum of the key because we employ partial reads from
         // the journal, which aren't verified before returning to `Archive`.
         buf.put_u32(crc32fast::hash(&buf[..]));
@@ -316,7 +311,7 @@ impl<T: Translator, B: Blob, E: Storage<B>> Archive<T, B, E> {
         self.intervals.insert(index..=index);
 
         // Store item
-        let translated_key = self.cfg.translator.transform(key);
+        let translated_key = self.cfg.translator.transform(&key);
         let entry = self.keys.entry(translated_key.clone());
         match entry {
             Entry::Occupied(entry) => {
@@ -353,7 +348,7 @@ impl<T: Translator, B: Blob, E: Storage<B>> Archive<T, B, E> {
     }
 
     /// Retrieve an item from `Archive`.
-    pub async fn get(&self, identifier: Identifier<'_>) -> Result<Option<Bytes>, Error> {
+    pub async fn get(&self, identifier: Identifier<'_, K>) -> Result<Option<Bytes>, Error> {
         match identifier {
             Identifier::Index(index) => self.get_index(index).await,
             Identifier::Key(key) => self.get_key(key).await,
@@ -379,7 +374,7 @@ impl<T: Translator, B: Blob, E: Storage<B>> Archive<T, B, E> {
             .ok_or(Error::RecordCorrupted)?;
 
         // Get key from item
-        let (_, value) = Self::parse_item(self.cfg.key_len, item)?;
+        let (_, value) = Self::parse_item(item)?;
 
         // If compression is enabled, decompress the data before returning.
         if self.cfg.compression.is_some() {
@@ -392,10 +387,7 @@ impl<T: Translator, B: Blob, E: Storage<B>> Archive<T, B, E> {
         Ok(Some(value))
     }
 
-    async fn get_key(&self, key: &[u8]) -> Result<Option<Bytes>, Error> {
-        // Check key length
-        self.check_key(key)?;
-
+    async fn get_key(&self, key: &K) -> Result<Option<Bytes>, Error> {
         // Update metrics
         self.gets.inc();
 
@@ -421,8 +413,8 @@ impl<T: Translator, B: Blob, E: Storage<B>> Archive<T, B, E> {
                     .ok_or(Error::RecordCorrupted)?;
 
                 // Get key from item
-                let (disk_key, value) = Self::parse_item(self.cfg.key_len, item)?;
-                if disk_key == key {
+                let (disk_key, value) = Self::parse_item(item)?;
+                if disk_key.as_ref() == key.as_ref() {
                     // If compression is enabled, decompress the data before returning.
                     if self.cfg.compression.is_some() {
                         return Ok(Some(
@@ -443,7 +435,7 @@ impl<T: Translator, B: Blob, E: Storage<B>> Archive<T, B, E> {
     }
 
     /// Check if an item exists in the `Archive`.
-    pub async fn has(&self, identifier: Identifier<'_>) -> Result<bool, Error> {
+    pub async fn has(&self, identifier: Identifier<'_, K>) -> Result<bool, Error> {
         self.has.inc();
         match identifier {
             Identifier::Index(index) => Ok(self.has_index(index)),
@@ -457,9 +449,6 @@ impl<T: Translator, B: Blob, E: Storage<B>> Archive<T, B, E> {
     }
 
     async fn has_key(&self, key: &[u8]) -> Result<bool, Error> {
-        // Check key length
-        self.check_key(key)?;
-
         // Create index key
         let translated_key = self.cfg.translator.transform(key);
 
@@ -477,12 +466,12 @@ impl<T: Translator, B: Blob, E: Storage<B>> Archive<T, B, E> {
                     .ok_or(Error::RecordCorrupted)?;
                 let item = self
                     .journal
-                    .get_prefix(section, location.offset, 8 + self.cfg.key_len + 4)
+                    .get_prefix(section, location.offset, Self::PREFIX_LEN)
                     .await?
                     .ok_or(Error::RecordCorrupted)?;
 
                 // Get key from item
-                let (_, item_key) = Self::parse_prefix(self.cfg.key_len, item)?;
+                let (_, item_key) = Self::parse_prefix(item)?;
                 if key == item_key {
                     return Ok(true);
                 }

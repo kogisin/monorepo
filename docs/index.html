@@ -72,12 +72,18 @@
     </div>
     <div class="content">
         <h2>Primitives</h2>
+        <h3><a href="https://docs.rs/commonware-broadcast">broadcast</a></h3>
+        <p>Disseminate data over a wide-area network.</p>
         <h3><a href="https://docs.rs/commonware-consensus">consensus</a></h3>
         <p>Order opaque messages in a Byzantine environment.</p>
         <h3><a href="https://docs.rs/commonware-cryptography">cryptography</a></h3>
         <p>Generate keys, sign arbitrary messages, and deterministically verify signatures.</p>
+        <h3><a href="https://docs.rs/commonware-deployer">deployer</a></h3>
+        <p>Deploy infrastructure across cloud providers.</p>
         <h3><a href="https://docs.rs/commonware-p2p">p2p</a></h3>
         <p>Communicate with authenticated peers over encrypted connections.</p>
+        <h3><a href="https://docs.rs/commonware-resolver">resolver</a></h3>
+        <p>Resolve data identified by a fixed-length key.</p>
         <h3><a href="https://docs.rs/commonware-runtime">runtime</a></h3>
         <p>Execute asynchronous tasks with a configurable scheduler.</p>
         <h3><a href="https://docs.rs/commonware-storage">storage</a></h3>
@@ -90,12 +96,32 @@
         <p>Send succinct consensus certificates between two networks.</p>
         <h3><a href="https://docs.rs/commonware-chat">chat</a></h3>
         <p>Send encrypted messages to a group of friends.</p>
+        <h3><a href="https://docs.rs/commonware-flood">flood</a></h3>
+        <p>Spam peers deployed to AWS EC2 with random messages.</p>
         <h3><a href="https://docs.rs/commonware-log">log</a></h3>
         <p>Commit to a secret log and agree to its hash.</p>
         <h3><a href="https://docs.rs/commonware-vrf">vrf</a></h3>
         <p>Generate bias-resistant randomness with untrusted contributors.</p>
 
         <h2>Blogs</h2>
+        <h3><a href="./blogs/commonware-deployer.html">Your p2p demo runs locally. Now what?</a></h3>
+        <div class="meta">
+            <div class="author">By <a href="https://x.com/_patrickogrady">Patrick O'Grady</a></div>
+            <div class="date">March 6, 2025</div>
+        </div>
+        <p>You've built a peer-to-peer (p2p) demo that hums along on your local machine. Peers connect, messages flow, and for a moment, you're basking in localhost bliss. Then comes the inevitable question: how do you migrate this from your laptop to the cloud?</p>
+        <h3><a href="./blogs/commonware-broadcast.html">Scaling Throughput with Linked Broadcast</a></h3>
+        <div class="meta">
+            <div class="author">By <a href="https://x.com/b_chou">Brendan Chou</a></div>
+            <div class="date">February 20, 2025</div>
+        </div>
+        <p>Blockchains require replicating data, like transactions, across nodes in the network—but doing it efficiently and reliably is a challenge. For the last decade, best-effort broadcast has been the norm, relying on consensus to guarantee delivery. The result? Wasted bandwidth by sending the same data multiple times, bottlenecked throughput by routing messages through a single node (the leader in consensus), and degraded performance whenever that node is unresponsive.</p>
+        <h3><a href="./blogs/mmr.html">Merkle Mountain Ranges for Performant Data Authentication</a></h3>
+        <div class="meta">
+            <div class="author">By <a href="https://x.com/roberto_bayardo">Roberto Bayardo</a></div>
+            <div class="date">February 13, 2025</div>
+        </div>
+        <p>Decentralized systems require the ability to prove authenticity of data received from potentially untrustworthy sources. The most well known data structure for this task is the Merkle tree, which allows one to efficiently prove inclusion of an element within a list without having to obtain the entire list from a trusted source.</p>
         <h3><a href="./blogs/threshold-simplex.html">Many-to-Many Interoperability with Threshold Simplex</a></h3>
         <div class="meta">
             <div class="author">By <a href="https://x.com/_patrickogrady">Patrick O'Grady</a></div>

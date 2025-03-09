@@ -1,11 +1,11 @@
-//! Make concurrent requests to peers limited by rate and prioritized by performance.
+//! Requester for sending rate-limited requests to peers.
 
-use commonware_cryptography::{Array, Scheme};
-use commonware_runtime::Clock;
-use commonware_utils::PrioritySet;
+use super::{Config, PeerLabel};
+use commonware_runtime::{Clock, Metrics};
+use commonware_utils::{Array, PrioritySet};
 use either::Either;
 use governor::{
-    clock::Clock as GClock, middleware::NoOpMiddleware, state::keyed::HashMapStateStore, Quota,
+    clock::Clock as GClock, middleware::NoOpMiddleware, state::keyed::HashMapStateStore,
     RateLimiter,
 };
 use rand::{seq::SliceRandom, Rng};
@@ -21,47 +21,32 @@ use std::{
 /// an issue.
 pub type ID = u64;
 
-/// Configuration for `Requester`.
-pub struct Config<C: Scheme> {
-    /// Cryptographic primitives.
-    pub crypto: C,
-
-    /// Rate limit for requests per participant.
-    pub rate_limit: Quota,
-
-    /// Initial expected performance for new participants.
-    pub initial: Duration,
-
-    /// Timeout for requests.
-    pub timeout: Duration,
-}
-
 /// Send rate-limited requests to peers prioritized by performance.
 ///
 /// Requester attempts to saturate the bandwidth (inferred by rate limit)
 /// of the most performant peers (based on our latency observations). To encourage
 /// exploration, set the value of `initial` to less than the expected latency of
 /// performant peers and/or periodically set `shuffle` in `request`.
-pub struct Requester<E: Clock + GClock + Rng, C: Scheme> {
-    runtime: E,
-    crypto: C,
+pub struct Requester<E: Clock + GClock + Rng + Metrics, P: Array> {
+    context: E,
+    public_key: P,
+    metrics: super::Metrics,
     initial: Duration,
     timeout: Duration,
 
     // Participants to exclude from requests
-    excluded: HashSet<C::PublicKey>,
+    excluded: HashSet<P>,
 
     // Rate limiter for participants
     #[allow(clippy::type_complexity)]
-    rate_limiter:
-        RateLimiter<C::PublicKey, HashMapStateStore<C::PublicKey>, E, NoOpMiddleware<E::Instant>>,
+    rate_limiter: RateLimiter<P, HashMapStateStore<P>, E, NoOpMiddleware<E::Instant>>,
     // Participants and their performance (lower is better)
-    participants: PrioritySet<C::PublicKey, u128>,
+    participants: PrioritySet<P, u128>,
 
     // Next ID to use for a request
     id: ID,
     // Outstanding requests (ID -> (participant, start time))
-    requests: HashMap<ID, (C::PublicKey, SystemTime)>,
+    requests: HashMap<ID, (P, SystemTime)>,
     // Deadlines for outstanding requests (ID -> deadline)
     deadlines: PrioritySet<ID, SystemTime>,
 }
@@ -83,13 +68,15 @@ pub struct Request<P: Array> {
     start: SystemTime,
 }
 
-impl<E: Clock + GClock + Rng, C: Scheme> Requester<E, C> {
+impl<E: Clock + GClock + Rng + Metrics, P: Array> Requester<E, P> {
     /// Create a new requester.
-    pub fn new(runtime: E, config: Config<C>) -> Self {
-        let rate_limiter = RateLimiter::hashmap_with_clock(config.rate_limit, &runtime);
+    pub fn new(context: E, config: Config<P>) -> Self {
+        let rate_limiter = RateLimiter::hashmap_with_clock(config.rate_limit, &context);
+        let metrics = super::Metrics::init(context.clone());
         Self {
-            runtime,
-            crypto: config.crypto,
+            context,
+            public_key: config.public_key,
+            metrics,
             initial: config.initial,
             timeout: config.timeout,
 
@@ -105,7 +92,7 @@ impl<E: Clock + GClock + Rng, C: Scheme> Requester<E, C> {
     }
 
     /// Indicate which participants can be sent requests.
-    pub fn reconcile(&mut self, participants: &[C::PublicKey]) {
+    pub fn reconcile(&mut self, participants: &[P]) {
         self.participants
             .reconcile(participants, self.initial.as_millis());
         self.rate_limiter.shrink_to_fit();
@@ -115,7 +102,7 @@ impl<E: Clock + GClock + Rng, C: Scheme> Requester<E, C> {
     ///
     /// Participants added to this list will never be removed (even if dropped
     /// during `reconcile`, in case they are re-added later).
-    pub fn block(&mut self, participant: C::PublicKey) {
+    pub fn block(&mut self, participant: P) {
         self.excluded.insert(participant);
     }
 
@@ -124,11 +111,11 @@ impl<E: Clock + GClock + Rng, C: Scheme> Requester<E, C> {
     /// If `shuffle` is true, the order of participants is shuffled before
     /// a request is made. This is typically used when a request to the preferred
     /// participant fails.
-    pub fn request(&mut self, shuffle: bool) -> Option<(C::PublicKey, ID)> {
+    pub fn request(&mut self, shuffle: bool) -> Option<(P, ID)> {
         // Prepare participant iterator
         let participant_iter = if shuffle {
             let mut participants = self.participants.iter().collect::<Vec<_>>();
-            participants.shuffle(&mut self.runtime);
+            participants.shuffle(&mut self.context);
             Either::Left(participants.into_iter())
         } else {
             Either::Right(self.participants.iter())
@@ -137,7 +124,7 @@ impl<E: Clock + GClock + Rng, C: Scheme> Requester<E, C> {
         // Look for a participant that can handle request
         for (participant, _) in participant_iter {
             // Check if me
-            if *participant == self.crypto.public_key() {
+            if *participant == self.public_key {
                 continue;
             }
 
@@ -156,26 +143,34 @@ impl<E: Clock + GClock + Rng, C: Scheme> Requester<E, C> {
             self.id = self.id.wrapping_add(1);
 
             // Record request issuance time
-            let now = self.runtime.current();
+            let now = self.context.current();
             self.requests.insert(id, (participant.clone(), now));
             let deadline = now.checked_add(self.timeout).expect("time overflowed");
             self.deadlines.put(id, deadline);
+
+            // Increment metric if-and-only-if request is successful
+            self.metrics.requests.inc();
+
             return Some((participant.clone(), id));
         }
         None
     }
 
     /// Calculate a participant's new priority using exponential moving average.
-    fn update(&mut self, participant: C::PublicKey, elapsed: Duration) {
+    fn update(&mut self, participant: P, elapsed: Duration) {
         let Some(past) = self.participants.get(&participant) else {
             return;
         };
         let next = past.saturating_add(elapsed.as_millis()) / 2;
+        self.metrics
+            .performance
+            .get_or_create(&PeerLabel::from(&participant))
+            .set(next as i64);
         self.participants.put(participant, next);
     }
 
     /// Drop an outstanding request regardless of who it was intended for.
-    pub fn cancel(&mut self, id: ID) -> Option<Request<C::PublicKey>> {
+    pub fn cancel(&mut self, id: ID) -> Option<Request<P>> {
         let (participant, start) = self.requests.remove(&id)?;
         self.deadlines.remove(&id);
         Some(Request {
@@ -190,7 +185,7 @@ impl<E: Clock + GClock + Rng, C: Scheme> Requester<E, C> {
     ///
     /// If the request was outstanding, a `Request` is returned that can
     /// either be resolved or timed out.
-    pub fn handle(&mut self, participant: &C::PublicKey, id: ID) -> Option<Request<C::PublicKey>> {
+    pub fn handle(&mut self, participant: &P, id: ID) -> Option<Request<P>> {
         // Confirm ID exists and is for the participant
         let (expected, _) = self.requests.get(&id)?;
         if expected != participant {
@@ -202,31 +197,33 @@ impl<E: Clock + GClock + Rng, C: Scheme> Requester<E, C> {
     }
 
     /// Resolve an outstanding request.
-    pub fn resolve(&mut self, request: Request<C::PublicKey>) {
+    pub fn resolve(&mut self, request: Request<P>) {
         // Get elapsed time
         //
         // If we can't compute the elapsed time for some reason (i.e. current time does
         // not monotonically increase), we should still credit the participant for a
         // timely response.
         let elapsed = self
-            .runtime
+            .context
             .current()
             .duration_since(request.start)
             .unwrap_or_default();
 
         // Update performance
         self.update(request.participant, elapsed);
+        self.metrics.resolves.observe(elapsed.as_secs_f64());
     }
 
     /// Timeout an outstanding request.
-    pub fn timeout(&mut self, request: Request<C::PublicKey>) {
+    pub fn timeout(&mut self, request: Request<P>) {
         // Update performance
         self.update(request.participant, self.timeout);
+        self.metrics.timeouts.inc();
     }
 
     /// Get the next outstanding ID and deadline.
     pub fn next(&self) -> Option<(ID, SystemTime)> {
-        let (id, deadline) = self.deadlines.iter().next()?;
+        let (id, deadline) = self.deadlines.peek()?;
         Some((*id, *deadline))
     }
 
@@ -235,12 +232,17 @@ impl<E: Clock + GClock + Rng, C: Scheme> Requester<E, C> {
     pub fn len(&self) -> usize {
         self.requests.len()
     }
+
+    /// Get the number of blocked participants.
+    pub fn len_blocked(&self) -> usize {
+        self.excluded.len()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_cryptography::Ed25519;
+    use commonware_cryptography::{Ed25519, Scheme};
     use commonware_runtime::deterministic::Executor;
     use commonware_runtime::Runner;
     use governor::Quota;
@@ -249,20 +251,20 @@ mod tests {
 
     #[test]
     fn test_requester_basic() {
-        // Instantiate runtime
-        let (executor, runtime, _auditor) = Executor::seeded(0);
+        // Instantiate context
+        let (executor, context, _auditor) = Executor::seeded(0);
         executor.start(async move {
             // Create requester
             let scheme = Ed25519::from_seed(0);
             let me = scheme.public_key();
             let timeout = Duration::from_secs(5);
             let config = Config {
-                crypto: scheme,
+                public_key: scheme.public_key(),
                 rate_limit: Quota::per_second(NonZeroU32::new(1).unwrap()),
                 initial: Duration::from_millis(100),
                 timeout,
             };
-            let mut requester = Requester::new(runtime.clone(), config);
+            let mut requester = Requester::new(context.clone(), config);
 
             // Request before any participants
             assert_eq!(requester.request(false), None);
@@ -279,7 +281,7 @@ mod tests {
             requester.reconcile(&[me.clone(), other.clone()]);
 
             // Get request
-            let current = runtime.current();
+            let current = context.current();
             let (participant, id) = requester.request(false).expect("failed to get participant");
             assert_eq!(id, 0);
             assert_eq!(participant, other);
@@ -294,7 +296,7 @@ mod tests {
             assert_eq!(requester.request(false), None);
 
             // Simulate processing time
-            runtime.sleep(Duration::from_millis(10)).await;
+            context.sleep(Duration::from_millis(10)).await;
 
             // Mark request as resolved with wrong participant
             assert!(requester.handle(&me, id).is_none());
@@ -313,7 +315,7 @@ mod tests {
             assert_eq!(requester.request(false), None);
 
             // Wait for rate limit to reset
-            runtime.sleep(Duration::from_secs(1)).await;
+            context.sleep(Duration::from_secs(1)).await;
 
             // Get request
             let (participant, id) = requester.request(false).expect("failed to get participant");
@@ -330,7 +332,7 @@ mod tests {
             assert_eq!(requester.request(false), None);
 
             // Sleep until reset
-            runtime.sleep(Duration::from_secs(1)).await;
+            context.sleep(Duration::from_secs(1)).await;
 
             // Get request
             let (participant, id) = requester.request(false).expect("failed to get participant");
@@ -345,7 +347,7 @@ mod tests {
             assert_eq!(requester.len(), 0);
 
             // Sleep until reset
-            runtime.sleep(Duration::from_secs(1)).await;
+            context.sleep(Duration::from_secs(1)).await;
 
             // Block participant
             requester.block(other);
@@ -357,20 +359,20 @@ mod tests {
 
     #[test]
     fn test_requester_multiple() {
-        // Instantiate runtime
-        let (executor, runtime, _auditor) = Executor::seeded(0);
+        // Instantiate context
+        let (executor, context, _auditor) = Executor::seeded(0);
         executor.start(async move {
             // Create requester
             let scheme = Ed25519::from_seed(0);
             let me = scheme.public_key();
             let timeout = Duration::from_secs(5);
             let config = Config {
-                crypto: scheme,
+                public_key: scheme.public_key(),
                 rate_limit: Quota::per_second(NonZeroU32::new(1).unwrap()),
                 initial: Duration::from_millis(100),
                 timeout,
             };
-            let mut requester = Requester::new(runtime.clone(), config);
+            let mut requester = Requester::new(context.clone(), config);
 
             // Request before any participants
             assert_eq!(requester.request(false), None);
@@ -399,7 +401,7 @@ mod tests {
             let (participant, id) = requester.request(false).expect("failed to get participant");
             assert_eq!(id, 1);
             if participant == other1 {
-                runtime.sleep(Duration::from_millis(10)).await;
+                context.sleep(Duration::from_millis(10)).await;
                 let request = requester
                     .handle(&participant, id)
                     .expect("failed to get request");
@@ -412,7 +414,7 @@ mod tests {
             assert_eq!(requester.request(false), None);
 
             // Wait for rate limit to reset
-            runtime.sleep(Duration::from_secs(1)).await;
+            context.sleep(Duration::from_secs(1)).await;
 
             // Get request
             let (participant, id) = requester.request(false).expect("failed to get participant");
@@ -432,7 +434,7 @@ mod tests {
             assert_eq!(id, 3);
 
             // Wait until eventually get slower participant
-            runtime.sleep(Duration::from_secs(1)).await;
+            context.sleep(Duration::from_secs(1)).await;
             loop {
                 // Shuffle participants
                 let (participant, _) = requester.request(true).unwrap();
@@ -441,7 +443,7 @@ mod tests {
                 }
 
                 // Sleep until reset
-                runtime.sleep(Duration::from_secs(1)).await;
+                context.sleep(Duration::from_secs(1)).await;
             }
         });
     }

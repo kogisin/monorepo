@@ -1,21 +1,27 @@
+//! Defines the inclusion `Proof` structure, functions for generating them from any MMR implementing
+//! the `Storage` trait, and functions for verifying them against a root hash.
+
 use crate::mmr::{
     hasher::Hasher,
     iterator::{PathIterator, PeakIterator},
     Error,
 };
 use bytes::{Buf, BufMut};
-use commonware_cryptography::{Array, Hasher as CHasher};
-use commonware_utils::SizedSerialize;
+use commonware_cryptography::Hasher as CHasher;
+use commonware_utils::{Array, SizedSerialize};
 use futures::future::try_join_all;
 use std::future::Future;
 
-/// Contains the information necessary for proving the inclusion of an element, or some range of
-/// elements, in the MMR from its root hash.
+/// Contains the information necessary for proving the inclusion of an element, or some range of elements, in the MMR
+/// from its root hash.
 ///
-/// The `hashes` vector contains: (1) the peak hashes other than those belonging to trees containing
-/// some elements within the range being proven, followed by: (2) the nodes in the remaining perfect
-/// trees necessary for reconstructing their peak hashes from the elements within the range. Both
-/// segments are ordered by decreasing height.
+/// The `hashes` vector contains:
+///
+/// 1: the hashes of each peak corresponding to a mountain containing no elements from the element range being proven
+/// in decreasing order of height, followed by:
+///
+/// 2: the nodes in the remaining mountains necessary for reconstructing their peak hashes from the elements within
+/// the range, ordered by the position of their parent.
 #[derive(Clone, Debug, Eq)]
 pub struct Proof<H: CHasher> {
     /// The total number of nodes in the MMR.
@@ -25,7 +31,7 @@ pub struct Proof<H: CHasher> {
     pub hashes: Vec<H::Digest>,
 }
 
-// A trait that allows generic generation of an MMR inclusion proof.
+/// A trait that allows generic generation of an MMR inclusion proof.
 pub trait Storage<H: CHasher> {
     /// Return the number of elements in the MMR.
     fn size(&self) -> impl Future<Output = Result<u64, Error>>;
@@ -172,48 +178,47 @@ impl<H: CHasher> Proof<H> {
         Some(Self { size, hashes })
     }
 
-    /// Return an inclusion proof for the specified range of elements, inclusive of both endpoints.
-    ///
-    /// Returns ElementPruned error if some element needed to generate the proof has been pruned.
-    pub async fn range_proof<S: Storage<H>>(
-        mmr: &S,
+    /// Return the list of element positions required by the range proof for the specified range of
+    /// elements, inclusive of both endpoints.
+    pub fn elements_required_for_range_proof(
+        size: u64,
         start_element_pos: u64,
         end_element_pos: u64,
-    ) -> Result<Proof<H>, Error> {
-        let mut hashes: Vec<H::Digest> = Vec::new();
+    ) -> Vec<u64> {
+        let mut positions = Vec::<u64>::new();
+
+        // Find the mountains that contain no elements from the range. The peaks of these mountains
+        // are required to prove the range, so they are added to the result.
         let mut start_tree_with_element = (u64::MAX, 0);
         let mut end_tree_with_element = (u64::MAX, 0);
-
-        // Include peak hashes only for trees that have no elements from the range, and keep track
-        // of the starting and ending trees of those that do contain some.
-        let mut node_futures = Vec::new();
-        let mut peak_iterator = PeakIterator::new(mmr.size().await?);
+        let mut peak_iterator = PeakIterator::new(size);
         while let Some(item) = peak_iterator.next() {
             if start_tree_with_element.0 == u64::MAX && item.0 >= start_element_pos {
-                // found the first tree to contain an element in the range
+                // Found the first tree to contain an element in the range
                 start_tree_with_element = item;
                 if item.0 >= end_element_pos {
-                    // start and end tree are the same
+                    // Start and end tree are the same
                     end_tree_with_element = item;
                     continue;
                 }
                 for item in peak_iterator.by_ref() {
                     if item.0 >= end_element_pos {
-                        // found the last tree to contain an element in the range
+                        // Found the last tree to contain an element in the range
                         end_tree_with_element = item;
                         break;
                     }
                 }
             } else {
-                node_futures.push(mmr.get_node(item.0));
+                // Tree is outside the range, its peak is thus required.
+                positions.push(item.0);
             }
         }
         assert!(start_tree_with_element.0 != u64::MAX);
         assert!(end_tree_with_element.0 != u64::MAX);
 
-        // For the trees containing elements in the range, add left-sibling hashes of nodes along
-        // the leftmost path, and right-sibling hashes of nodes along the rightmost path, in
-        // decreasing order of the position of the parent node.
+        // Include the positions of any left-siblings of each node on the path from peak to
+        // leftmost-leaf, and right-siblings for the path from peak to rightmost-leaf. These are
+        // added in order of decreasing parent position.
         let left_path_iter = PathIterator::new(
             start_element_pos,
             start_tree_with_element.0,
@@ -242,7 +247,26 @@ impl<H: CHasher> Proof<H> {
                 siblings.sort_by(|a, b| b.0.cmp(&a.0));
             }
         }
-        node_futures.extend(siblings.iter().map(|(_, pos)| mmr.get_node(*pos)));
+        positions.extend(siblings.into_iter().map(|(_, pos)| pos));
+        positions
+    }
+
+    /// Return an inclusion proof for the specified range of elements, inclusive of both endpoints.
+    ///
+    /// Returns ElementPruned error if some element needed to generate the proof has been pruned.
+    pub async fn range_proof<S: Storage<H>>(
+        mmr: &S,
+        start_element_pos: u64,
+        end_element_pos: u64,
+    ) -> Result<Proof<H>, Error> {
+        let mut hashes: Vec<H::Digest> = Vec::new();
+        let positions = Self::elements_required_for_range_proof(
+            mmr.size().await?,
+            start_element_pos,
+            end_element_pos,
+        );
+
+        let node_futures = positions.into_iter().map(|pos| mmr.get_node(pos));
         let hash_results = try_join_all(node_futures).await?;
         for hash_result in hash_results {
             match hash_result {
@@ -261,7 +285,7 @@ impl<H: CHasher> Proof<H> {
 
 fn peak_hash_from_range<'a, H: CHasher>(
     hasher: &mut Hasher<H>,
-    node_pos: u64,      // current node position in the tree
+    pos: u64,           // current node position in the tree
     two_h: u64,         // 2^height of the current node
     leftmost_pos: u64,  // leftmost leaf in the tree to be traversed
     rightmost_pos: u64, // rightmost leaf in the tree to be traversed
@@ -272,12 +296,12 @@ fn peak_hash_from_range<'a, H: CHasher>(
     if two_h == 1 {
         // we are at a leaf
         match elements.next() {
-            Some(element) => return Ok(hasher.leaf_hash(node_pos, element)),
+            Some(element) => return Ok(hasher.leaf_hash(pos, element)),
             None => return Err(()),
         }
     }
 
-    let left_pos = node_pos - two_h;
+    let left_pos = pos - two_h;
     let mut left_hash: Option<H::Digest> = None;
     let right_pos = left_pos + two_h - 1;
     let mut right_hash: Option<H::Digest> = None;
@@ -325,20 +349,19 @@ fn peak_hash_from_range<'a, H: CHasher>(
             None => return Err(()),
         }
     }
-    Ok(hasher.node_hash(node_pos, &left_hash.unwrap(), &right_hash.unwrap()))
+    Ok(hasher.node_hash(pos, &left_hash.unwrap(), &right_hash.unwrap()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::Proof;
+    use crate::mmr::iterator::{oldest_provable_pos, oldest_required_proof_pos, PeakIterator};
     use crate::mmr::mem::Mmr;
-    use commonware_cryptography::{sha256::Digest, Hasher, Sha256};
+    use commonware_cryptography::{hash, sha256::Digest, Sha256};
     use commonware_runtime::{deterministic::Executor, Runner};
 
     fn test_digest(v: u8) -> Digest {
-        let mut hasher = Sha256::new();
-        hasher.update(&[v]);
-        hasher.finalize()
+        hash(&[v])
     }
 
     #[test]
@@ -349,11 +372,12 @@ mod tests {
             let mut mmr = Mmr::<Sha256>::new();
             let element = Digest::from(*b"01234567012345670123456701234567");
             let mut leaves: Vec<u64> = Vec::new();
+            let mut hasher = Sha256::default();
             for _ in 0..11 {
-                leaves.push(mmr.add(&element));
+                leaves.push(mmr.add(&mut hasher, &element));
             }
 
-            let root_hash = mmr.root();
+            let root_hash = mmr.root(&mut hasher);
             let mut hasher = Sha256::default();
 
             // confirm the proof of inclusion for each leaf successfully verifies
@@ -441,12 +465,13 @@ mod tests {
             let mut mmr: Mmr<Sha256> = Mmr::default();
             let mut elements = Vec::<Digest>::new();
             let mut element_positions = Vec::<u64>::new();
+            let mut hasher = Sha256::default();
             for i in 0..49 {
                 elements.push(test_digest(i));
-                element_positions.push(mmr.add(elements.last().unwrap()));
+                element_positions.push(mmr.add(&mut hasher, elements.last().unwrap()));
             }
             // test range proofs over all possible ranges of at least 2 elements
-            let root_hash = mmr.root();
+            let root_hash = mmr.root(&mut hasher);
             let mut hasher = Sha256::default();
 
             for i in 0..elements.len() {
@@ -600,81 +625,151 @@ mod tests {
     }
 
     #[test]
-    fn test_range_proofs_after_forgetting() {
+    fn test_oldest_provable_pos() {
         let (executor, _, _) = Executor::default();
         executor.start(async move {
-
-        // create a new MMR and add a non-trivial amount (49) of elements
-        let mut mmr: Mmr<Sha256> = Mmr::default();
-        let mut elements = Vec::<Digest>::new();
-        let mut element_positions = Vec::<u64>::new();
-        for i in 0..49 {
-            elements.push(test_digest(i));
-            element_positions.push(mmr.add(elements.last().unwrap()));
-        }
-
-        // forget the max # of elements
-        assert_eq!(mmr.forget_max(), 62);
-
-        // Prune the elements from our lists that can no longer be proven after forgetting.
-        for i in 0..elements.len() {
-            if element_positions[i] > 62 {
-                elements = elements[i..elements.len()].to_vec();
-                element_positions = element_positions[i..element_positions.len()].to_vec();
-                break;
+            // create a new MMR and add a non-trivial amount (49) of elements
+            let mut mmr: Mmr<Sha256> = Mmr::default();
+            let mut elements = Vec::<Digest>::new();
+            let mut element_positions = Vec::<u64>::new();
+            let mut hasher = Sha256::default();
+            for i in 0..49 {
+                elements.push(test_digest(i));
+                element_positions.push(mmr.add(&mut hasher, elements.last().unwrap()));
             }
-        }
 
-        // test range proofs over all possible ranges of at least 2 elements
-        let root_hash = mmr.root();
-        let mut hasher = Sha256::default();
-        for i in 0..elements.len() {
-            for j in i + 1..elements.len() {
-                let start_pos = element_positions[i];
-                let end_pos = element_positions[j];
-                let range_proof = mmr.range_proof(start_pos, end_pos).await.unwrap();
-                assert!(
-                    range_proof.verify_range_inclusion(
-                        &mut hasher,
-                        &elements[i..j + 1],
-                        start_pos,
-                        end_pos,
-                        &root_hash,
-                    ),
-                    "valid range proof over remaining elements should verify successfully",
-                );
+            // For every node in the MMR, confirm that the computed oldest_provable_pos is indeed
+            // the correct boundary between being able to generate a proof for a leaf or not.
+            for i in 1..mmr.size() {
+                mmr.prune_to_pos(i);
+                let oldest_provable_pos = oldest_provable_pos(PeakIterator::new(mmr.size()), i);
+                for pos in element_positions.iter() {
+                    let proof = mmr.proof(*pos).await;
+                    if *pos < oldest_provable_pos {
+                        assert!(proof.is_err(), "proof should fail");
+                    } else {
+                        assert!(proof.is_ok(), "proof should succeed");
+                    }
+                }
             }
-        }
+        });
+    }
 
-        // add a few more nodes, forget again, and test again to make sure repeated forgetting works
-        for i in 0..37 {
-            elements.push(test_digest(i));
-            element_positions.push(mmr.add(elements.last().unwrap()));
-        }
-        assert_eq!(mmr.forget_max(), 126);
-        assert_eq!(mmr.oldest_remembered_node_pos(), 126);
-        let updated_root_hash = mmr.root();
-        for i in 0..elements.len() {
-            if element_positions[i] > 126 {
-                elements = elements[i..elements.len()].to_vec();
-                element_positions = element_positions[i..element_positions.len()].to_vec();
-                break;
+    #[test]
+    fn test_oldest_required_proof_pos() {
+        let (executor, _, _) = Executor::default();
+        executor.start(async move {
+            // create a new MMR and add a non-trivial amount (49) of elements
+            let mut mmr: Mmr<Sha256> = Mmr::default();
+            let mut elements = Vec::<Digest>::new();
+            let mut element_positions = Vec::<u64>::new();
+            let mut hasher = Sha256::default();
+            for i in 0..49 {
+                elements.push(test_digest(i));
+                element_positions.push(mmr.add(&mut hasher, elements.last().unwrap()));
             }
-        }
-        let start_pos = element_positions[0];
-        let end_pos = *element_positions.last().unwrap();
-        let range_proof = mmr.range_proof(start_pos, end_pos).await.unwrap();
-        assert!(
-            range_proof.verify_range_inclusion(
-                &mut hasher,
-                &elements,
-                start_pos,
-                end_pos,
-                &updated_root_hash,
-            ),
-            "valid range proof over remaining elements after 2 forgetting rounds should verify successfully",
-        );
-    });
+
+            // For every leaf, confirm that pruning to its oldest_required_proof_point allows us to
+            // still prove the leaf, and that pruning even a single node beyond that renders the
+            // leaf unprovable.
+            for &pos in &element_positions {
+                let oldest_required_proof_pos =
+                    oldest_required_proof_pos(PeakIterator::new(mmr.size()), pos);
+
+                let mut mmr = Mmr::default();
+                for _ in 0..49 {
+                    mmr.add(&mut hasher, elements.last().unwrap());
+                }
+                mmr.prune_to_pos(oldest_required_proof_pos);
+                let proof = mmr.proof(pos).await;
+                assert!(proof.is_ok(), "proof should succeed");
+                mmr.prune_to_pos(oldest_required_proof_pos + 1);
+                let proof = mmr.proof(pos).await;
+                assert!(proof.is_err(), "proof should fail");
+            }
+        });
+    }
+
+    #[test]
+    fn test_range_proofs_after_pruning() {
+        let (executor, _, _) = Executor::default();
+        executor.start(async move {
+            // create a new MMR and add a non-trivial amount (49) of elements
+            let mut mmr: Mmr<Sha256> = Mmr::default();
+            let mut elements = Vec::<Digest>::new();
+            let mut element_positions = Vec::<u64>::new();
+            let mut hasher = Sha256::default();
+            for i in 0..49 {
+                elements.push(test_digest(i));
+                element_positions.push(mmr.add(&mut hasher, elements.last().unwrap()));
+            }
+
+            // prune up to the first peak
+            mmr.prune_to_pos(62);
+            assert_eq!(mmr.oldest_retained_pos().unwrap(), 62);
+            assert_eq!(mmr.oldest_provable_pos().unwrap(), 62); // peaks are always their own oldest-provable-point
+
+            // Prune the elements from our lists that can no longer be proven after pruning.
+            for i in 0..elements.len() {
+                if element_positions[i] > 62 {
+                    elements = elements[i..elements.len()].to_vec();
+                    element_positions = element_positions[i..element_positions.len()].to_vec();
+                    break;
+                }
+            }
+
+            // test range proofs over all possible ranges of at least 2 elements
+            let root_hash = mmr.root(&mut hasher);
+            let mut hasher = Sha256::default();
+            for i in 0..elements.len() {
+                for j in i + 1..elements.len() {
+                    let start_pos = element_positions[i];
+                    let end_pos = element_positions[j];
+                    let range_proof = mmr.range_proof(start_pos, end_pos).await.unwrap();
+                    assert!(
+                        range_proof.verify_range_inclusion(
+                            &mut hasher,
+                            &elements[i..j + 1],
+                            start_pos,
+                            end_pos,
+                            &root_hash,
+                        ),
+                        "valid range proof over remaining elements should verify successfully",
+                    );
+                }
+            }
+
+            // add a few more nodes, prune again, and test again to make sure repeated pruning works
+            for i in 0..37 {
+                elements.push(test_digest(i));
+                element_positions.push(mmr.add(&mut hasher, elements.last().unwrap()));
+            }
+            mmr.prune_to_pos(126); // the new highest peak
+            assert_eq!(mmr.oldest_retained_pos().unwrap(), 126);
+            assert_eq!(mmr.oldest_provable_pos().unwrap(), 126); // peaks are always their own oldest-provable-point
+
+            let updated_root_hash = mmr.root(&mut hasher);
+            for i in 0..elements.len() {
+                if element_positions[i] > 126 {
+                    elements = elements[i..elements.len()].to_vec();
+                    element_positions = element_positions[i..element_positions.len()].to_vec();
+                    break;
+                }
+            }
+            let start_pos = element_positions[0];
+            let end_pos = *element_positions.last().unwrap();
+            let range_proof = mmr.range_proof(start_pos, end_pos).await.unwrap();
+            assert!(
+		range_proof.verify_range_inclusion(
+                    &mut hasher,
+                    &elements,
+                    start_pos,
+                    end_pos,
+                    &updated_root_hash,
+		),
+		"valid range proof over remaining elements after 2 pruning rounds should verify successfully",
+            );
+        });
     }
 
     #[test]
@@ -690,9 +785,10 @@ mod tests {
             let mut mmr: Mmr<Sha256> = Mmr::default();
             let mut elements = Vec::<Digest>::new();
             let mut element_positions = Vec::<u64>::new();
+            let mut hasher = Sha256::default();
             for i in 0..25 {
                 elements.push(test_digest(i));
-                element_positions.push(mmr.add(elements.last().unwrap()));
+                element_positions.push(mmr.add(&mut hasher, elements.last().unwrap()));
             }
 
             // Generate proofs over all possible ranges of elements and confirm each

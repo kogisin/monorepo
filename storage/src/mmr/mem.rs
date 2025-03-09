@@ -2,12 +2,15 @@
 
 use crate::mmr::{
     hasher::Hasher,
-    iterator::{nodes_needing_parents, PeakIterator},
+    iterator::{
+        nodes_needing_parents, oldest_provable_pos, oldest_required_proof_pos, PeakIterator,
+    },
     verification::{Proof, Storage},
     Error,
-    Error::ElementPruned,
+    Error::{ElementPruned, Empty},
 };
 use commonware_cryptography::Hasher as CHasher;
+use std::collections::HashMap;
 
 /// Implementation of `Mmr`.
 ///
@@ -16,14 +19,17 @@ use commonware_cryptography::Hasher as CHasher;
 /// The maximum number of elements that can be stored is usize::MAX
 /// (u32::MAX on 32-bit architectures).
 pub struct Mmr<H: CHasher> {
-    hasher: H,
     // The nodes of the MMR, laid out according to a post-order traversal of the MMR trees, starting
     // from the from tallest tree to shortest.
     nodes: Vec<H::Digest>,
-    // The position of the oldest element still maintained by the MMR. Will be 0 unless forgetting
-    // has been invoked. If non-zero, then proofs can only be generated for elements with positions
-    // strictly after this point.
-    oldest_remembered_pos: u64,
+
+    // The position of the oldest element still retained by the MMR. Will be 0 unless pruning has
+    // been invoked.
+    oldest_retained_pos: u64,
+
+    // The hashes of the MMR's peaks that are older than oldest_retained_pos, keyed by their
+    // position.
+    old_peaks: HashMap<u64, H::Digest>,
 }
 
 impl<H: CHasher> Default for Mmr<H> {
@@ -38,9 +44,16 @@ impl<H: CHasher> Storage<H> for Mmr<H> {
     }
 
     async fn get_node(&self, position: u64) -> Result<Option<H::Digest>, Error> {
-        match self.nodes.get(self.pos_to_index(position)) {
-            Some(node) => Ok(Some(node.clone())),
-            None => Ok(None),
+        if position < self.oldest_retained_pos {
+            match self.old_peaks.get(&position) {
+                Some(node) => Ok(Some(node.clone())),
+                None => Ok(None),
+            }
+        } else {
+            match self.nodes.get(self.pos_to_index(position)) {
+                Some(node) => Ok(Some(node.clone())),
+                None => Ok(None),
+            }
         }
     }
 }
@@ -49,131 +62,236 @@ impl<H: CHasher> Mmr<H> {
     /// Return a new (empty) `Mmr`.
     pub fn new() -> Self {
         Self {
-            hasher: H::new(),
             nodes: Vec::new(),
-            oldest_remembered_pos: 0,
+            oldest_retained_pos: 0,
+            old_peaks: HashMap::new(),
         }
     }
 
-    // Return an `Mmr` initialized with the given nodes and oldest remembered position.
-    pub fn init(nodes: Vec<H::Digest>, oldest_remembered_pos: u64) -> Self {
-        Self {
-            hasher: H::new(),
+    /// Return an `Mmr` initialized with the given nodes and oldest retained position, and hashes of
+    /// any peaks that are older than the oldest retained position.
+    pub fn init(
+        nodes: Vec<H::Digest>,
+        oldest_retained_pos: u64,
+        old_peaks: Vec<H::Digest>,
+    ) -> Self {
+        let mut s = Self {
             nodes,
-            oldest_remembered_pos,
+            oldest_retained_pos,
+            old_peaks: HashMap::new(),
+        };
+        assert!(PeakIterator::check_validity(s.size()));
+        let mut given_peak_iter = old_peaks.iter();
+        for (peak, _) in s.peak_iterator() {
+            if peak < s.oldest_retained_pos {
+                let given_peak = given_peak_iter.next().unwrap();
+                assert!(s.old_peaks.insert(peak, given_peak.clone()).is_none());
+            }
         }
+        assert!(given_peak_iter.next().is_none());
+        s
     }
 
-    /// Return the total number of nodes in the MMR, independent of any forgetting.
+    /// Return the total number of nodes in the MMR, irrespective of any pruning.
     pub fn size(&self) -> u64 {
-        self.nodes.len() as u64 + self.oldest_remembered_pos
+        self.nodes.len() as u64 + self.oldest_retained_pos
     }
 
-    /// Return the position of the oldest remembered node in the MMR.
-    pub fn oldest_remembered_node_pos(&self) -> u64 {
-        self.oldest_remembered_pos
+    /// Return the position of the oldest retained node in the MMR, not including the peaks which
+    /// are always retained.
+    pub fn oldest_retained_pos(&self) -> Option<u64> {
+        if self.size() == 0 {
+            return None;
+        }
+        Some(self.oldest_retained_pos)
     }
 
     /// Return a new iterator over the peaks of the MMR.
-    fn peak_iterator(&self) -> PeakIterator {
+    pub(crate) fn peak_iterator(&self) -> PeakIterator {
         PeakIterator::new(self.size())
     }
 
     /// Return the position of the element given its index in the current nodes vector.
     fn index_to_pos(&self, index: usize) -> u64 {
-        index as u64 + self.oldest_remembered_pos
+        index as u64 + self.oldest_retained_pos
+    }
+
+    /// Returns the requested node, assuming it is either a peak or known to exist within the
+    /// currently retained node set.
+    fn get_node_unchecked(&self, pos: u64) -> &H::Digest {
+        if pos >= self.oldest_retained_pos {
+            &self.nodes[self.pos_to_index(pos)]
+        } else {
+            self.old_peaks.get(&pos).unwrap()
+        }
     }
 
     /// Return the index of the element in the current nodes vector given its position in the MMR.
+    ///
+    /// Will underflow if `pos` precedes the oldest retained position.
     fn pos_to_index(&self, pos: u64) -> usize {
-        (pos - self.oldest_remembered_pos) as usize
+        (pos - self.oldest_retained_pos) as usize
     }
 
     /// Add an element to the MMR and return its position in the MMR.
-    pub fn add(&mut self, element: &H::Digest) -> u64 {
+    pub fn add(&mut self, hasher: &mut H, element: &H::Digest) -> u64 {
         let peaks = nodes_needing_parents(self.peak_iterator());
         let element_pos = self.index_to_pos(self.nodes.len());
 
         // Insert the element into the MMR as a leaf.
-        let mut hash = Hasher::new(&mut self.hasher).leaf_hash(element_pos, element);
+        let mut h = Hasher::new(hasher);
+        let mut hash = h.leaf_hash(element_pos, element);
         self.nodes.push(hash.clone());
 
         // Compute the new parent nodes if any, and insert them into the MMR.
         for sibling_pos in peaks.into_iter().rev() {
             let parent_pos = self.index_to_pos(self.nodes.len());
-            let sibling_hash = &self.nodes[self.pos_to_index(sibling_pos)];
-            hash = Hasher::new(&mut self.hasher).node_hash(parent_pos, sibling_hash, &hash);
+            let sibling_hash = self.get_node_unchecked(sibling_pos);
+            hash = h.node_hash(parent_pos, sibling_hash, &hash);
             self.nodes.push(hash.clone());
         }
         element_pos
     }
 
-    /// Computes the root hash of the MMR.
-    pub fn root(&mut self) -> H::Digest {
-        let peaks = self
-            .peak_iterator()
-            .map(|(peak_pos, _)| &self.nodes[(peak_pos - self.oldest_remembered_pos) as usize]);
-        let size = self.size();
-        Hasher::new(&mut self.hasher).root_hash(size, peaks)
+    /// Pop the most recent leaf element out of the MMR (if it exists).
+    pub fn pop(&mut self) -> Result<u64, Error> {
+        if self.size() == 0 {
+            return Err(Empty);
+        }
+
+        let mut new_size = self.size() - 1;
+        loop {
+            if new_size != 0 && new_size == self.oldest_retained_pos {
+                return Err(ElementPruned);
+            }
+            if PeakIterator::check_validity(new_size) {
+                break;
+            }
+            new_size -= 1;
+        }
+
+        while self.size() != new_size {
+            self.nodes.pop();
+        }
+
+        Ok(self.size())
     }
 
+    /// Computes the root hash of the MMR.
+    pub fn root(&self, hasher: &mut H) -> H::Digest {
+        let peaks = self
+            .peak_iterator()
+            .map(|(peak_pos, _)| self.get_node_unchecked(peak_pos));
+        let size = self.size();
+        Hasher::new(hasher).root_hash(size, peaks)
+    }
+
+    /// Return an inclusion proof for the specified element.
+    ///
+    /// Returns ElementPruned error if some element needed to generate the proof has been pruned.
     pub async fn proof(&self, element_pos: u64) -> Result<Proof<H>, Error> {
         self.range_proof(element_pos, element_pos).await
     }
 
+    /// Return an inclusion proof for the specified range of elements, inclusive of both endpoints.
+    ///
+    /// Returns ElementPruned error if some element needed to generate the proof has been pruned.
     pub async fn range_proof(
         &self,
         start_element_pos: u64,
         end_element_pos: u64,
     ) -> Result<Proof<H>, Error> {
-        // Since we only forget nodes up to what was at one point the tallest peak, we can always
-        // prove any element that inclusively follows it. If we allow more flexible forgetting
-        // strategies we will have to update this logic. See:
-        // https://github.com/commonwarexyz/monorepo/issues/459
-        if start_element_pos < self.oldest_remembered_pos {
+        if start_element_pos < self.oldest_retained_pos {
             return Err(ElementPruned);
         }
         Proof::<H>::range_proof::<Mmr<H>>(self, start_element_pos, end_element_pos).await
     }
 
-    /// Returns the position of the oldest element that must be retained by this MMR in order to
-    /// preserve its ability to generate proofs for new elements. This is the position of the
-    /// tallest peak.
-    fn oldest_required_element(&self) -> u64 {
-        match self.peak_iterator().next() {
-            None => {
-                // Degenerate case, only happens when MMR is empty.
-                0
-            }
-            Some((pos, _)) => pos,
+    /// Prune all but the very last node.
+    ///
+    /// This always leaves the MMR in a valid state since the last node is always a peak.
+    pub fn prune_all(&mut self) {
+        if !self.nodes.is_empty() {
+            self.prune_to_pos(self.index_to_pos(self.nodes.len() - 1));
         }
     }
 
-    /// Forget as many nodes as possible without breaking proof generation going forward, returning
-    /// the position of the oldest remembered node after forgetting, or 0 if nothing was forgotten.
-    pub fn forget_max(&mut self) -> u64 {
-        self.forget_to_pos(self.oldest_required_element());
-        self.oldest_required_element()
+    /// Prune the maximum amount of nodes possible while still allowing nodes with position `pos`
+    /// or newer to be provable, returning the position of the oldest retained node.
+    pub fn prune(&mut self, pos: u64) -> Option<u64> {
+        if self.size() == 0 {
+            return None;
+        }
+        let oldest_pos = oldest_required_proof_pos(self.peak_iterator(), pos);
+        self.prune_to_pos(oldest_pos);
+        Some(oldest_pos)
     }
 
-    fn forget_to_pos(&mut self, pos: u64) {
-        let nodes_to_remove = self.pos_to_index(pos);
-        self.oldest_remembered_pos = pos;
-        self.nodes = self.nodes[nodes_to_remove..self.nodes.len()].to_vec();
+    /// Prune all nodes up to but not including the given position (except for any peaks in that
+    /// range).
+    ///
+    /// Pruned nodes will no longer be provable, nor will some nodes that follow them in some cases.
+    /// Use prune(pos) to guarantee a desired node (and all that follow it) will remain provable
+    /// after pruning.
+    pub(crate) fn prune_to_pos(&mut self, pos: u64) {
+        for peak in self.peak_iterator() {
+            if peak.0 < pos && peak.0 >= self.oldest_retained_pos {
+                assert!(self
+                    .old_peaks
+                    .insert(peak.0, self.nodes[self.pos_to_index(peak.0)].clone())
+                    .is_none());
+            }
+        }
+        let nodes_to_keep = self.pos_to_index(pos);
+        self.nodes = self.nodes[nodes_to_keep..self.nodes.len()].to_vec();
+        self.oldest_retained_pos = pos;
+    }
+
+    /// Return the oldest node position provable by this MMR.
+    pub fn oldest_provable_pos(&self) -> Option<u64> {
+        if self.size() == 0 {
+            return None;
+        }
+        Some(oldest_provable_pos(
+            self.peak_iterator(),
+            self.oldest_retained_pos,
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::mmr::{
-        hasher::Hasher,
-        iterator::nodes_needing_parents,
-        verification::Storage,
-        {mem::Mmr, Error::*},
-    };
-    use commonware_cryptography::{hash, Hasher as CHasher, Sha256};
+    use super::{nodes_needing_parents, Error::*, Hasher, Mmr, PeakIterator, Storage};
+    use commonware_cryptography::{Hasher as CHasher, Sha256};
     use commonware_runtime::{deterministic::Executor, Runner};
     use commonware_utils::hex;
+
+    /// Test empty MMR behavior.
+    #[test]
+    fn test_empty() {
+        let (executor, _, _) = Executor::default();
+        executor.start(async move {
+            let mut mmr: Mmr<Sha256> = Mmr::<Sha256>::new();
+            assert_eq!(
+                mmr.peak_iterator().next(),
+                None,
+                "empty iterator should have no peaks"
+            );
+            assert_eq!(mmr.size(), 0);
+            assert_eq!(mmr.oldest_provable_pos(), None);
+            assert_eq!(mmr.oldest_retained_pos(), None);
+            assert_eq!(mmr.get_node(0).await.unwrap(), None);
+            assert_eq!(mmr.prune(0), None);
+            mmr.prune_all();
+            assert_eq!(mmr.size(), 0, "prune_all on empty MMR should do nothing");
+
+            let mut hasher = Sha256::default();
+            assert_eq!(
+                mmr.root(&mut hasher),
+                Hasher::new(&mut hasher).root_hash(0, [].iter())
+            );
+        });
+    }
 
     /// Test MMR building by consecutively adding 11 equal elements to a new MMR, producing the
     /// structure in the example documented at the top of the mmr crate's mod.rs file with 19 nodes
@@ -183,32 +301,18 @@ mod tests {
         let (executor, _, _) = Executor::default();
         executor.start(async move {
             let mut mmr: Mmr<Sha256> = Mmr::<Sha256>::new();
-            assert_eq!(
-                mmr.peak_iterator().next(),
-                None,
-                "empty iterator should have no peaks"
-            );
-            assert_eq!(
-                mmr.forget_max(),
-                0,
-                "forget_max on empty MMR should do nothing"
-            );
-            assert_eq!(
-                mmr.oldest_required_element(),
-                0,
-                "oldest_required_element should return 0 on empty MMR"
-            );
             let element = <Sha256 as CHasher>::Digest::from(*b"01234567012345670123456701234567");
             let mut leaves: Vec<u64> = Vec::new();
+            let mut hasher = Sha256::default();
             for _ in 0..11 {
-                leaves.push(mmr.add(&element));
+                leaves.push(mmr.add(&mut hasher, &element));
                 let peaks: Vec<(u64, u32)> = mmr.peak_iterator().collect();
                 assert_ne!(peaks.len(), 0);
                 assert!(peaks.len() <= mmr.size() as usize);
                 let nodes_needing_parents = nodes_needing_parents(mmr.peak_iterator());
                 assert!(nodes_needing_parents.len() <= peaks.len());
             }
-            assert_eq!(mmr.oldest_remembered_node_pos(), 0);
+            assert_eq!(mmr.oldest_retained_pos().unwrap(), 0);
             assert_eq!(mmr.size(), 19, "mmr not of expected size");
             assert_eq!(
                 leaves,
@@ -264,61 +368,95 @@ mod tests {
             assert_eq!(mmr.nodes[14], hash14);
 
             // verify root hash
-            let root_hash = mmr.root();
+            let mut hasher = Sha256::default();
+            let root_hash = mmr.root(&mut hasher);
             let peak_hashes = [hash14, hash17, mmr.nodes[18].clone()];
             let expected_root_hash = mmr_hasher.root_hash(19, peak_hashes.iter());
             assert_eq!(root_hash, expected_root_hash, "incorrect root hash");
 
-            // forgetting tests
-            assert_eq!(
-                mmr.forget_max(),
-                14,
-                "forget_max should forget to tallest peak"
-            );
-            assert_eq!(mmr.oldest_remembered_node_pos(), 14);
+            // pruning tests
+            mmr.prune_to_pos(14); // prune up to the tallest peak
+            assert_eq!(mmr.oldest_retained_pos().unwrap(), 14);
 
-            // After forgetting we shouldn't be able to prove elements at or before the oldest remaining.
+            // After pruning up to a peak, we shouldn't be able to prove any elements before it.
             assert!(matches!(mmr.proof(0).await, Err(ElementPruned)));
             assert!(matches!(mmr.proof(11).await, Err(ElementPruned)));
+            // We should still be able to prove any leaf following this peak, the first of which is
+            // at position 15.
             assert!(mmr.proof(15).await.is_ok());
 
-            let root_hash_after_forget = mmr.root();
+            let root_hash_after_prune = mmr.root(&mut hasher);
             assert_eq!(
-                root_hash, root_hash_after_forget,
-                "root hash changed after forgetting"
+                root_hash, root_hash_after_prune,
+                "root hash changed after pruning"
             );
             assert!(
                 mmr.proof(11).await.is_err(),
-                "attempts to prove elements at or before the oldest remaining should fail"
+                "attempts to prove elements at or before the oldest retained should fail"
             );
             assert!(
                 mmr.range_proof(10, 15).await.is_err(),
-                "attempts to range_prove elements at or before the oldest remaining should fail"
+                "attempts to range_prove elements at or before the oldest retained should fail"
             );
             assert!(
                 mmr.range_proof(15, 18).await.is_ok(),
-                "attempts to range_prove over elements following oldest remaining should succeed"
+                "attempts to range_prove over elements following oldest retained should succeed"
             );
 
             // Test that we can initialize a new MMR from another's elements.
-            let mmr_copy = Mmr::<Sha256>::init(mmr.nodes.clone(), mmr.oldest_remembered_node_pos());
-            assert_eq!(mmr_copy.size(), 19);
-            assert_eq!(
-                mmr_copy.oldest_remembered_node_pos(),
-                mmr.oldest_remembered_node_pos()
+            let mut old_peaks = Vec::new();
+            mmr.peak_iterator().for_each(|peak| {
+                if peak.0 < mmr.oldest_retained_pos().unwrap() {
+                    old_peaks.push(mmr.get_node_unchecked(peak.0).clone());
+                }
+            });
+            let mmr_copy = Mmr::<Sha256>::init(
+                mmr.nodes.clone(),
+                mmr.oldest_retained_pos().unwrap(),
+                old_peaks,
             );
+            assert_eq!(mmr_copy.size(), 19);
+            assert_eq!(mmr_copy.oldest_retained_pos(), mmr.oldest_retained_pos());
         });
     }
 
-    /// Test that max-forgetting never breaks adding new nodes.
+    /// Test that pruning all nodes never breaks adding new nodes.
     #[test]
-    fn test_forget_max() {
+    fn test_prune_all() {
         let mut mmr: Mmr<Sha256> = Mmr::<Sha256>::new();
         let element = <Sha256 as CHasher>::Digest::from(*b"01234567012345670123456701234567");
+        let mut hasher = Sha256::default();
         for _ in 0..1000 {
-            mmr.forget_max();
-            mmr.add(&element);
+            mmr.prune_all();
+            mmr.add(&mut hasher, &element);
         }
+    }
+
+    /// Test that the MMR validity check works as expected.
+    #[test]
+    fn test_mmr_validity() {
+        let (executor, _, _) = Executor::default();
+        executor.start(async move {
+            let mut mmr: Mmr<Sha256> = Mmr::<Sha256>::new();
+            let element = <Sha256 as CHasher>::Digest::from(*b"01234567012345670123456701234567");
+            let mut hasher = Sha256::default();
+            for _ in 0..1001 {
+                assert!(
+                    PeakIterator::check_validity(mmr.size()),
+                    "mmr of size {} should be valid",
+                    mmr.size()
+                );
+                let old_size = mmr.size();
+                mmr.add(&mut hasher, &element);
+                for size in old_size + 1..mmr.size() {
+                    assert!(
+                        !PeakIterator::check_validity(size),
+                        "mmr of size {} should be invalid",
+                        size
+                    );
+                }
+            }
+        });
     }
 
     /// Roots for all MMRs with 0..200 elements.
@@ -327,220 +465,266 @@ mod tests {
     /// algorithm.
     const ROOTS: [&str; 200] = [
         "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc",
-        "6640b495f46158d2b2169660ba347b07eceba14ec540e480a4231e37dc53e967",
-        "9df224ccaba058aa137e63cd2668c4f3689173a7ccef7c0ac1ec3f079e456f79",
-        "7596f95fa4a3f9cbb24760cbbeea41cc727e0fcfa167ea87ac361580efffdf47",
-        "86c811b2c7b05ed5887db8de666567888fcbd9ff1e86ef6cda38c9b2c4e13169",
-        "de7880bb806f1ef592e7dc47d5d4f5af19396fe1089969fc57dc037d182288ba",
-        "4856a9cca73f93cad97017c15a6a28de76db959dcc2b77585a56c8b8afa5eac3",
-        "1e356f2446d67fbcc2a03611f996e669666c8c5e4fc78e045ceffa7b6728ad29",
-        "5f15ed1551f1a5042c4f1c6bda815c4f0c187b02bd1d84f3bfaea7a2072793d2",
-        "0a31daee1b822f3292f3877ed9064dfc6d9c187ab45fa296b36665f1f243d1dd",
-        "5a91bc0c1cde64c191af518c55f8380b3d4ffd77315bd3a4e241eb520f3b9d80",
-        "1124f1590b44bd186e796533fdc5ced167036070f202ba4841a5c4167806d12e",
-        "0809d11fbb8c56ac393444ba34a900f7a6428fcc5d5836f0f75c598a0445cb74",
-        "8764f42c573c21a37cb32c6346abe71b573ad631e6b2fa034656df2fbdc584e0",
-        "5299cd504b24274991095721a42e4109184285d7510233d531180221eaa4dfa9",
-        "87e115893ebfc75c52b1f3b0e30a76489404a05972906c2e80034e51a711a455",
-        "67c6da08950611d31b58d2cea28c516d686301f29d8ef21ae847e99d1c383cb8",
-        "9b0f6b2f591e7b8338d9f0b45ff5705c1f259588ed2d9c45a4cb898ad8b96c7c",
-        "534151483a6146cccf49913b4bb5481bae280819fd74cc2d29b128fd104df00f",
-        "d60dc66ce726b5518401eb83c9747238c6246bee2951df0c21d123e48976551e",
-        "4001205c77c823e75fcbfab3580390b0272614d7b7e488a1cc199502746c7ff8",
-        "cf3d8cc2775f1ba81fbf1664b90956c6b9189feb637f380af3c28b7e9c4421f8",
-        "92041809edde60af32bc18ab9cd8443b9742ea08296cd93bb0b231b4932ff3c6",
-        "f1114faac31bf5b79e269d0a823de9f1bb54cadf3bbd3899d3404503a1e86525",
-        "e588ab5af8ba8fbbc7091525864b33bc4dc11d296dc46c85237e56819e05dbf8",
-        "f3a01a562c17e1a3cf51527b77607397ad1d00552e66035b6680cd95d6a7eda1",
-        "957db1952ce89ec427d0034eb7c0b7a886ae2ede4f9e0111a419594c03f71e6c",
-        "6e6aa6d258746ddfb7a40cd7dd7560486e5f805e0c3a2f664f57207993d96e7a",
-        "9171298227a6f39ac7f797b4a1348925254aadc742d754d56c1b71ea5f5a7771",
-        "f6705879ca7439fb6e039a842842f6022b0427b9b1462a691bfaad4d1b40b59b",
-        "0307b0c5e1b95a634e82202774ed3ca930e5df712856ad78066e04395e136b92",
-        "f962f4736a2997ac9098d8ff6b70277622ca81a5057fef03bd51edd174eda429",
-        "e1a71f92d6711d48b2a84c5af76978dcc069d0eb62b95693cb7720c9d3e2acf3",
-        "c3aa40186955a591630fa4edd96a9efbb96f1908fc162fdad7b5ccfae11b9fb3",
-        "d9bcf7e38f9720c7ef34aee4c5969ef38e45245f2a18901d6a41f99bb4633beb",
-        "9c80b73fe6366f9103f236d517956bc5af305b31a9f94503d05302faafd5a876",
-        "a4e993bc5777914844c2a44493b6f4b11fa80b6624b8943153d0dd8596ccc592",
-        "e6a4608d05c0fad14e61d0b4e40cc777f58925c3c4be66a40c065e300390fbb8",
-        "74f1d960fc4fa543fdc6deb989cd1b985b0f4021a6f28e51e0da149b39c70dc0",
-        "4cfaba43dbf82a7e85f3965cd1ea18f3954b3ab50248edfc5375a32619d828e7",
-        "a70a15a23123e800fa402ef9400ce15cab0b399393524828a5a826333b99c324",
-        "c7b69b49ff695f52866c46e4f8a4195bca1f6b1544a7959f559b9981866f8734",
-        "9a42c119a9bc0c9e63847d7d75fac75bd64ca564d3438e6e2b35a1f7a1907949",
-        "7ea377590b4838177f3e1bd1297f2ff106c33594b68e3f3b4d86f5a733edc464",
-        "ed80b749d755cc671de8bcbe9523fcb007a4461607a07cc7d29b42b51890800d",
-        "bcd106f2517a7f2f04f8a3ef24e8c0ffaedcdb417daff755150d19df8763216b",
-        "1fa11d2a199ff23ce9f3b2b68c3b0ae07c870d328fd64a2342d123e5291d1fe6",
-        "6ee35aba7df4bf8c16061f84d4acd92924096105dd4ad17b1a72d4b5f4d2ee29",
-        "1349ae02d324b630f7baa37bdea7089dc10db78c116b15994159455b543a34b1",
-        "b55e221d1ca839d708efd30af6d4c8f9afa7c07d66c45ba0386c349afc51cfcb",
-        "3122d9a14a02eaf30a43a1d8c91b4501981693329bd8a6b70f9489b26b4d542b",
-        "6938e4af2b8f33e97908bf7666d90c8ae970ab022cc5bde84df484bb57531143",
-        "b502e5495d557b098e5d1c6cc01f6aaba041541929ada8fa9af5a8b4005e5442",
-        "5b4facb775952c2fda9f3f6a43a3f45714a4a4098938dbdd4008752e78c83108",
-        "996111339bcc196ba0f69aa345068418604eab78c81cf647c92a45938ad71c62",
-        "1173b18d1429ab2f1ee17bc01b6b3c0c8af24d8bc129d4de3d91c8a492f40645",
-        "aca1939d77018da0b13861ae12ab60de671c7b8306f6586802459728ed372a93",
-        "1a9a4c42ffc4e50121f4653a4f0eb588a0426cc3014efa40979e5702ba2288f2",
-        "589887d62010118bc0f4fc6e40408af681a85cd92ad91f549206163849180cb1",
-        "f5ab67b23f667d709bb08f73c840fb9dec841975750085232eb43e46435412f2",
-        "08d09d565b994505e11874b70c425a4d3b794ec4ad2d8334fe7a9c11e6a57eb8",
-        "7300db79b56dbdd7fec2ef7130fa6657d1e51aeb416da939794e143c436591bd",
-        "24b2c1aae068bc5f514491cf633d64451e16f304c2cc5dd2363b092ea8dfe98a",
-        "78b06ae6b3f5ae420bcbe3accf159d281537e10733b387dbc1f853d31314f970",
-        "0aa50ab1ae87879d9af14c4cb50a13c389d7549fc320a609eb549b8c39bbcba9",
-        "2aee102a01e5da108633faff7a35ac60f8f224c53cd751198b7506519c8fe2d7",
-        "a30dee20dbd75b113843859f2dff0be41da46625413946fac2d2f5e459ffb59b",
-        "9c7571374fef130bf8895e1ba8dd8ea64c269c2435bee4767842415d48d5b893",
-        "0526947ba6a80518e9b76eda4871a11db56c87d8e630d8164fc733a70f675da5",
-        "e383d57097e048627e79c196eb28a27e22b1147df4596c48a6d82a31d5555d61",
-        "f50d356755ef554991a800fbf4ddb32d09690dbb1766fc3d2e2a0e7fd38f1a5c",
-        "06cba3b369a46d2f9cacb19562c093ad2235e15e7158ab54f807701bf0ff0017",
-        "01088421b8b65524048c5ed3092bdf4d31428efc6dfebc61240fcd107dae4534",
-        "31db1fb2dc7c1c690a2a8bcf9782fd7a3a1929aa912070a703760bdefbd40019",
-        "fe3e53a3b3fee028ba9f57410e342254a1f0077c523b03e6df47f0eda925c7fc",
-        "b8ab10cd264f1e71f9e7224e92537c43bd0f190b2eb412551e25f9cb3dfa85cb",
-        "69f711c694892eb49cebacf86c82584dd2bfbea356dccbc633f77031c0e4b741",
-        "496e32579a40f9a7e737126479c5c8dd0225c7386ec61cad0a81eec969f7d10c",
-        "e9b4cff8f4b9b2bd53c55653270b6dc803e39fcd9021e6cd7df4cc791f2016ec",
-        "acc2afaf8d4547241dd22ef8ef6f454d379a8fe3a89f4134c4de68ad5c6d724d",
-        "6f38bd7287001cf8d941d0808695cfc2decc0b922644fdf970445e119a6c9690",
-        "55148cb62b52d2cd3c488217af888489f6b7ab2503483cc9cad247b9c41ac951",
-        "e0bb29a5c1e6bd85f95675f888aff38d52ff0da34a49703194a7082823f839a8",
-        "42fbe33ce85066b250e5acff15079b7a55decc6f451c7438a2dd2700be0cd5ee",
-        "65e8464144447cdba58433e5618586be3ac399ec18fabcb7b05887dcb3d3f593",
-        "a0e5e686b42220e49f66350dd080d51301767865bc03916b7ccac8cb3113c0fd",
-        "efcbe4d7f4029bb355ed228400a75f8da7578228b4e2f265b6bc4694b15e2260",
-        "b525b69ec8fed6948ec48bffa1ea553f04a35a8e3f9267805c79bf4c60b4cc5e",
-        "b0dc01198f280c2606c67b1913b7f32410a87d53c0115e29951005b2730943e6",
-        "1d503869ed404acf9277e682aeb3d7cfa0db0efaf43db7ced37bc3b9a06ff23f",
-        "1c0b1c1491eb78c45bb14637c3dba6109b8959efe157f16a4ab384406c952ce7",
-        "f4acb95089044b98f6ebca68c1c40dbd7f05c065f11d4dbfa7115710b601cf09",
-        "06d646c8656a76434795ef1512cc763868e370d356a21bd8067ab60add138086",
-        "83cac997aec96fe6a15449a8f66e36c5bd07a4cf6ed186502a36b0a2ace4fc8c",
-        "da887e4d9d8cd9e79baaf50c22342357d62b3598fbff02220e3ad1aae9500165",
-        "2b0c70b609bfe8d437eed1287762e7058b63e840dce1174816e79ce0a80b0204",
-        "203f44020f57d2427a464e0136bfcd1fdfcba0e8165ad1f3088923447a243f45",
-        "767949797550e9a324a47f8201ddd16e2bd324e176977e7719fa7e47625a20ea",
-        "58c056915b6e96bb12e150a797d9adbd73c70a80e6bbb9ef722f705dbff14097",
-        "788e7ca7f427e6aae4d224539408596645eb3c09c0c09bd4cf43c2697ea4ee7b",
-        "c3aa4afb4b1d8990c0665655a65ff51ff3ae5ead9f7f2134a7ab18768228a39a",
-        "c9ba42efb98c6539702f782e2a723355434abb01dc2d62538b2662651ef6384b",
-        "e2440c9e929bd6d59e6f2abd11fb281f7d3d3a8fc3f5117e3fccf798124972fc",
-        "b676b53033240a5aadfd76a57b9c391d2e82699953f93163927e5bf53dae9fa3",
-        "53b5372089212d6e9de62c5ed1fbd428f426fd7b617272d762c00154e600b3c3",
-        "aa43c45552608bb722cd2a01a24b9a7161023f970d926e7118c9b30622a23c5b",
-        "fb699e3f4ee048cb87b92d4cc00ee79bf211fad45cf03d49034f9910864010b1",
-        "23ddbeedcf5540d4e7f2db090607423fb479acf8b3c840ece90c76c5badfd991",
-        "4527a5dd599898fbb3c1362c8807d0898b939124b7e5a2dc1df791313eee525c",
-        "f17c62a590b71c35b1c67d20c933b4d05b1b03ee9a99d81359755ada0df30e2a",
-        "b323a4c91c6f83dc522c33108aea3102d85443a0bc26a0235f4e83d86477e786",
-        "a79a878ef53f3e5f97150b93d098f843bc32d3ed8b6f41185eb8900b4e5c1c06",
-        "3e6215ae2dbdba8c7eaaafa3d350bd6f3e6c6649c7b3cfe77a7d81bb13537101",
-        "cde99c0dd45cad07f6181398ff30676574ccd9c6cb83b79d940d5eaa30992c39",
-        "a42d11fcbaa4f81a16a82e1e77677c670ca7d4bc053ec7702a99be1b621b3ec1",
-        "9aa8eda2771b7c8955722566ce75f843538425fef37cb968c76f06ab6e6ddaf1",
-        "9ea03c9d831922d9cd321d446fc904aa6b1e0afbd8cff29b8d9e9736976256d9",
-        "2c50b98c32219c78300a6b5b0ab21ce15dfcbe64fe14774c972867b641d6972b",
-        "e7c7c5511da1288364fc7dca2f9e6980f701f6513f017e4aad9cb59ef31f804c",
-        "8a6a038c37d5b44a849c143cc4e21e1762013a58f386f2fe7d24393fe2123c5a",
-        "5c230019fac955b3e6b6d04195990f06fbd24c0b558e4f5900643f0315560142",
-        "02bbee82d8fc58d9d7270595b39a85c938dcee91cd26435221ab3301f4b76ba1",
-        "b579e14a0887050519b25618f90f98ae0cae08915533b02ea84252c569f84a00",
-        "24db0d1afc134721aa653e16a4551737a178407124faf44325a086d3e9cce01b",
-        "5e3751022de12113f2f8a2ac4b173ca056e12baa3ad01aaf7d1e6a567b75d3b1",
-        "984aba28c9d53ac891f9a3a47aea0e7a5f1c3dd7850b132fa4ff47993fc05aff",
-        "04915a7aaaf33711976e735150de41243cc69f39c3d2193616fbaa71139820c7",
-        "6a19db31612d444cea333cf48c9f442c2974505e92ce3b3c6b029ee2460c7d58",
-        "fa6b0269f90c1a76abdfcb4a7798caa7585f6de87d12aea97f0750e7497863a0",
-        "1795d159bb69748aeabcc797f0109cf2e53718fc1fddaee4f8d7a74427a5ec3a",
-        "c7d1f9a562853378bebf6cc2bec9e221f6062eea3f6a779265731a8da40245f7",
-        "d96eaec3568183dd310062d5617184abd12df2a727aba670683781a55fb32bfc",
-        "08cc2b8a0e3df49c5927aedb69f9aab680deea59bac1cdab4b182ce9bbdf44a0",
-        "95fa5149bb136f345b706b331fc0153aeaa3212815063fa975390371df4fea47",
-        "4321637119f8ce35b6aad33e06fcc1ba91004e93188ebd0fff7a378ce5b8c621",
-        "46d26400e235cc732a3e7a872dbb8a03e735102be052268ef5e1b9f81559381f",
-        "a0798537fd527f875a1b8ffa7ac4ca1f9fcc8da400c7e90144cda059ec121509",
-        "c19da50f45b44787ca688405a6f66e1d70000a78d951e0f2cb5ad2ee256491d1",
-        "3383013d7245d18474107ec7ab56dbce06be495ee7117fc6b8e55bd196bbe52f",
-        "a0035cdc2d52a06b1cbe5fe961f33fe6ed7835bee7ac7bf5e20b93d84814403b",
-        "f9a1d6dcb2e7bb649781aac402981c26bef7c8251d79c58758a49b156e1283e9",
-        "0db66d90f481cd2cd58067c48df58ea1f54dbe57458d81d8fcaf6f40f9d3eed0",
-        "dd90b12f05d562cfb3c56d54c65a08e1b3f36b6aaa8d1175ac8ded91cc1948c8",
-        "ea45adbdebda7fa696999efadbc4897120469ccb1d3ca5c000a7dda0076ae5d3",
-        "822556e39b6d4b013bca40d8c6a6fd7262be4599bd4ace746fb42e863eb16243",
-        "93477f035f9c7f56446ca64779ac7c550eb560013b5935412d6007f74b253140",
-        "966029dbfed551ae34d549b6b2fc10897d4bd58ff2db45e1a7e8c1f3e522848c",
-        "2722c71e2f0fd7a8911c926a68361e78584fb58547c6a5524c4d04499ea05a44",
-        "18abb94aa8ec914499d6e9613fb796c07193f0753ea53ddcbf6dcf06164ccf4f",
-        "ff9ddda86d369c9b1eb76f218f025350b769229292deb63eefce7801bc9e7020",
-        "b32bceca593299a66a6180a892bccd42e2d393b7f178b6bd8da7da9ed493c081",
-        "c643efff633694ff7de82ba28c83f290a0f75343f51fd0dcdc71cee3663a488c",
-        "135e7f453fc8d8f62de2d193a93d8a7ca521fc5f5c968e9c6e0453e9fc8bf2af",
-        "897e44146cad4bca248736f46c0bf8aeb5ab94cf155b47af2b130c066ec8134b",
-        "79ae8e7df23f60a7d289c74b309073d205c1bf3cce7ba33553569d77f29c323d",
-        "c0ccaf622569270c56a140985d998e29db5a1a63eaba377bc5deaef197fd8d21",
-        "5a20a4a7f5a34923fb5d00c5161042ce367b40ed1e70f2856d5bc263f22134ad",
-        "eea5a54303e23085f2fcfec79100143bb9719547c1f7b1ff5146e76f13a667f3",
-        "c968c34e4ec45936bde0e457a714c4b33b0f6cc19b079789787504166d964ef0",
-        "72e63851f547d70f8d12ecffec5a504437c6cf57c4841278f73f853d7888cb0c",
-        "739a6daca71d06de679d92fbf1ea0e6f4d6b9f5742411997cb713eca9f13da21",
-        "dd920518eecc31db0ec484c47025fdf835857eba2e147bbf0ac1863feec4af60",
-        "a381fb6136a2e9f486985b9dd00fce9e71e621f16d4937e6610c8649a7415d21",
-        "5cf063825b0beaab8001f2ee143c68977d58adf575b6ca9caca1d98e88acc05e",
-        "1e5d12ea0034b10a3c6c8939f242f3cd479d62fd8e6e71c58d3bf2f2f07f150c",
-        "dbb596b4bab11c5b08ca26a205b05f77a5ee34c6c98d9919a50a79d796c5e484",
-        "98af7d76c4bd1568791fc069d38c3c12624dd18657b3dd5b902f3ddddb3fd27c",
-        "6f529b4174e59844a71faea3df9791631201a97db46059c02456b6383daab908",
-        "2f4d4aa119c91d3ea8dba7dd537d4a8c977b81accff75ef21829a0ac557c954c",
-        "dc985e4d7fb60e0ac5dff2100be803b647ba0071c73cd6d65bd903b5b1e34e3a",
-        "f8ba71a992fd5cd5b4cda903c6f38759bf62359c7edbed6f6336c39875264fe3",
-        "8d11683052a837ab944c4cf46bf7714dd22f5bba9d3c7d112785de4dc60c359f",
-        "7c8b2fcd3050de3a82391ef769b4aefe26344be7b399c0d71cfe4db378d392e6",
-        "ad9f2a6e85a92f2a9212dc17b4602e527ecb015d65108eab5ee3e5c08e564028",
-        "af4dad20a60c495f96f716bdfc3dcd43f8403eec96e89c1577d25a1368aa91b2",
-        "4354f5db9cc56189b330a9839585289b008ca818c95fe404b99332a19e22026f",
-        "d71db6ed14873ca0f409f2ef6d660d98511df4cc8cce9baf4242f9eb279c34cd",
-        "3f44eafd7612f6f5bfec1be806b54a9da7bcb39e0a22ad2841c499eaecf32690",
-        "23653e60570bf4ff2b113244856d5cfd002b6efa58947ef1b079de8ee9f31f26",
-        "55b95e33deec16322f794a43f68ddc2ee6d9db233b13f19e2078855c474cbdbc",
-        "b232a7a9dd39fa0e6da4ed1e9306a20f90ee0404c0010f91dee5e6b5c6344f77",
-        "ea47293128de7c015d94fadf54fd4a6c67ac6500703fb0ccfb14128484da6914",
-        "22afe18354e32cffa35b361b2f2f6b9a2a0a708c17a48e8acb4b0d5c1122ec04",
-        "ea35772a98614777475bf5e8ad6e537d7c2b8dc08bce36afd796ca4d06c8e7bc",
-        "fb561977ed473fc350f3e6af098fd0d8a1fc6f20f151ef40b938c2b35c483b72",
-        "7fbfb4f967a764dd63432635359cc0c29cc16370dbf1e1ddbaf0d149f7a94bbc",
-        "a15d4d1fc27fe748ccb83b9a57ab803d1b10dcdecf1077c0828bd40366c8bd9a",
-        "6cd2627c10e5ca816c7accb72367af6d3481126ef8d873ed7a8559fd9fb7aaba",
-        "36611c5964ce9db1d41143de4c85dcf5e6ba53261199196e36beb69abc91e5a5",
-        "b1fb749ab397cb1495f6f13e4b7ee16e0c28c8677a83df0a1fb7d587a2322923",
-        "e815b6c84ef99dad298b955a5d2a5ae29438f3a6a2f5ae3f64f17506fc9b3365",
-        "4f1ae306cad26f9393b1175d1f68c21e64836749748de7b564557e76bb9e5a34",
-        "b66f9d4572f8d547998a10127c4fdc78fb46680451ac168d990dcedf45bc2cfd",
-        "7b962f156a2293a6d2c9e241d8abf23dd2554fd2665c1d12021174618865d737",
-        "c6bd3abeb0a29b3ce74df0899aaac55e012f1f1250e6a8c657527a130e4f779a",
-        "2f13959436ad4b3a80b7845ee7298870a04c60fe41a67e62233fd103becb0777",
-        "05530a1fcf6e05f66e8ec5bb719083f83a32c57e509c5be5697cc44fe9bbd28f",
-        "1b1b0ce428dd25d6509287b0f43dae671e3640ae066c4e7caf3029fceabe8d8c",
-        "dd6df42d1ca8f3ca69697e431863b66e9bff97bd6ec3dd10ef6e540adc46ab38",
-        "97b296e314eed8f5e0c26fe46bb8908b17432984b7dc4cf00f8fcecb6a151aa6",
+        "7676407563b96f8f78658b5b6fd523b190634cf5435393a66d62986a35cdd838",
+        "ea9fecf8f1137ea087d15b8877a06e64029a2d2e7d8b8c2220213c8c590ad52a",
+        "e9e73c4746ec9ad329e0abada3155b3266fe35c26b09fb4cf8e76afbd8890680",
+        "4ce8f78f8411a10364a77ed458f458a5cc413cd2f92181403cb7302465a560c7",
+        "055c9c09a4f8ff9d41f875f57ff9e7afeb7e58d554b35959755c0d6cd5180010",
+        "36771d4af0af342207e650d874aaa292807831f33f416609c50a4d5bf220b386",
+        "3985eaacbbe87805e27d4e1b82b1ffb76a9c9c705e8d7b75f604a86afc218c8a",
+        "041a41f4c70f5be225c8c018b87b07da51aee80c9eb138ae4175f7f0a0e4e670",
+        "f4107afbcbb927b2f70b0c0fa352eacd6c2c26a71385cfbb572d484c5806c1aa",
+        "a41d7fb992e7d06f7b57835ee06cf6bbed6eb2b61c51d1e178c5c9753e542787",
+        "6548a284abdd5fff9940e1a81cb0b7ab1225a060ebc8d2b961dd7d8cb1454727",
+        "dde12753fdfa81d59e56297b9c3b444d7dcde8fd9033d7589fab5e915e9e1d86",
+        "74c4c0772536bcbe5effe82fc7cdd8e46449306393547b64d52ac35912cdc583",
+        "0f3fd4ba6b949a2cafce04c3fb9533e02bfb28a777efed50e7e0075e82769923",
+        "1de606df85255961e2a2122a1b61a646b9dffdb7a39ea4ecffcc733e3ef7d049",
+        "f0d797beb68b7e486139421ffe176ec21ce330a4debc914705d46c09938459f5",
+        "09c9ebd8d7e528b4f1f29be9efc07b9cfda86c268258cbec60da4c9090c74f56",
+        "6368bf81a9984ee0ab7c1ccd8aec4c8baf22a14ec444ca97947cd1e7b0b50910",
+        "7195003fd96b06d2345b5ea02811e082d5b2a8deba44e7b8bc7a678e75128064",
+        "d93a67a13df9ae7568dc7b3a9015afbd4be0636447216406e2ef81d37aa2c5d1",
+        "5968bdd338f60e08121a0424442b9b435159b53b4177a417acbb5e81d9afceed",
+        "7b9cee8f420b6b58afe14f0be315d51e2da320154e2bd83b86b6ab65a5d6e7ba",
+        "e800ab561317c4f514c8f4a9f8dee8608eb727009c8052d434ecb03e465335d0",
+        "b75d0bcfb32273a6a150944631534c9181fca16e03ad083ad071d4d8aef30709",
+        "f0339cc83740e3e48436c869d4434dd5e29957af1dc7ebd843e88b1ae543b868",
+        "61bf5037f812646d25e260b2b79bf3bed9edf540c545a9119da5ca19a99f23ae",
+        "6f08446b78fb39779ce769bc6907edf6d580047f151b8af98b3f1d68a6cab8db",
+        "f54c366a4d2b19dfabcf9562e2a567b15c948498f172d223db09394648430956",
+        "0d7f9d02077c8015a33a80b488e9510b4f219f34542cc985c1673fa73b3abf15",
+        "ecbcdac946e4735fabbec373de0fe8fc74bdbb54751e3651b72b1a6dd2ee3254",
+        "e3d831cb4f7e6bdf1f9236952559ce7e7ced856abb140660bae7e35559b607ed",
+        "d62e272a2716613ab6a960eb2e16b211e387f03b5d129f6ff9093960e09cdc51",
+        "eba0c1e246d0fab436cdcf8249ce55920014495d4490853463c1f0b9c51d45b8",
+        "8824cdf87a4b60a31d1d30ad1b6fac753809afe1294b6b114522548c029905a6",
+        "6c41cd344760a0f223ff77054da185aef8b1512223fe2f06c59b7371d9678619",
+        "cf1b1aa2dbb0f78ad7f735a20d4689f2a7743cc6ce30e6fe8ab1c1578bc926fd",
+        "39f59891c2273541174e621142638bc0ab354c953778f3a6ccaa3914489b6b8f",
+        "3e5b56a3964418ba229bae1a766ac26f35d5f044c6a17f2fafecb677d85a3b64",
+        "49d1d775d0ff5dd6fd247922f776469d3e236e0251a1533a86d06e0fc663a77d",
+        "5b299678281ce68981e3e2f0c4deef0eec414222938bb5123a710ec9400571bf",
+        "835017bdd0e05f61719c0e3b1e94dcc0cf0b60328420b8696dc0b7090dca8b48",
+        "ef0603c1b30d49a9e38749947dd90d17e61b4483999e63489fe9efc920dd2745",
+        "54f889f331d4e383cf05d04b2cab3f5512aefb4498b4ed13f97fc3a73a58605d",
+        "1f355117e2d405c4a272da9a83f951e3a00998e30cc354ce9fa3d7acb3e06c78",
+        "611102f648e71ee0aa8b0f1fb5dd6cb113f1630f640f8794bbedfd36d68b76f0",
+        "8635c87f5664198965b59b6555c5c31c18d1dd0cfde8ad310f5945ed3af2c7d4",
+        "91c45e51b06e91b1474947d79639e1dd806e93e4ad72fa190b817dcd2c619fab",
+        "d57f5d6d868d3fdbb5d97d9b8d7684a73a7b4e4a9f854160a92a583acebe37af",
+        "539c8263ade2a42e86307960defedadfbe0810840f0543ad5fe64e378044f146",
+        "340361294fbc4357a84615a2c6c057d41015ac3688e45db2788f6027d158d7be",
+        "3c19386acb0a97947765def9b0427eb6130618196b91977386749655baf90101",
+        "9962dcc2db6cb1787b15824bbad54b03492ad7f23d86e3c6109e1649bc351a44",
+        "c281f592cc55e5431228e8e075a801640e8f07907cb94d203e7a848236b74178",
+        "125617fa7488d1ca193c62e1b62e360171ab00597ba06249ffa6b40e4636c8a1",
+        "91cf03368afc21f8a16a5d29cd438eae36d605b17aa730495f1f52b2c405c76a",
+        "5158ce6a963f0cbc29d9a278e19a173efecd4e4a76904d976759361251d05822",
+        "e547785582ff991d26f7462361dea3bc3b3014d44798fbdade057ad71d0c348a",
+        "0b8000d561d68767ec14f2a21be1df67dd97d5746f4112a08b208eabff5a3cc9",
+        "1dd183efd7cd89a2f5f837ca4bc9ba1dd8b36146ae6ac4e20a3f6bb7a66cba2a",
+        "a3eb0e974d929bb2fa8dc5e9abbe4fc51731bcd2b919095dfb0d1e3daec9cd63",
+        "fece8b224f7a64d67f020736719fb2ac30bde795610ec251b5fd82de4f3777c4",
+        "08366a2ad117c4af3c65c2c622f005903f308e5b36cf7d4abde6a85921e13bbf",
+        "61385b246f058fa4a563b68c8463ea854419d253e716bc7854cbcfb2d5aaaa8c",
+        "39b47c3734fa04c5e25ca3c1fdd05ba90b404c4312ff64ab677340bfd5c9f5d9",
+        "856b58ba8121292eb139e8322a3a5dea720577a9ada1d3ec56309422a80cf574",
+        "4790b9715efeae9224b30eb5b12a1dd931f5cd46bc429eb6fa3a26ac38c35913",
+        "5e3513b039d2e4fb5aeab1b6d522d2592050ef6105b03c3b1a116cabc68eb20a",
+        "3f181082097473f2f9acbdf6228007b8647a217835403d3128fafdb0c0d01beb",
+        "38090af5752ce7d6f35e4dc3e75011622a1188f6a32407d01c2cb02933b05366",
+        "3b8ef716575ba9ff2128fddaa235abcc6b67ea4fb4f4dc4422971459df2dd545",
+        "434f5d9aa23c51d43646fa4a7a4f41086fe503c8e07a349ffe7358fb78ed036a",
+        "b99507f44d111cfdf42bce385c513b1ee204208f0501f8a1935983f4aacb4663",
+        "2824294b1b8959215c162a28e627e9433345e81ea6aef4bfada227ea03ea87bf",
+        "8f1bf9667fbe4e42f6a567b554af125886cdb8b0a03a6b2afe123f1b21ef1e51",
+        "d1d534ac950bf18cc225d02fa16a94a97fcbf66ec4a96c85003310123f51dd91",
+        "2c70401526b22eb8d853b866b5f517a177b70e1bcb4abc2050022cab126eab8a",
+        "294372879e02e89e54001843a835f8085fb16990ed788e1e17ab5baae3590d97",
+        "ccd5e7d8102db4d2fe6016b605c1375fb3418f2239aabdb1efd8fe1436d618ee",
+        "60f7e4c97258e2116cab06f72f7d2228377295ab55fc5b8cd68546fa2cff7180",
+        "d59f34201e2aa8c3fd9e09b847ff0cd4d16074081ed763393b3438a61226bbb8",
+        "dda8d247e04a419cf56d77e97b686ee5d7047d0e4a8b0eb0509ef497d162f019",
+        "53ed258a5880a34bdd6dbdd56d78c4a8483d552016dc1f4be3f047b7037c4fdc",
+        "1d017a52bba710fe44d442fc8ed6c0c0aa2bf897029500d6b2157d95251243af",
+        "d9208fcb088daa3b18f475273dfabdf3e6ee119272ec70f9312c1c13440bd96b",
+        "c196d0ff129a9cf99098faba4d9d3fff8bf1222f3accfdd066be316a400189d7",
+        "1f7ef6763d1c515ab5c5cc26a16256de3b979bf55ec7e4bb77bf3a9f32a52ff7",
+        "8644ce2d487e8343cb3fec379c28483dbc87516f84fa155febe2d17fdd8386a3",
+        "c7313eef9f6531831391f0fb23471de96c01786ab568e699f44ca5780bd7bd02",
+        "71ad2f97e4ba25c79b1006f44375525a9a691abf009bd2a85cfa97cabfcb736a",
+        "02d45be470cb8fe79715438dc6f8fc5bbc3e85dd8d8e54eaab191b9fcd519259",
+        "d370a5cadcdb0e41b4bee3e926fb424562b8035bcfa0d3371173ed9467698ea0",
+        "2a69858f63545f8452a90524474b8859469ca06e52d7d4404d08d0278171546d",
+        "9c02e6ed9f2d7b91a6be0796de5b2605085642545f56079a8759b946f81ed351",
+        "ed4865a61aada2b14262deb60b5ccac5b8ef37f3df8b68cfa9d88c262225f89d",
+        "1b116ac51f52d9d2fa5b02a62ae5efa2a0b7aa31a5abd2d20d02c6bb5289684f",
+        "163f841a79813d06e3dd3fe3662734f49bc5cc020c41a81e11b2903005700e50",
+        "d6c6958437610fd52ae44bafccc7940bf8fd26917ade7b55c0b15d5b70eb6609",
+        "d4367a2ced0d467a3ae3195ee375888e545722b6d653479faebf19d886ffbc8f",
+        "fbc4a385d5419a0f667abcc4fe09efc503accc057e7a4c84acfb9250c006b32e",
+        "a584b1d4375a4e15706bab392601536378334d754cd491eef59611a949345d98",
+        "8c5379636b9f91d91a0eb4d4101846a147e205c450e32ff854e25aba098a862d",
+        "83338d52af9dd2dedc14e052d0bed495013dfde0ed87a88abb8cd8cec85e7109",
+        "2925ec80c1a2511fbd92c23a3ac1210c588e574620c8644ff383fa61ae49cce7",
+        "0f6fb936332ff8eda213ca907407f6f6e88bdedc39d36e72a4d271a921efba91",
+        "c0b8ebd97919568c0eb3d91c5440d82c5113ba2364ee7130d94a54602c4e4f27",
+        "dfa4e1e4aa007f82aae40be9c718137e1315e19da46a329a6caf4253a80ba3d3",
+        "fe3cbba95b537ec75166eb548c3be6a85c88ca789d79557c176e8c1b90b3095f",
+        "2963ba9fe2572c0c7827faaaa99bc2ba4863061f7ec0f61ac536b9c576679ffc",
+        "6eb88bfa4d07d0fbdc5eb2d77c2504749b532efca883534a51781b62aa30ba65",
+        "de5c2ae29dc7d7aa61a36f894665b8a59101616b3286bbc43c488f4e6d2d6be2",
+        "352918398570aff052eb9044299ef7f97e8779e3b1572d2db44302746fa3e021",
+        "f5c78b0f902f759fc3ca2763ec585ff200fbc9837431b6df02398e5eb13f6fe9",
+        "be696289775fa55f47982dade7573a69398b084b21e4e02d5d13523bc315033e",
+        "86e17e71a1b645e3efebb71eca1c4664a2b324bf99fd410966da373bb7357419",
+        "2d0173464be0053ac627ef6024bc8c4056efe40520c148cc7b4fdcc8285390a8",
+        "7f77a14d6175851afd844cdd4f289ab566e120190d42d57b167932c05964b2e5",
+        "aab1912c61e2a8c99c2220cb5f8cc3ca0db82e9d8e655022e379f433aa701c49",
+        "68076b2e51b9b32d84d0a69bb09a42c0f0c78a55171b25b881dd6f272ff9076b",
+        "f8480344e34ad147ef9960af2d2a1631201642c93a7c0ec59ef432df874682fe",
+        "63e870e86c4a95a4afbdfb75ca9f2f5928fbd866e3d8233d23f914603ed46178",
+        "d04afced8358884ac74b60c73121d3f6d5fd54267501b891acc9577652f55358",
+        "7f17d74afce5950c93c56c2acfecd1a3e98a445f8f06652d2fa1f0c4b042c2cf",
+        "fdc8f413371d6de57d94b73fb2ba130ead6aaec491d2365418abf301cc31fbec",
+        "201ae8590dcd4ef338f431c642d9a3e2381ca8d461fa3697977d98a3535aff86",
+        "41b38461bb19e20d73392ad96ff453e19d9256d3e67232bdce68353600fbadb8",
+        "008800687c883595708041976240864c6f16b947e73355850e2fec6278f271a6",
+        "386abe200dd33e7d8b82497078af9bc8bdcd29d4f576d124f4cd7ab7d62de3ac",
+        "ccfb11a1968121793585de0a46d3fa65d8622208de59f5807a64f09b5655cf6b",
+        "792289bcfde5056b063d80b24d2cc547cd69b66d68d17cda260802b42ca6deb7",
+        "9968f72a0025372c119a57aaa2cc6bc4097af32f4fbe74426400d40860fbeafe",
+        "e494f16da9c92c9ff3a1084b57845cf35141f5235bd314137922762491b4ef29",
+        "ce7cb8456d5e2d86e8df3de8fc9d405de713692c9a55f7c23b23f8c1350514ff",
+        "51a69a4817e311923ecbff58b56e0579488023166325f5a7c7ca6b9f3d6bba7f",
+        "a485b7b34fb0216a40b62dbbb2fd49dfeab651e44ea5adf069b7aa377f40b612",
+        "3c527f8b5556a7e4d73f5c4a9fd929f16e620c04b71b12e42d3b450c00a83803",
+        "33b1d7ab84b04b90145503f87471ba6ba742bd858da108245784f618954c9cb4",
+        "984c179490367dc2d4a3f94037f7b78d9a42d87ea8eccf19bdd4b9e377c3dcb7",
+        "8fa6b7139776fa3f4816f6b39562aa967f02a5a619ce76d24c9dfe1f4ac0e627",
+        "d32ffff650711171cce566a61c7ffc55d1fe6a52ff3486aaf25525659a5db570",
+        "9c05774a36aa9d0bfb071973e55d27d025c6fd21d0cd010ddc9432da04c552c9",
+        "8a377da699bb85cf793c463649b1e53352c4d289c10a463e3da347cf0a7ce663",
+        "b632a32ff6ccbe53c399095a47276937e0fa11f588e8166331c46282df6d7292",
+        "86309e3a515432e814101aab1e718e1336dca9f91ef271ca4ead50f5bbc48d0b",
+        "bffc5b71402d586aeea2ad682ede1c2b89adc37ff43816405816deccd3cae21b",
+        "9727623aaf308cc8ce711e0b5f40fa76c906c9ca9f2892bb00f86f16dd297a32",
+        "89f4c1bce56473e96bcd9fe06c07ae9e332a2b5f782fe6e3f2dcb88e57796025",
+        "1272c8ba048225f0348819c6962f970622e05f2ad708a02932ad1a5b6ef0c6c5",
+        "12133e775dea36c42631f3cca0b58d7af46cf3797ba690f302b5d28328bc4bce",
+        "2b9d357c0bc0c4ef92645731fb49f3b82d19f0bca6191549c820e23b5f7ef488",
+        "03f32ebf322815798d5c4596c83265274df86292ec74b65fce3b6e68f8bd6dc6",
+        "b6b1e6eeeb449e2f34c52505f98ac857f46a8f98bfa9a9e4a86bc063ac2df669",
+        "e458ce180dc8360f55219f23c6ff7df9a4fd0fffe2738e0385114d63b5665cfa",
+        "84e476d0a1d5c9cb50805e32132502d4f403150f68e2405f6268276a0cd21358",
+        "c09b56491c472926ca09562950096d213221592a9bae27b5b6c067587f2c1bf2",
+        "a7163a4e8c61c064ac54a631159ec2c1726a1beadb41fe30ad71a276e32719b5",
+        "3cd3a864fdf0f6d355d0628f364cbe4cb39fbed237a90a6fe5d512dc9c3780b0",
+        "a5bfc49544ea5314339dd3c66e3147b7432325ceed7fdf5bba4c168417ee894d",
+        "a7dce1d4ea213bfe0522c8a40d790b450725b2265fce7f487a8412f065408466",
+        "53cf25cc550b0a6e6a4df67e412550efe85f466e19de0a3f75e5f4a279ebca3c",
+        "e3b7cf4bc05489c7ab04fcd06f44429b10f3e397194ac335c7f04e3275305a58",
+        "f1ea7417154ff412564381d0579245d5c5392f689cf156dab70392edb4575159",
+        "ba3455b72800bcb2c4826532ee07747eb8cd5ad1357b57a0304bbad011298a5d",
+        "86e9cee8ee0f181f5c32bc4624a4ad3aea76ee9e31c6ae2aa5a00be155875e54",
+        "c8371b4a906542fbc26981fe54579031a6f23a3728accb5dfd2044e7dd2dbfe6",
+        "db2902d25a95a72c081ef5685e8b4406963853fcf06e11f37b247b1486e697b2",
+        "1beff6ec8bd1ebafa3923c96d6c1c1fc25d4ceeb12f6c7b04f56a960f42c8ebe",
+        "1cf844c3c35d828aac85f93e1f5c611d2161df326163b123f6907f1b54a6bc1e",
+        "22adf3131035ed1ef9808b658223a4278d5a06efb648577e88114a7b814e65cb",
+        "56d44dbdaa62c1e1f826f1a99a55e4415d99f27043bcc3b999bb79115aa1cf89",
+        "c805263481303944d9189469488d1dd36dbdc6d6d42fdc2971375051dfc511db",
+        "5ebdcd3f7e2fe558be557d799f3ced886fc6a08cf38fa775d713f3f8b9485246",
+        "7da5931e8cbcb6e151f2106e0b5f5198f44e62f2b29a4e47f3e3a4b05e622a36",
+        "7dd08e28700d60231868088da9cbbb46056b732076edf1d6e07b816f9563594e",
+        "b9be5856487edf3e7814e55bec8c118ddb5bef8150fb9ee74b40dae18b512a9e",
+        "2f481eb9eb3ae2556ca6bd38478a7da87af01f0428242173adb086abb3258507",
+        "3d5e3dda5b0c2cdab22ca513b4cebb024a6c260a90da24414e751d7cb0ee68b7",
+        "d67a3388529c932f85daaa03c114dde54661716a33aada66b482337ff816c23e",
+        "d16c6c6ad379b79cf417e1339afa81e63b5be20a6d19dbb9c6a5991cf7f78825",
+        "fb6e7bde608b1bc0f5be4c34a63c51a4b2e934c91057bbd1e83860125d2e917c",
+        "01902ecdab30d33d0df32fd32e663f46ec1aa09b10fbbaa5cca5b9038f635da4",
+        "322428a14306d9cd75a54d7d4ce586c5a62a4beb84929f36703480c87a16baa0",
+        "ae494e35f8632d1e89834750bf6b9f83a5abaf5ae108d387d75a99a41f262f53",
+        "4d020bfff37176bafea76c529dbd743435c95efa64e4f79b613fa6ca11770ad7",
+        "898922cbc36eaff9b38f17dd32fcfd22540d3df4bef31a0b6100660a34893f7b",
+        "7fea96d799e7d286d99d1be11c28d02180d877d48d1d8258787c8e8df5b25467",
+        "ef299195417e6aa3fe07ce847bbb1e4dfab8959700ccac0f0ca6f62d0d78bde5",
+        "85e20d7eeea9600eb4313ba2f821fd25fa32a31f4d522b20bd71a4d4c7d3a9af",
+        "6c748202320e8edc1fc1c5d0929d1824f728a0edfdb6732e59dcf7041e96edb4",
+        "615079f8a57735afd423f355877a3421375dbad5ac485b3ccee503ec14788cec",
+        "bbe47ac28fc3458d21c89b042e75539211e63f55e80f52edaee8365d2ca1d311",
+        "a280b5d71c849e421292e484151e77dc1a0315e443100275a9b4fbded1ab6140",
+        "a2a7815b07c156de0b9f5a2fd0c6ad73bd70d06fef7c328c0fefe95a43899c52",
+        "c5252ffc458658cd274ea080b4c52a84ab0915d7e9fdc949b94bbc462fb46543",
+        "bfa7188cd6e33ceb7db6c87b8afc3cea4098b90293d0d962315cc83d51f4710f",
+        "a2f018444b66aef64c149c1bdf0bec28784772f09cc4abb3dcccb882bde089f8",
+        "27f7d66ded874e6b5ac1843ea8147df16c79ac09fd1db2a5a0f5d6e76dea12e6",
+        "a15e25ef9f2b99281a81a9926cd2b5bc9335ece7c35dd4ad99845bfb0ba8c0e9",
+        "6ef54ff7810f3b28821950a29ec9a797c5f2b3fe79fb50bda7c392777752a4ff",
+        "77a20dc05f10e9b4f494d3d22cdcddb7cbe5e99f951c2cee900c9024f34ab4e8",
     ];
 
     /// Test that the MMR root computation remains stable by comparing against previously computed
     /// roots.
     #[test]
     fn test_root_stability() {
-        let mut mmr = Mmr::<Sha256>::new();
-        for i in 0..200 {
-            for _ in 0u64..i {
-                let element = hash(&i.to_be_bytes());
-                mmr.add(&element);
+        let mut hasher = Sha256::new();
+        for i in 0u64..200 {
+            let mut mmr = Mmr::<Sha256>::new();
+            for j in 0u64..i {
+                hasher.update(&j.to_be_bytes());
+                let element = hasher.finalize();
+                mmr.add(&mut hasher, &element);
             }
-            let root = mmr.root();
+            let root = mmr.root(&mut hasher);
+            let expected_root = ROOTS[i as usize];
+            assert_eq!(hex(&root), expected_root);
+
+            // confirm pruning doesn't affect the root computation
+            mmr.prune_all();
+            let root2 = mmr.root(&mut hasher);
+            assert_eq!(root, root2);
+        }
+    }
+
+    #[test]
+    fn test_pop() {
+        let mut hasher = Sha256::new();
+        let mut mmr = Mmr::<Sha256>::new();
+        for i in 0u64..199 {
+            hasher.update(&i.to_be_bytes());
+            let element = hasher.finalize();
+            mmr.add(&mut hasher, &element);
+        }
+        let root = mmr.root(&mut hasher);
+        let expected_root = ROOTS[199];
+        assert_eq!(hex(&root), expected_root);
+
+        // Pop off one node at a time until empty, confirming the root hash is still is as expected.
+        for i in (0..199u64).rev() {
+            assert!(mmr.pop().is_ok());
+            let root = mmr.root(&mut hasher);
             let expected_root = ROOTS[i as usize];
             assert_eq!(hex(&root), expected_root);
         }
+
+        assert!(
+            matches!(mmr.pop().unwrap_err(), Empty),
+            "pop on empty MMR should fail"
+        );
+
+        // Test popping over a prune boundary.
+        for i in 0u64..199 {
+            hasher.update(&i.to_be_bytes());
+            let element = hasher.finalize();
+            mmr.add(&mut hasher, &element);
+        }
+        let boundary = mmr.prune(100).unwrap();
+        while mmr.size() - 1 > boundary {
+            assert!(mmr.pop().is_ok());
+        }
+        assert!(matches!(mmr.pop().unwrap_err(), ElementPruned));
     }
 }

@@ -9,11 +9,11 @@ use bytes::BufMut;
 use commonware_consensus::threshold_simplex::Prover;
 use commonware_cryptography::{
     bls12381::primitives::{group::Element, poly},
-    Array, Hasher,
+    Hasher,
 };
-use commonware_runtime::{Sink, Stream};
+use commonware_runtime::{Sink, Spawner, Stream};
 use commonware_stream::{public_key::Connection, Receiver, Sender};
-use commonware_utils::SizedSerialize;
+use commonware_utils::{hex, Array, SizedSerialize};
 use futures::{channel::mpsc, StreamExt};
 use prost::Message as _;
 use rand::Rng;
@@ -23,8 +23,8 @@ use tracing::{debug, info};
 const GENESIS: &[u8] = b"commonware is neat";
 
 /// Application actor.
-pub struct Application<R: Rng, H: Hasher, Si: Sink, St: Stream> {
-    runtime: R,
+pub struct Application<R: Rng + Spawner, H: Hasher, Si: Sink, St: Stream> {
+    context: R,
     indexer: Connection<Si, St>,
     prover: Prover<H::Digest>,
     other_prover: Prover<H::Digest>,
@@ -34,16 +34,16 @@ pub struct Application<R: Rng, H: Hasher, Si: Sink, St: Stream> {
     mailbox: mpsc::Receiver<Message<H::Digest>>,
 }
 
-impl<R: Rng, H: Hasher, Si: Sink, St: Stream> Application<R, H, Si, St> {
+impl<R: Rng + Spawner, H: Hasher, Si: Sink, St: Stream> Application<R, H, Si, St> {
     /// Create a new application actor.
     pub fn new<P: Array>(
-        runtime: R,
+        context: R,
         config: Config<H, Si, St, P>,
     ) -> (Self, Supervisor<P>, Mailbox<H::Digest>) {
         let (sender, mailbox) = mpsc::channel(config.mailbox_size);
         (
             Self {
-                runtime,
+                context,
                 indexer: config.indexer,
                 prover: config.prover,
                 other_prover: config.other_prover,
@@ -71,11 +71,11 @@ impl<R: Rng, H: Hasher, Si: Sink, St: Stream> Application<R, H, Si, St> {
                 }
                 Message::Propose { index, response } => {
                     // Either propose a random message (prefix=0) or include a consensus certificate (prefix=1)
-                    let msg = match self.runtime.gen_bool(0.5) {
+                    let msg = match self.context.gen_bool(0.5) {
                         true => {
                             // Generate a random message
                             let mut msg = vec![0; 17];
-                            self.runtime.fill(&mut msg[1..]);
+                            self.context.fill(&mut msg[1..]);
                             msg
                         }
                         false => {
@@ -123,7 +123,7 @@ impl<R: Rng, H: Hasher, Si: Sink, St: Stream> Application<R, H, Si, St> {
                     // Hash the message
                     self.hasher.update(&msg);
                     let digest = self.hasher.finalize();
-                    info!(?msg, payload = ?digest, "proposed");
+                    info!(msg = hex(&msg), payload = ?digest, "proposed");
 
                     // Publish to indexer
                     let msg = wire::PutBlock {
@@ -208,15 +208,15 @@ impl<R: Rng, H: Hasher, Si: Sink, St: Stream> Application<R, H, Si, St> {
                 Message::Prepared { proof, payload } => {
                     let (view, _, _, signature, seed) =
                         self.prover.deserialize_notarization(proof).unwrap();
-                    let signature = signature.serialize();
-                    let seed = seed.serialize();
+                    let signature = hex(&signature.serialize());
+                    let seed = hex(&seed.serialize());
                     info!(view, ?payload, ?signature, ?seed, "prepared")
                 }
                 Message::Finalized { proof, payload } => {
                     let (view, _, _, signature, seed) =
                         self.prover.deserialize_finalization(proof.clone()).unwrap();
-                    let signature = signature.serialize();
-                    let seed = seed.serialize();
+                    let signature = hex(&signature.serialize());
+                    let seed = hex(&seed.serialize());
                     info!(view, ?payload, ?signature, ?seed, "finalized");
 
                     // Post finalization
