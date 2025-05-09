@@ -9,8 +9,10 @@ use std::time::Duration;
 use thiserror::Error;
 
 mod actor;
-mod address;
 mod ingress;
+mod metrics;
+mod record;
+mod set;
 
 pub use actor::Actor;
 pub use ingress::{Mailbox, Oracle, Reservation};
@@ -24,28 +26,23 @@ pub struct Config<C: Scheme> {
     pub mailbox_size: usize,
     pub synchrony_bound: Duration,
     pub tracked_peer_sets: usize,
+    pub max_peer_set_size: usize,
     pub allowed_connection_rate_per_peer: Quota,
     pub peer_gossip_max_count: usize,
 }
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("invalid IP length: {0}")]
-    InvalidIPLength(usize),
     #[error("too many peers: {0}")]
     TooManyPeers(usize),
     #[error("private IPs not allowed: {0}")]
     PrivateIPsNotAllowed(IpAddr),
-    #[error("network peer unsigned")]
-    PeerUnsigned,
-    #[error("invalid public key")]
-    InvalidPublicKey,
     #[error("received self")]
     ReceivedSelf,
     #[error("invalid signature")]
     InvalidSignature,
+    #[error("synchrony bound violated")]
+    SynchronyBound,
     #[error("peervec length mismatch: expected {0} bytes, got {1}")]
     BitVecLengthMismatch(usize, usize),
-    #[error("peervec has extra bit")]
-    BitVecExtraBit,
 }

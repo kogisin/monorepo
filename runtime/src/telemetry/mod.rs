@@ -1,4 +1,4 @@
-//! Utility functions for metrics
+//! Utilities for collecting and reporting telemetry data.
 
-pub mod histogram;
-pub mod status;
+pub mod metrics;
+pub mod traces;

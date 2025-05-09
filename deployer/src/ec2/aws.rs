@@ -1,6 +1,10 @@
 //! AWS EC2 SDK function wrappers
 
-use crate::ec2::{utils::RETRY_INTERVAL, PortConfig};
+use super::{MEMLEAK_PORT, METRICS_PORT, SYSTEM_PORT};
+use crate::ec2::{
+    utils::{exact_cidr, DEPLOYER_MAX_PORT, DEPLOYER_MIN_PORT, DEPLOYER_PROTOCOL, RETRY_INTERVAL},
+    PortConfig,
+};
 use aws_config::BehaviorVersion;
 pub use aws_config::Region;
 use aws_sdk_ec2::error::BuildError;
@@ -17,7 +21,7 @@ use tokio::time::sleep;
 
 /// Creates an EC2 client for the specified AWS region
 pub async fn create_ec2_client(region: Region) -> Ec2Client {
-    let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
+    let config = aws_config::defaults(BehaviorVersion::v2025_01_17())
         .region(region)
         .load()
         .await;
@@ -46,14 +50,14 @@ pub async fn delete_key_pair(client: &Ec2Client, key_name: &str) -> Result<(), E
     Ok(())
 }
 
-/// Finds the latest Ubuntu 22.04 ARM64 AMI in the region
+/// Finds the latest Ubuntu 24.04 ARM64 AMI in the region
 pub async fn find_latest_ami(client: &Ec2Client) -> Result<String, Ec2Error> {
     let resp = client
         .describe_images()
         .filters(
             Filter::builder()
                 .name("name")
-                .values("ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-arm64-server-*")
+                .values("ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*")
                 .build(),
         )
         .filters(
@@ -213,14 +217,10 @@ pub async fn create_security_group_monitoring(
         .group_id(&sg_id)
         .ip_permissions(
             IpPermission::builder()
-                .ip_protocol("tcp")
-                .from_port(0)
-                .to_port(65535)
-                .ip_ranges(
-                    IpRange::builder()
-                        .cidr_ip(format!("{}/32", deployer_ip))
-                        .build(),
-                )
+                .ip_protocol(DEPLOYER_PROTOCOL)
+                .from_port(DEPLOYER_MIN_PORT)
+                .to_port(DEPLOYER_MAX_PORT)
+                .ip_ranges(IpRange::builder().cidr_ip(exact_cidr(deployer_ip)).build())
                 .build(),
         )
         .send()
@@ -256,12 +256,20 @@ pub async fn create_security_group_binary(
         .group_id(&sg_id)
         .ip_permissions(
             IpPermission::builder()
+                .ip_protocol(DEPLOYER_PROTOCOL)
+                .from_port(DEPLOYER_MIN_PORT)
+                .to_port(DEPLOYER_MAX_PORT)
+                .ip_ranges(IpRange::builder().cidr_ip(exact_cidr(deployer_ip)).build())
+                .build(),
+        )
+        .ip_permissions(
+            IpPermission::builder()
                 .ip_protocol("tcp")
-                .from_port(0)
-                .to_port(65535)
+                .from_port(METRICS_PORT as i32)
+                .to_port(METRICS_PORT as i32)
                 .ip_ranges(
                     IpRange::builder()
-                        .cidr_ip(format!("{}/32", deployer_ip))
+                        .cidr_ip(exact_cidr(monitoring_ip))
                         .build(),
                 )
                 .build(),
@@ -269,11 +277,23 @@ pub async fn create_security_group_binary(
         .ip_permissions(
             IpPermission::builder()
                 .ip_protocol("tcp")
-                .from_port(9090)
-                .to_port(9090)
+                .from_port(SYSTEM_PORT as i32)
+                .to_port(SYSTEM_PORT as i32)
                 .ip_ranges(
                     IpRange::builder()
-                        .cidr_ip(format!("{}/32", monitoring_ip))
+                        .cidr_ip(exact_cidr(monitoring_ip))
+                        .build(),
+                )
+                .build(),
+        )
+        .ip_permissions(
+            IpPermission::builder()
+                .ip_protocol("tcp")
+                .from_port(MEMLEAK_PORT as i32)
+                .to_port(MEMLEAK_PORT as i32)
+                .ip_ranges(
+                    IpRange::builder()
+                        .cidr_ip(exact_cidr(monitoring_ip))
                         .build(),
                 )
                 .build(),

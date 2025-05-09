@@ -1,10 +1,11 @@
 use clap::{value_parser, Arg, Command};
+use commonware_codec::Encode;
 use commonware_cryptography::{
     bls12381::{
         dkg::ops,
-        primitives::{group::Element, poly},
+        primitives::{poly, variant::MinSig},
     },
-    Ed25519, Scheme,
+    Ed25519, Signer,
 };
 use commonware_utils::{hex, quorum};
 use rand::{rngs::StdRng, SeedableRng};
@@ -45,23 +46,17 @@ fn main() {
     }
     validators.sort_by(|(_, a), (_, b)| a.cmp(b));
     let n = validators.len() as u32;
-    let t = quorum(n).expect("unable to compute threshold");
+    let t = quorum(n);
 
     // Generate secret
     let mut rng = StdRng::seed_from_u64(seed);
-    let (public, shares) = ops::generate_shares(&mut rng, None, n, t);
+    let (public, shares) = ops::generate_shares::<_, MinSig>(&mut rng, None, n, t);
 
     // Log secret
-    println!("polynomial: {}", hex(&public.serialize()));
-    let public = poly::public(&public);
-    println!("public: {}", hex(&public.serialize()));
+    println!("polynomial: {}", hex(&public.encode()));
+    println!("public: {}", poly::public::<MinSig>(&public));
     for share in shares {
         let validator = validators[share.index as usize].0;
-        println!(
-            "share (index={} validator={}): {}",
-            share.index,
-            validator,
-            hex(&share.serialize())
-        );
+        println!("validator={}: {}", validator, share,);
     }
 }

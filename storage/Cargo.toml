@@ -2,7 +2,7 @@
 name = "commonware-storage"
 edition = "2021"
 publish = true
-version = "0.0.17"
+version = "0.0.50"
 license = "MIT OR Apache-2.0"
 description = "Persist and retrieve data from an abstract store."
 readme = "README.md"
@@ -11,14 +11,15 @@ repository = "https://github.com/commonwarexyz/monorepo/tree/main/storage"
 documentation = "https://docs.rs/commonware-storage"
 
 [dependencies]
-bytes = { workspace = true }
+commonware-codec = {workspace = true}
 commonware-cryptography = {workspace = true}
-thiserror = { workspace = true }
-commonware-utils = { workspace = true }
-futures = { workspace = true }
-commonware-runtime = { workspace = true }
-crc32fast = "1.4.2"
 commonware-macros = { workspace = true }
+commonware-runtime = { workspace = true }
+commonware-utils = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+crc32fast = "1.4.2"
 prometheus-client = { workspace = true }
 futures-util = { workspace = true }
 tracing = { workspace = true }
@@ -45,6 +46,17 @@ harness = false
 path = "src/bmt/benches/bench.rs"
 
 [[bench]]
+name="index"
+harness = false
+path = "src/index/benches/bench.rs"
+
+[[bench]]
+name="journal"
+harness = false
+path = "src/journal/benches/bench.rs"
+
+[[bench]]
 name="mmr"
 harness = false
 path = "src/mmr/benches/bench.rs"
+

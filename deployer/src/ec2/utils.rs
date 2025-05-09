@@ -14,6 +14,15 @@ pub const MAX_POLL_ATTEMPTS: usize = 30;
 /// Interval between retries
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Protocol for deployer ingress
+pub const DEPLOYER_PROTOCOL: &str = "tcp";
+
+/// Minimum port for deployer ingress
+pub const DEPLOYER_MIN_PORT: i32 = 0;
+
+/// Maximum port for deployer ingress
+pub const DEPLOYER_MAX_PORT: i32 = 65535;
+
 /// Fetch the current machine's public IPv4 address
 pub async fn get_public_ip() -> Result<String, Error> {
     // icanhazip.com is maintained by Cloudflare as of 6/6/2021 (https://major.io/p/a-new-future-for-icanhazip/)
@@ -26,21 +35,21 @@ pub async fn get_public_ip() -> Result<String, Error> {
     Ok(result)
 }
 
-/// Copies a local file to a remote instance via SCP with retries
-pub async fn scp_file(
+/// Copies a local file to a remote instance via rsync with retries
+pub async fn rsync_file(
     key_file: &str,
     local_path: &str,
     ip: &str,
     remote_path: &str,
 ) -> Result<(), Error> {
     for _ in 0..MAX_SSH_ATTEMPTS {
-        let output = Command::new("scp")
-            .arg("-i")
-            .arg(key_file)
-            .arg("-o")
-            .arg("ServerAliveInterval=600")
-            .arg("-o")
-            .arg("StrictHostKeyChecking=no")
+        let output = Command::new("rsync")
+            .arg("-az")
+            .arg("-e")
+            .arg(format!(
+                "ssh -i {} -o ServerAliveInterval=600 -o StrictHostKeyChecking=no",
+                key_file
+            ))
             .arg(local_path)
             .arg(format!("ubuntu@{}:{}", ip, remote_path))
             .output()
@@ -91,7 +100,13 @@ pub async fn poll_service_active(key_file: &str, ip: &str, service: &str) -> Res
             .arg(format!("systemctl is-active {}", service))
             .output()
             .await?;
-        if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "active" {
+        let parsed = String::from_utf8_lossy(&output.stdout);
+        let parsed = parsed.trim();
+        if parsed == "active" {
+            return Ok(());
+        }
+        if service == "binary" && parsed == "failed" {
+            warn!(service, "service failed to start (check logs and update)");
             return Ok(());
         }
         warn!(error = ?String::from_utf8_lossy(&output.stderr), service, "active status check failed");
@@ -114,7 +129,13 @@ pub async fn poll_service_inactive(key_file: &str, ip: &str, service: &str) -> R
             .arg(format!("systemctl is-active {}", service))
             .output()
             .await?;
-        if String::from_utf8_lossy(&output.stdout).trim() == "inactive" {
+        let parsed = String::from_utf8_lossy(&output.stdout);
+        let parsed = parsed.trim();
+        if parsed == "inactive" {
+            return Ok(());
+        }
+        if service == "binary" && parsed == "failed" {
+            warn!(service, "service was never active");
             return Ok(());
         }
         warn!(error = ?String::from_utf8_lossy(&output.stderr), service, "inactive status check failed");
@@ -125,7 +146,7 @@ pub async fn poll_service_inactive(key_file: &str, ip: &str, service: &str) -> R
 
 /// Enables BBR on a remote instance by copying and applying sysctl settings.
 pub async fn enable_bbr(key_file: &str, ip: &str, bbr_conf_local_path: &str) -> Result<(), Error> {
-    scp_file(
+    rsync_file(
         key_file,
         bbr_conf_local_path,
         ip,
@@ -140,4 +161,9 @@ pub async fn enable_bbr(key_file: &str, ip: &str, bbr_conf_local_path: &str) -> 
     .await?;
     ssh_execute(key_file, ip, "sudo sysctl -p /etc/sysctl.d/99-bbr.conf").await?;
     Ok(())
+}
+
+/// Converts an IP address to a CIDR block
+pub fn exact_cidr(ip: &str) -> String {
+    format!("{}/32", ip)
 }

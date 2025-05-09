@@ -1,55 +1,94 @@
-use crate::Error;
-use bytes::Bytes;
+use bytes::{Buf, BufMut};
+use commonware_codec::{Error as CodecError, FixedSize, Read, ReadExt, Write};
 use rand::{CryptoRng, Rng};
-use x25519_dalek::{EphemeralSecret, PublicKey};
+use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
 
-const PUBLIC_KEY_LENGTH: usize = 32;
+#[derive(PartialEq, Eq, Hash, Copy, Clone, Debug)]
+pub struct PublicKey {
+    inner: X25519PublicKey,
+}
+
+impl PublicKey {
+    pub fn from_secret(secret: &EphemeralSecret) -> Self {
+        PublicKey {
+            inner: X25519PublicKey::from(secret),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn from_bytes(array: [u8; 32]) -> Self {
+        PublicKey {
+            inner: X25519PublicKey::from(array),
+        }
+    }
+}
+
+impl AsRef<x25519_dalek::PublicKey> for PublicKey {
+    fn as_ref(&self) -> &x25519_dalek::PublicKey {
+        &self.inner
+    }
+}
+
+impl Write for PublicKey {
+    fn write(&self, buf: &mut impl BufMut) {
+        self.inner.as_bytes().write(buf);
+    }
+}
+
+impl Read for PublicKey {
+    type Cfg = ();
+
+    fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
+        let public_key = <[u8; Self::SIZE]>::read(buf)?;
+        Ok(PublicKey {
+            inner: X25519PublicKey::from(public_key),
+        })
+    }
+}
+
+impl FixedSize for PublicKey {
+    const SIZE: usize = 32;
+}
 
 pub fn new<R: Rng + CryptoRng>(rng: &mut R) -> EphemeralSecret {
     EphemeralSecret::random_from_rng(rng)
 }
 
-pub fn decode_public_key(public_key: &[u8]) -> Result<PublicKey, Error> {
-    // Construct a public key array from the data
-    let public_key: [u8; PUBLIC_KEY_LENGTH] = match public_key.as_ref().try_into() {
-        Ok(key) => key,
-        Err(_) => return Err(Error::InvalidEphemeralPublicKey),
-    };
-
-    // Create the public key from the array
-    Ok(PublicKey::from(public_key))
-}
-
-pub fn encode_public_key(public_key: PublicKey) -> Bytes {
-    public_key.as_bytes().to_vec().into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use commonware_codec::{DecodeExt, Encode as _};
+    use commonware_runtime::{deterministic, Runner};
 
     #[test]
-    fn test_encode_decode_public_key() {
-        let mut rng = rand::thread_rng();
-        let secret = new(&mut rng);
-        let public_key = PublicKey::from(&secret);
-
-        let encoded = encode_public_key(public_key);
-        let decoded = decode_public_key(&encoded).unwrap();
-
-        assert_eq!(public_key, decoded);
+    fn test_codec() {
+        let executor = deterministic::Runner::default();
+        executor.start(|mut context| async move {
+            // Create a random public key
+            let mut buf = [0u8; PublicKey::SIZE];
+            context.fill(&mut buf);
+            let original = PublicKey {
+                inner: X25519PublicKey::from(buf),
+            };
+            // Encode and decode the public key
+            let encoded = original.encode();
+            assert_eq!(encoded.len(), PublicKey::SIZE);
+            let decoded = PublicKey::decode(encoded).unwrap();
+            assert_eq!(original, decoded);
+        });
     }
 
     #[test]
-    fn invalid_public_key() {
+    fn test_decode_invalid() {
         // Create a Bytes object that is too short
         let invalid_bytes = Bytes::from(vec![1, 2, 3]); // Length 3 instead of 32
-        let result = decode_public_key(&invalid_bytes);
-        assert!(matches!(result, Err(Error::InvalidEphemeralPublicKey)));
+        let result = PublicKey::decode(invalid_bytes);
+        assert!(result.is_err());
 
         // Create Bytes object that's too long
         let too_long_bytes = Bytes::from(vec![0u8; 33]); // Length 33
-        let result = decode_public_key(&too_long_bytes);
-        assert!(matches!(result, Err(Error::InvalidEphemeralPublicKey)));
+        let result = PublicKey::decode(too_long_bytes);
+        assert!(result.is_err());
     }
 }

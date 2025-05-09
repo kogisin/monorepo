@@ -21,24 +21,20 @@
 //! it can be simulated deterministically.
 //!
 //! In any handshake, the dialer is the party that attempts to connect to some known address/identity (public key)
-//! and the recipient of this connection is the dialee. Upon forming a TCP connection, the dialer sends a signed
-//! handshake message to the dialee.
+//! and the recipient of this connection is the listener. Upon forming a TCP connection, the dialer sends a signed
+//! handshake message to the listener. Besides the signature and the public key of the dialer, the handshake message
+//! contains:
 //!
-//! ```protobuf
-//! message Handshake {
-//!     bytes recipient_public_key = 1;
-//!     bytes ephemeral_public_key = 2;
-//!     uint64 timestamp = 3;
-//!     Signature signature = 4;
-//! }
-//! ```
+//! - The receiver's public key.
+//! - The sender's ephemeral public key (used to establish a shared secret).
+//! - The current timestamp (used to prevent replay attacks).
 //!
-//! The dialee verifies the public keys are well-formatted, the timestamp is valid (not too old/not too far in the future),
-//! and that the signature is valid. If all these checks pass, the dialee checks to see if it is already connected or dialing
+//! The listener verifies the public keys are well-formatted, the timestamp is valid (not too old/not too far in the future),
+//! and that the signature is valid. If all these checks pass, the listener checks to see if it is already connected or dialing
 //! this peer. If it is, it drops the connection. If it isn't, it sends back its own signed handshake message (same as above)
 //! and considers the connection established.
 //!
-//! Upon receiving the dialee's handshake message, the dialer verifies the same data as the dialee and additionally verifies
+//! Upon receiving the listener's handshake message, the dialer verifies the same data as the listener and additionally verifies
 //! that the public key returned matches what they expected at the address. If all these checks pass, the dialer considers the
 //! connection established. If not, the dialer drops the connection.
 //!
@@ -48,35 +44,23 @@
 //!
 //! ## Encryption
 //!
-//! During the handshake (described above), a shared x25519 secret is established using a Diffie-Hellman Key Exchange. This
-//! x25519 secret is then used to create a ChaCha20-Poly1305 cipher for encrypting all messages exchanged with the peer.
+//! During the handshake (described above), a shared x25519 secret is established using a
+//! Diffie-Hellman Key Exchange. This x25519 secret is then used to create a ChaCha20-Poly1305
+//! cipher for encrypting all messages exchanged with the peer.
 //!
-//! ChaCha20-Poly1305 nonces (12 bytes) are constructed such that the first bit indicates whether the sender is a dialer (1) or
-//! dialee (0). The rest of the first byte (next 7 bits) is unused (set to 0). The next 2 bytes are a `u16` iterator.
-//! The next 8 bytes are a `u64` sequence number. When the sequence reaches `u64::MAX`, the iterator is incremented and the
-//! sequence is reset to 0. This technique provides each sender with a channel duration of `2^80` frames
-//! (and automatically terminates when this number of frames has been sent). In the blockchain context, validators often maintain
-//! long-lived connections with each other and avoiding connection re-establishment (to reset iterator/sequence with a new cipher)
-//! is desirable. The final byte is unused (set to 0).
+//! Each peer maintains a pair of ChaCha20-Poly1305 nonces (12 bytes), one for itself and one for
+//! the other. Each nonce is constructed using a counter that starts at either 1 for the dialer, or
+//! 0 for the listener. For each message sent, the relevant counter is incremented by 2, ensuring that
+//! the two counters have disjoint nonce spaces.
 //!
-//! ```text
-//! +---+---+---+---+---+---+---+---+---+---+---+---+
-//! | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |10 |11 |
-//! +---+---+---+---+---+---+---+---+---+---+---+---+
-//! | D |It(u16)|         Sequence(u64)         | U |
-//! +---+---+---+---+---+---+---+---+---+---+---+---+
-//!
-//! D = Dialer/Dialee, U = Unused, It = Iterator
-//! ```
-//!
-//! _We use a combination of `u64` (sequence) and `u16` (iterator) instead of implementing `u80/u88` because
-//! CPUs provide native support for `u64` operations (which will always be faster than an implementation of a
-//! "wrapping add" over arbitrary bytes). With this technique, almost all operations (other than iterator
-//! increments every `2^64` frames) are just a basic `u64` increment._
+//! The nonce is the least-significant 12 bytes of the counter, encoded big-endian. This provides 2^95 unique nonces
+//! per sender, sufficient for over 1 trillion years at 1 billion messages/second—far exceeding practical limits. This approach
+//! ensures well-behaving peers, as long as they both stay online, remain connected indefinitely (maximizing the stability
+//! of any p2p construction). In an unlikely case of overflow, the connection would terminate, and a new handshake would be required.
 //!
 //! This simple coordination prevents nonce reuse (which would allow for messages to be decrypted) and saves a small amount of
 //! bandwidth (no need to send the nonce alongside the encrypted message). This "pedantic" construction of the nonce
-//! also avoids accidentally reusing a nonce over long-lived connections when setting it to be a small hash (as in XChaCha-Poly1305).
+//! also avoids accidental reuse of a nonce over long-lived connections (when setting it to be a small hash as in XChaCha20-Poly1305).
 
 use commonware_cryptography::Scheme;
 use std::time::Duration;
@@ -85,9 +69,6 @@ mod connection;
 pub use connection::{Connection, IncomingConnection, Receiver, Sender};
 mod handshake;
 mod nonce;
-mod wire {
-    include!(concat!(env!("OUT_DIR"), "/wire.rs"));
-}
 mod x25519;
 
 /// Configuration for a connection.
@@ -102,18 +83,21 @@ pub struct Config<C: Scheme> {
     /// Cryptographic primitives.
     pub crypto: C,
 
-    /// Prefix for all signed messages to avoid replay attacks.
+    /// Prefix for all signed messages. Should be unique to the application.
+    /// Used to avoid replay attacks across different applications
     pub namespace: Vec<u8>,
 
-    /// Maximum size allowed for messages over any connection.
+    /// Maximum size allowed for messages (in bytes).
+    /// Used to prevent DoS attacks.
     pub max_message_size: usize,
 
     /// Time into the future that a timestamp can be and still be considered valid.
+    /// Used to handle clock skew between peers.
     pub synchrony_bound: Duration,
 
-    /// Duration after which a handshake message is considered stale.
+    /// Maximum age of a handshake message before it is considered stale.
     pub max_handshake_age: Duration,
 
-    /// Timeout for the handshake process.
+    /// Timeout for completing the handshake process.
     pub handshake_timeout: Duration,
 }

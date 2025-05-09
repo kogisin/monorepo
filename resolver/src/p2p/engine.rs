@@ -4,18 +4,16 @@ use super::{
     ingress::{Mailbox, Message},
     metrics,
 };
-use crate::{
-    p2p::{
-        wire::{self, peer_msg::Payload},
-        Coordinator, Producer,
-    },
-    Consumer,
-};
+use super::{wire, Coordinator, Producer};
+use crate::Consumer;
 use bytes::Bytes;
 use commonware_macros::select;
-use commonware_p2p::{Receiver, Recipients, Sender};
+use commonware_p2p::{
+    utils::codec::{wrap, WrappedSender},
+    Receiver, Recipients, Sender,
+};
 use commonware_runtime::{
-    telemetry::{
+    telemetry::metrics::{
         histogram,
         status::{CounterExt, Status},
     },
@@ -28,7 +26,6 @@ use futures::{
     StreamExt,
 };
 use governor::clock::Clock as GClock;
-use prost::Message as _;
 use rand::Rng;
 use std::{collections::HashMap, marker::PhantomData};
 use tracing::{debug, error, trace, warn};
@@ -111,7 +108,7 @@ impl<
         let (sender, receiver) = mpsc::channel(cfg.mailbox_size);
         let metrics = metrics::Metrics::init(context.clone());
         let fetcher = Fetcher::new(
-            context.clone(),
+            context.with_label("fetcher"),
             cfg.requester_config,
             cfg.fetch_retry_timeout,
             cfg.priority_requests,
@@ -147,8 +144,10 @@ impl<
 
     /// Inner run loop called by `start`.
     async fn run(mut self, network: (NetS, NetR)) {
-        let (mut sender, mut receiver) = network;
         let mut shutdown = self.context.stopped();
+
+        // Wrap channel
+        let (mut sender, mut receiver) = wrap((), network.0, network.1);
 
         // Set initial peer set.
         self.last_peer_set_id = Some(self.coordinator.peer_set_id());
@@ -249,6 +248,7 @@ impl<
 
                 // Handle network messages
                 msg = receiver.recv() => {
+                    // Break if the receiver is closed
                     let (peer, msg) = match msg {
                         Ok(msg) => msg,
                         Err(err) => {
@@ -256,7 +256,9 @@ impl<
                             return;
                         }
                     };
-                    let msg = match wire::PeerMsg::decode(msg) {
+
+                    // Skip if there is a decoding error
+                    let msg = match msg {
                         Ok(msg) => msg,
                         Err(err) => {
                             trace!(?err, ?peer, "decode failed");
@@ -264,9 +266,9 @@ impl<
                         }
                     };
                     match msg.payload {
-                        Some(Payload::Request(request)) => self.handle_network_request(peer, msg.id, request).await,
-                        Some(Payload::Response(response)) => self.handle_network_response(&mut sender, peer, msg.id, response).await,
-                        None => self.handle_network_response_empty(&mut sender, peer, msg.id).await,
+                        wire::Payload::Request(key) => self.handle_network_request(peer, msg.id, key).await,
+                        wire::Payload::Response(response) => self.handle_network_response(&mut sender, peer, msg.id, response).await,
+                        wire::Payload::ErrorResponse => self.handle_network_error_response(&mut sender, peer, msg.id).await,
                     };
                 },
 
@@ -293,19 +295,18 @@ impl<
     /// Handles the case where the application responds to a request from an external peer.
     async fn handle_serve(
         &mut self,
-        sender: &mut NetS,
+        sender: &mut WrappedSender<NetS, wire::Message<Key>>,
         peer: P,
         id: u64,
         response: Result<Bytes, oneshot::Canceled>,
         priority: bool,
     ) {
-        // Encode message. If the response is an error, send an empty response.
-        let msg = wire::PeerMsg {
-            id,
-            payload: response.ok().map(Payload::Response),
-        }
-        .encode_to_vec()
-        .into();
+        // Encode message
+        let payload: wire::Payload<Key> = match response {
+            Ok(data) => wire::Payload::Response(data),
+            Err(_) => wire::Payload::ErrorResponse,
+        };
+        let msg = wire::Message { id, payload };
 
         // Send message to peer
         let result = sender
@@ -321,14 +322,7 @@ impl<
     }
 
     /// Handle a network request from a peer.
-    async fn handle_network_request(&mut self, peer: P, id: u64, request: Bytes) {
-        // Parse request
-        let Ok(key) = Key::try_from(request.to_vec()) else {
-            trace!(?peer, ?id, "peer invalid request");
-            self.metrics.serve.inc(Status::Invalid);
-            return;
-        };
-
+    async fn handle_network_request(&mut self, peer: P, id: u64, key: Key) {
         // Serve the request
         trace!(?peer, ?id, "peer request");
         let mut producer = self.producer.clone();
@@ -348,7 +342,7 @@ impl<
     /// Handle a network response from a peer.
     async fn handle_network_response(
         &mut self,
-        sender: &mut NetS,
+        sender: &mut WrappedSender<NetS, wire::Message<Key>>,
         peer: P,
         id: u64,
         response: Bytes,
@@ -376,8 +370,13 @@ impl<
     }
 
     /// Handle a network response from a peer that did not have the data.
-    async fn handle_network_response_empty(&mut self, sender: &mut NetS, peer: P, id: u64) {
-        trace!(?peer, ?id, "peer response: empty");
+    async fn handle_network_error_response(
+        &mut self,
+        sender: &mut WrappedSender<NetS, wire::Message<Key>>,
+        peer: P,
+        id: u64,
+    ) {
+        trace!(?peer, ?id, "peer response: error");
 
         // Get the key associated with the response, if any
         let Some(key) = self.fetcher.pop_by_id(id, &peer, false) else {

@@ -2,7 +2,7 @@
 name = "commonware-p2p"
 edition = "2021"
 publish = true
-version = "0.0.36"
+version = "0.0.50"
 license = "MIT OR Apache-2.0"
 description = "Communicate with authenticated peers over encrypted connections."
 readme = "README.md"
@@ -11,6 +11,7 @@ repository = "https://github.com/commonwarexyz/monorepo/tree/main/p2p"
 documentation = "https://docs.rs/commonware-p2p"
 
 [dependencies]
+commonware-codec = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-macros = { workspace = true }
 commonware-runtime = { workspace = true }
@@ -22,15 +23,10 @@ rand_distr = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
-prost = { workspace = true }
 governor = { workspace = true }
 prometheus-client = { workspace = true }
 zstd = { workspace = true }
-bitvec = "1.0.1"
-either = "1.13.0"
-
-[build-dependencies]
-prost-build = { workspace = true }
+either = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

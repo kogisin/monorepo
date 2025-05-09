@@ -33,11 +33,23 @@ impl PeakIterator {
         }
     }
 
+    /// Return the position of the last leaf in an MMR of the given size.
+    ///
+    /// This is an O(log2(n)) operation.
+    pub(crate) fn last_leaf_pos(size: u64) -> u64 {
+        if size == 0 {
+            return 0;
+        }
+
+        let last_peak = PeakIterator::new(size).last().unwrap();
+        last_peak.0 - last_peak.1 as u64
+    }
+
     /// Return if an MMR of the given `size` has a valid structure.
     ///
     /// The implementation verifies that peaks in the MMR of the given size have strictly decreasing
     /// height, which is a necessary condition for MMR validity.
-    pub(crate) fn check_validity(size: u64) -> bool {
+    pub(crate) const fn check_validity(size: u64) -> bool {
         if size == 0 {
             return true;
         }
@@ -64,6 +76,18 @@ impl PeakIterator {
             node_pos -= two_h;
         }
         true
+    }
+
+    // Returns the largest valid MMR size that is no greater than the given size.
+    //
+    // TODO(https://github.com/commonwarexyz/monorepo/issues/820): This is an O(log2(n)^2)
+    // implementation but it's reasonably straightforward to make it O(log2(n)).
+    pub(crate) fn to_nearest_size(mut size: u64) -> u64 {
+        while !PeakIterator::check_validity(size) {
+            // A size-0 MMR is always valid so this loop must terminate before underflow.
+            size -= 1;
+        }
+        size
     }
 }
 
@@ -112,70 +136,69 @@ pub(crate) fn nodes_needing_parents(peak_iterator: PeakIterator) -> Vec<u64> {
     peaks
 }
 
-/// Returns the position of the oldest provable node in the represented MMR.
-pub(crate) fn oldest_provable_pos(peak_iterator: PeakIterator, oldest_retained_pos: u64) -> u64 {
-    if peak_iterator.size == 0 {
-        return 0;
+/// Returns the number of the leaf at position `leaf_pos` in an MMR, or None if
+/// this is not a leaf.
+///
+/// This computation is O(log2(n)) in the given position.
+pub(crate) const fn leaf_pos_to_num(leaf_pos: u64) -> Option<u64> {
+    if leaf_pos == 0 {
+        return Some(0);
     }
-    for (peak_pos, height) in peak_iterator {
-        if peak_pos < oldest_retained_pos {
-            continue;
+
+    let start = u64::MAX >> (leaf_pos + 1).leading_zeros();
+    let height = start.trailing_ones();
+    let mut two_h = 1 << (height - 1);
+    let mut cur_node = start - 1;
+    let mut leaf_num_floor = 0u64;
+
+    while two_h > 1 {
+        if cur_node == leaf_pos {
+            return None;
         }
-        // We have found the tree containing the oldest retained node. Now we look for the
-        // highest node in this tree whose left-sibling is pruned (if any). The provable nodes
-        // are those that strictly follow this node. If no such node exists, then all existing
-        // nodes are provable
-        let mut two_h = 1 << height;
-        let mut cur_node = peak_pos;
-        while two_h > 1 {
-            let left_pos = cur_node - two_h;
-            let right_pos = cur_node - 1;
-            if left_pos < oldest_retained_pos {
-                // found pruned left sibling
-                return right_pos + 1;
-            }
-            two_h >>= 1;
+        let left_pos = cur_node - two_h;
+        two_h >>= 1;
+        if leaf_pos > left_pos {
+            // The leaf is in the right subtree, so we must account for the leaves in the left
+            // subtree all of which precede it.
+            leaf_num_floor += two_h;
+            cur_node -= 1; // move to the right child
+        } else {
+            // The node is in the left subtree
             cur_node = left_pos;
         }
-        return oldest_retained_pos;
     }
-    // The oldest retained node should always be at or equal to the last peak (aka the last node
-    // in the MMR), so if we get here, the MMR corresponding to the inputs is invalid.
-    panic!("mmr invalid")
+
+    Some(leaf_num_floor)
 }
 
-/// Returns the position of the oldest node whose digest will be required to prove inclusion of
-/// `provable_pos`. The implementation assumes that the peak digests will remain available.
+/// Returns the position of the leaf with number `leaf_num` in an MMR.
 ///
-/// Pruning this position will render the node with position `provable_pos` unprovable.
-pub(crate) fn oldest_required_proof_pos(peak_iterator: PeakIterator, provable_pos: u64) -> u64 {
-    if peak_iterator.size == 0 {
+/// This computation is O(log2(n)) in `leaf_num`.
+pub(crate) const fn leaf_num_to_pos(leaf_num: u64) -> u64 {
+    if leaf_num == 0 {
         return 0;
     }
-    for (peak_pos, height) in peak_iterator {
-        if peak_pos < provable_pos {
-            continue;
+
+    // The following won't underflow because any sane leaf number would have several leading zeros.
+    let mut pos = u64::MAX >> (leaf_num.leading_zeros() - 1);
+    let mut two_h = (pos >> 2) + 1;
+    pos -= 1;
+
+    // `pos` is the position of the peak of the lowest mountain that includes both the very first
+    // leaf and the given leaf. We descend from this peak to the leaf level by descending left or
+    // right depending on the relevant bit of `leaf_num`. The position we arrive at is the position
+    // of the leaf.
+    while two_h != 0 {
+        if leaf_num & two_h != 0 {
+            // descend right
+            pos -= 1;
+        } else {
+            pos -= two_h << 1;
         }
-        // We have found the tree containing the node we want to guarantee is provable. We
-        // now walk down the path from its root to this node.
-        let iter = PathIterator::new(provable_pos, peak_pos, height);
-        for (parent_pos, sibling_pos) in iter {
-            if parent_pos == provable_pos {
-                // If we hit the node we are trying to prove while walking the path, then no
-                // older nodes are required to prove it.
-                return provable_pos;
-            }
-            // If we hit a node whose sibling precedes the position we wish to prove, then that
-            // sibling is required to prove it, and it's the oldest such node.
-            if sibling_pos < provable_pos {
-                return sibling_pos;
-            }
-        }
-        return provable_pos;
+        two_h >>= 1;
     }
-    // The oldest retained node should always be at or equal to the last peak (aka the last node
-    // in the MMR), so if we get here, the MMR corresponding to the inputs is invalid.
-    panic!("mmr invalid")
+
+    pos
 }
 
 /// A PathIterator returns a (parent_pos, sibling_pos) tuple for the sibling of each node along the
@@ -241,21 +264,32 @@ impl Iterator for PathIterator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mmr::mem::Mmr;
+    use commonware_cryptography::{sha256::hash, Sha256};
 
-    // Very basic testing for the proving boundary computations. Testing of the validity of these
-    // boundaries appears in the verification crate.
     #[test]
-    fn test_proof_boundaries() {
-        for oldest_retained in 0u64..19 {
-            let iter = PeakIterator::new(19);
-            let oldest_provable = oldest_provable_pos(iter, oldest_retained);
-            assert!(oldest_provable >= oldest_retained);
+    fn test_leaf_num_calculation() {
+        let digest = hash(b"testing");
+
+        // Build MMR with 1000 leaves and make sure we can correctly convert each leaf position to
+        // its number and back again.
+        let mut mmr = Mmr::<Sha256>::new();
+        let mut hasher = Sha256::default();
+        let mut num_to_pos = Vec::new();
+        for _ in 0u64..1000 {
+            num_to_pos.push(mmr.add(&mut hasher, &digest));
         }
 
-        for provable_pos in 0u64..19 {
-            let iter = PeakIterator::new(19);
-            let oldest_required = oldest_required_proof_pos(iter, provable_pos);
-            assert!(oldest_required <= provable_pos);
+        let mut last_leaf_pos = 0;
+        for (leaf_num_expected, leaf_pos) in num_to_pos.iter().enumerate() {
+            let leaf_num_got = leaf_pos_to_num(*leaf_pos).unwrap();
+            assert_eq!(leaf_num_got, leaf_num_expected as u64);
+            let leaf_pos_got = leaf_num_to_pos(leaf_num_got);
+            assert_eq!(leaf_pos_got, *leaf_pos);
+            for i in last_leaf_pos + 1..*leaf_pos {
+                assert!(leaf_pos_to_num(i).is_none());
+            }
+            last_leaf_pos = *leaf_pos;
         }
     }
 }

@@ -1,11 +1,11 @@
 use super::{Config, Error};
-use bytes::{BufMut, Bytes};
+use bytes::BufMut;
+use commonware_codec::{FixedSize, ReadExt};
 use commonware_runtime::{Blob, Clock, Metrics, Storage};
-use commonware_utils::{Array, SizedSerialize, SystemTimeExt as _};
+use commonware_utils::{Array, SystemTimeExt as _};
 use prometheus_client::metrics::{counter::Counter, gauge::Gauge};
 use std::{
     collections::BTreeMap,
-    marker::PhantomData,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tracing::{trace, warn};
@@ -14,30 +14,28 @@ const BLOB_NAMES: [&[u8]; 2] = [b"left", b"right"];
 const SECONDS_IN_NANOSECONDS: u128 = 1_000_000_000;
 
 /// Implementation of `Metadata` storage.
-pub struct Metadata<B: Blob, E: Clock + Storage<B> + Metrics, K: Array> {
+pub struct Metadata<E: Clock + Storage + Metrics, K: Array> {
     context: E,
 
     // Data is stored in a BTreeMap to enable deterministic serialization.
-    data: BTreeMap<K, Bytes>,
+    data: BTreeMap<K, Vec<u8>>,
     cursor: usize,
-    blobs: [(B, u128); 2],
+    blobs: [(E::Blob, u64, u128); 2],
 
     syncs: Counter,
     keys: Gauge,
-
-    _phantom_e: PhantomData<E>,
 }
 
-impl<B: Blob, E: Clock + Storage<B> + Metrics, K: Array> Metadata<B, E, K> {
+impl<E: Clock + Storage + Metrics, K: Array> Metadata<E, K> {
     /// Initialize a new `Metadata` instance.
     pub async fn init(context: E, cfg: Config) -> Result<Self, Error<K>> {
         // Open dedicated blobs
-        let left = context.open(&cfg.partition, BLOB_NAMES[0]).await?;
-        let right = context.open(&cfg.partition, BLOB_NAMES[1]).await?;
+        let (left_blob, left_len) = context.open(&cfg.partition, BLOB_NAMES[0]).await?;
+        let (right_blob, right_len) = context.open(&cfg.partition, BLOB_NAMES[1]).await?;
 
         // Find latest blob (check which includes a hash of the other)
-        let left_result = Self::load(0, &left).await?;
-        let right_result = Self::load(1, &right).await?;
+        let left_result = Self::load(0, &left_blob, left_len).await?;
+        let right_result = Self::load(1, &right_blob, right_len).await?;
 
         // Set checksums
         let mut left_timestamp = 0;
@@ -74,18 +72,22 @@ impl<B: Blob, E: Clock + Storage<B> + Metrics, K: Array> Metadata<B, E, K> {
 
             data,
             cursor,
-            blobs: [(left, left_timestamp), (right, right_timestamp)],
+            blobs: [
+                (left_blob, left_len, left_timestamp),
+                (right_blob, right_len, right_timestamp),
+            ],
 
             syncs,
             keys,
-
-            _phantom_e: PhantomData,
         })
     }
 
-    async fn load(index: usize, blob: &B) -> Result<Option<(u128, BTreeMap<K, Bytes>)>, Error<K>> {
+    async fn load(
+        index: usize,
+        blob: &E::Blob,
+        len: u64,
+    ) -> Result<Option<(u128, BTreeMap<K, Vec<u8>>)>, Error<K>> {
         // Get blob length
-        let len = blob.len().await?;
         if len == 0 {
             // Empty blob
             return Ok(None);
@@ -134,11 +136,11 @@ impl<B: Blob, E: Clock + Storage<B> + Metrics, K: Array> Metadata<B, E, K> {
         // If the checksum is correct, we assume data is correctly packed and we don't perform
         // length checks on the cursor.
         let mut data = BTreeMap::new();
-        let mut cursor = u128::SERIALIZED_LEN;
+        let mut cursor = u128::SIZE;
         while cursor < checksum_index {
             // Read key
-            let next_cursor = cursor + K::SERIALIZED_LEN;
-            let key = K::read_from(&mut buf[cursor..next_cursor].as_ref()).unwrap();
+            let next_cursor = cursor + K::SIZE;
+            let key = K::read(&mut buf[cursor..next_cursor].as_ref()).unwrap();
             cursor = next_cursor;
 
             // Read value length
@@ -149,7 +151,7 @@ impl<B: Blob, E: Clock + Storage<B> + Metrics, K: Array> Metadata<B, E, K> {
 
             // Read value
             let next_cursor = cursor + value_len;
-            let value = Bytes::copy_from_slice(&buf[cursor..next_cursor]);
+            let value = buf[cursor..next_cursor].to_vec();
             cursor = next_cursor;
             data.insert(key, value);
         }
@@ -159,7 +161,7 @@ impl<B: Blob, E: Clock + Storage<B> + Metrics, K: Array> Metadata<B, E, K> {
     }
 
     /// Get a value from `Metadata` (if it exists).
-    pub fn get(&self, key: &K) -> Option<&Bytes> {
+    pub fn get(&self, key: &K) -> Option<&Vec<u8>> {
         self.data.get(key)
     }
 
@@ -174,7 +176,7 @@ impl<B: Blob, E: Clock + Storage<B> + Metrics, K: Array> Metadata<B, E, K> {
     ///
     /// If the key already exists, the value will be overwritten. The
     /// value stored will not be persisted until `sync` is called.
-    pub fn put(&mut self, key: K, value: Bytes) {
+    pub fn put(&mut self, key: K, value: Vec<u8>) {
         self.data.insert(key, value);
         self.keys.set(self.data.len() as i64);
     }
@@ -188,7 +190,7 @@ impl<B: Blob, E: Clock + Storage<B> + Metrics, K: Array> Metadata<B, E, K> {
     /// Get the timestamp of the last update to `Metadata` (if a previous
     /// update exists).
     pub fn last_update(&self) -> Option<SystemTime> {
-        let timestamp = self.blobs[self.cursor].1;
+        let timestamp = self.blobs[self.cursor].2;
         if timestamp == 0 {
             return None;
         }
@@ -202,7 +204,7 @@ impl<B: Blob, E: Clock + Storage<B> + Metrics, K: Array> Metadata<B, E, K> {
     /// Atomically commit the current state of `Metadata`.
     pub async fn sync(&mut self) -> Result<(), Error<K>> {
         // Compute next timestamp
-        let past_timestamp = &self.blobs[self.cursor].1;
+        let past_timestamp = &self.blobs[self.cursor].2;
         let mut next_timestamp = self.context.current().epoch().as_nanos();
         if next_timestamp <= *past_timestamp {
             // While it is possible that extremely high-frequency updates to `Metadata` (more than
@@ -239,10 +241,12 @@ impl<B: Blob, E: Clock + Storage<B> + Metrics, K: Array> Metadata<B, E, K> {
         let next_blob = &mut self.blobs[next_cursor];
 
         // Write and truncate blob
+        let buf_len = buf.len() as u64;
         next_blob.0.write_at(&buf, 0).await?;
-        next_blob.0.truncate(buf.len() as u64).await?;
+        next_blob.0.truncate(buf_len).await?;
         next_blob.0.sync().await?;
-        next_blob.1 = next_timestamp;
+        next_blob.1 = buf_len;
+        next_blob.2 = next_timestamp;
 
         // Switch blobs
         self.cursor = next_cursor;
@@ -254,7 +258,7 @@ impl<B: Blob, E: Clock + Storage<B> + Metrics, K: Array> Metadata<B, E, K> {
     pub async fn close(mut self) -> Result<(), Error<K>> {
         // Sync and close blobs
         self.sync().await?;
-        for (blob, _) in self.blobs.into_iter() {
+        for (blob, _, _) in self.blobs.into_iter() {
             blob.close().await?;
         }
         Ok(())

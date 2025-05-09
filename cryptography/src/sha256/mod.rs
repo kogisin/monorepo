@@ -20,8 +20,10 @@
 //! println!("digest: {:?}", digest);
 //! ```
 
-use crate::{Array, Error, Hasher};
-use commonware_utils::{hex, SizedSerialize};
+use crate::Hasher;
+use bytes::{Buf, BufMut};
+use commonware_codec::{Error as CodecError, FixedSize, Read, ReadExt, Write};
+use commonware_utils::{hex, Array};
 use rand::{CryptoRng, Rng};
 use sha2::{Digest as _, Sha256 as ISha256};
 use std::{
@@ -87,57 +89,34 @@ impl Hasher for Sha256 {
 }
 
 /// Digest of a SHA-256 hashing operation.
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 #[repr(transparent)]
 pub struct Digest([u8; DIGEST_LENGTH]);
 
-impl Array for Digest {
-    type Error = Error;
-}
-
-impl SizedSerialize for Digest {
-    const SERIALIZED_LEN: usize = DIGEST_LENGTH;
-}
-
-impl From<[u8; DIGEST_LENGTH]> for Digest {
-    fn from(value: [u8; DIGEST_LENGTH]) -> Self {
-        Self(value)
+impl Write for Digest {
+    fn write(&self, buf: &mut impl BufMut) {
+        self.0.write(buf);
     }
 }
 
-impl TryFrom<&[u8]> for Digest {
-    type Error = Error;
-    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if value.len() != DIGEST_LENGTH {
-            return Err(Error::InvalidDigestLength);
-        }
-        let array: [u8; DIGEST_LENGTH] =
-            value.try_into().map_err(|_| Error::InvalidDigestLength)?;
+impl Read for Digest {
+    type Cfg = ();
+
+    fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
+        let array = <[u8; DIGEST_LENGTH]>::read(buf)?;
         Ok(Self(array))
     }
 }
 
-impl TryFrom<&Vec<u8>> for Digest {
-    type Error = Error;
-    fn try_from(value: &Vec<u8>) -> Result<Self, Self::Error> {
-        Self::try_from(value.as_slice())
-    }
+impl FixedSize for Digest {
+    const SIZE: usize = DIGEST_LENGTH;
 }
 
-impl TryFrom<Vec<u8>> for Digest {
-    type Error = Error;
-    fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
-        if value.len() != DIGEST_LENGTH {
-            return Err(Error::InvalidDigestLength);
-        }
+impl Array for Digest {}
 
-        // If the length is correct, we can safely convert the vector into a boxed slice without
-        // any copies.
-        let boxed_slice = value.into_boxed_slice();
-        let boxed_array: Box<[u8; DIGEST_LENGTH]> = boxed_slice
-            .try_into()
-            .map_err(|_| Error::InvalidDigestLength)?;
-        Ok(Self(*boxed_array))
+impl From<[u8; DIGEST_LENGTH]> for Digest {
+    fn from(value: [u8; DIGEST_LENGTH]) -> Self {
+        Self(value)
     }
 }
 
@@ -166,9 +145,12 @@ impl Display for Digest {
     }
 }
 
+impl crate::Digest for Digest {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use commonware_codec::{DecodeExt, Encode};
     use commonware_utils::hex;
 
     const HELLO_DIGEST: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
@@ -181,13 +163,13 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(msg);
         let digest = hasher.finalize();
-        assert!(Digest::try_from(digest.as_ref()).is_ok());
+        assert!(Digest::decode(digest.as_ref()).is_ok());
         assert_eq!(hex(digest.as_ref()), HELLO_DIGEST);
 
         // Reuse hasher
         hasher.update(msg);
         let digest = hasher.finalize();
-        assert!(Digest::try_from(digest.as_ref()).is_ok());
+        assert!(Digest::decode(digest.as_ref()).is_ok());
         assert_eq!(hex(digest.as_ref()), HELLO_DIGEST);
 
         // Test simple hasher
@@ -197,6 +179,21 @@ mod tests {
 
     #[test]
     fn test_sha256_len() {
-        assert_eq!(Digest::SERIALIZED_LEN, DIGEST_LENGTH);
+        assert_eq!(Digest::SIZE, DIGEST_LENGTH);
+    }
+
+    #[test]
+    fn test_codec() {
+        let msg = b"hello world";
+        let mut hasher = Sha256::new();
+        hasher.update(msg);
+        let digest = hasher.finalize();
+
+        let encoded = digest.encode();
+        assert_eq!(encoded.len(), DIGEST_LENGTH);
+        assert_eq!(encoded, digest.as_ref());
+
+        let decoded = Digest::decode(encoded).unwrap();
+        assert_eq!(digest, decoded);
     }
 }

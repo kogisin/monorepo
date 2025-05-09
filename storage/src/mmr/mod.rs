@@ -13,7 +13,9 @@
 //! The nodes of the MMR are ordered by a post-order traversal of the MMR trees, starting from the
 //! from tallest tree to shortest. The "position" of a node in the MMR is defined as the 0-based
 //! index of the node in this ordering. This implies the positions of elements, which are always
-//! leaves, may not be contiguous even if they were consecutively added.
+//! leaves, may not be contiguous even if they were consecutively added. An element's "number" is
+//! its 0-based index in the order of element insertion. In the example below, the right-most
+//! element has position 18 and number 10.
 //!
 //! As the MMR is an append-only data structure, node positions never change and can be used as
 //! stable identifiers.
@@ -41,6 +43,8 @@
 //!      1     2     5      9     12     17
 //!           / \   / \    / \   /  \   /  \
 //!      0   0   1 3   4  7   8 10  11 15  16 18
+//!
+//! Number   0   1 2   3  4   5  6   7  8   9 10
 //! ```
 //!
 //! The root hash in this example is computed as:
@@ -63,11 +67,12 @@
 //! )
 //! ```
 
-use commonware_utils::array;
+use commonware_utils::array::prefixed_u64::U64;
 use thiserror::Error;
 
+pub mod bitmap;
 mod hasher;
-mod iterator;
+pub mod iterator;
 pub mod journaled;
 pub mod mem;
 pub mod verification;
@@ -75,14 +80,20 @@ pub mod verification;
 /// Errors that can occur when interacting with an MMR.
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("an element required for this operation has been pruned")]
-    ElementPruned,
+    #[error("an element required for this operation has been pruned: {0}")]
+    ElementPruned(u64),
     #[error("metadata error: {0}")]
-    MetadataError(#[from] crate::metadata::Error<array::U64>),
+    MetadataError(#[from] crate::metadata::Error<U64>),
     #[error("journal error: {0}")]
     JournalError(#[from] crate::journal::Error),
-    #[error("missing peak: {0}")]
-    MissingPeak(u64),
+    #[error("missing node: {0}")]
+    MissingNode(u64),
     #[error("MMR is empty")]
     Empty,
+    #[error("missing hashes in proof")]
+    MissingHashes,
+    #[error("extra hashes in proof")]
+    ExtraHashes,
+    #[error("invalid update")]
+    InvalidUpdate,
 }

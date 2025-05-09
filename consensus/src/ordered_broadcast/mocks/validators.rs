@@ -1,0 +1,69 @@
+use crate::{ordered_broadcast::types::Epoch, Supervisor, ThresholdSupervisor};
+use commonware_cryptography::bls12381::primitives::{group::Share, poly::Public, variant::Variant};
+use commonware_utils::Array;
+use std::{collections::HashMap, marker::PhantomData};
+
+#[derive(Clone)]
+pub struct Validators<P: Array, V: Variant> {
+    identity: Public<V>,
+    validators: Vec<P>,
+    validators_map: HashMap<P, u32>,
+    share: Option<Share>,
+
+    _phantom: PhantomData<V>,
+}
+
+impl<P: Array, V: Variant> Validators<P, V> {
+    pub fn new(identity: Public<V>, mut validators: Vec<P>, share: Option<Share>) -> Self {
+        // Setup validators
+        validators.sort();
+        let mut validators_map = HashMap::new();
+        for (index, validator) in validators.iter().enumerate() {
+            validators_map.insert(validator.clone(), index as u32);
+        }
+
+        Self {
+            identity,
+            validators,
+            validators_map,
+            share,
+
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<P: Array, V: Variant> Supervisor for Validators<P, V> {
+    type Index = Epoch;
+    type PublicKey = P;
+
+    fn leader(&self, _: Self::Index) -> Option<Self::PublicKey> {
+        unimplemented!()
+    }
+
+    fn participants(&self, _: Self::Index) -> Option<&Vec<Self::PublicKey>> {
+        Some(&self.validators)
+    }
+
+    fn is_participant(&self, _: Self::Index, candidate: &Self::PublicKey) -> Option<u32> {
+        self.validators_map.get(candidate).cloned()
+    }
+}
+
+impl<P: Array, V: Variant> ThresholdSupervisor for Validators<P, V> {
+    type Identity = Public<V>;
+    type Share = Share;
+    type Seed = V::Signature;
+
+    fn leader(&self, _: Self::Index, _: Self::Seed) -> Option<Self::PublicKey> {
+        unimplemented!()
+    }
+
+    fn identity(&self, _: Self::Index) -> Option<&Self::Identity> {
+        Some(&self.identity)
+    }
+
+    fn share(&self, _: Self::Index) -> Option<&Self::Share> {
+        self.share.as_ref()
+    }
+}

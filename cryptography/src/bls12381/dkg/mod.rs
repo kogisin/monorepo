@@ -191,13 +191,21 @@ mod tests {
         partial_sign_proof_of_possession, threshold_signature_recover, verify_proof_of_possession,
     };
     use crate::bls12381::primitives::poly::public;
-    use crate::{Ed25519, Scheme};
+    use crate::bls12381::primitives::variant::{MinPk, MinSig, Variant};
+    use crate::{Ed25519, Signer};
+    use arbiter::Output;
     use commonware_utils::quorum;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
     use std::collections::HashMap;
 
-    fn run_dkg_and_reshare(n_0: u32, dealers_0: u32, n_1: u32, dealers_1: u32, concurrency: usize) {
+    fn run_dkg_and_reshare<V: Variant>(
+        n_0: u32,
+        dealers_0: u32,
+        n_1: u32,
+        dealers_1: u32,
+        concurrency: usize,
+    ) {
         // Create shared RNG (for reproducibility)
         let mut rng = StdRng::seed_from_u64(0);
 
@@ -213,7 +221,8 @@ mod tests {
         let mut dealer_shares = HashMap::new();
         let mut dealers = HashMap::new();
         for con in contributors.iter().take(dealers_0 as usize) {
-            let (dealer, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+            let (dealer, commitment, shares) =
+                Dealer::<_, V>::new(&mut rng, None, contributors.clone());
             dealer_shares.insert(con.clone(), (commitment, shares));
             dealers.insert(con.clone(), dealer);
         }
@@ -221,7 +230,7 @@ mod tests {
         // Create players
         let mut players = HashMap::new();
         for con in &contributors {
-            let player = Player::new(
+            let player = Player::<_, V>::new(
                 con.clone(),
                 None,
                 contributors.clone(),
@@ -232,7 +241,7 @@ mod tests {
         }
 
         // Create arbiter
-        let mut arb = Arbiter::new(
+        let mut arb = Arbiter::<_, V>::new(
             None,
             contributors.clone(),
             contributors.clone(),
@@ -250,7 +259,11 @@ mod tests {
                 // Process share
                 let player_obj = players.get_mut(player).unwrap();
                 player_obj
-                    .share(dealer.clone(), commitment.clone(), shares[player_idx])
+                    .share(
+                        dealer.clone(),
+                        commitment.clone(),
+                        shares[player_idx].clone(),
+                    )
                     .unwrap();
 
                 // Collect ack
@@ -278,10 +291,10 @@ mod tests {
         assert_eq!(disqualified.len(), (n_0 - dealers_0) as usize);
 
         // Verify result
-        let output = result.unwrap();
+        let output: Output<V> = result.unwrap();
 
         // Ensure right number of commitments picked
-        let expected_commitments = quorum(n_0).unwrap() as usize;
+        let expected_commitments = quorum(n_0) as usize;
         assert_eq!(output.commitments.len(), expected_commitments);
 
         // Ensure no reveals required
@@ -299,15 +312,16 @@ mod tests {
         }
 
         // Test that can generate proof-of-possession
-        let t = quorum(n_0).unwrap();
+        let t = quorum(n_0);
         let partials = outputs
             .values()
-            .map(|s| partial_sign_proof_of_possession(&s.public, &s.share))
+            .map(|s| partial_sign_proof_of_possession::<V>(&s.public, &s.share))
             .collect::<Vec<_>>();
         let signature =
-            threshold_signature_recover(t, partials).expect("unable to recover signature");
-        let public_key = public(&outputs.iter().next().unwrap().1.public);
-        verify_proof_of_possession(&public_key, &signature).expect("invalid proof of possession");
+            threshold_signature_recover::<V, _>(t, &partials).expect("unable to recover signature");
+        let public_key = public::<V>(&outputs.iter().next().unwrap().1.public);
+        verify_proof_of_possession::<V>(public_key, &signature)
+            .expect("invalid proof of possession");
 
         // Create reshare players (assume no overlap)
         let mut reshare_players = Vec::new();
@@ -322,8 +336,11 @@ mod tests {
         let mut reshare_dealers = HashMap::new();
         for con in contributors.iter().take(dealers_1 as usize) {
             let output = outputs.get(con).unwrap();
-            let (dealer, commitment, shares) =
-                Dealer::new(&mut rng, Some(output.share), reshare_players.clone());
+            let (dealer, commitment, shares) = Dealer::<_, V>::new(
+                &mut rng,
+                Some(output.share.clone()),
+                reshare_players.clone(),
+            );
             reshare_shares.insert(con.clone(), (commitment, shares));
             reshare_dealers.insert(con.clone(), dealer);
         }
@@ -331,7 +348,7 @@ mod tests {
         // Create reshare player objects
         let mut reshare_player_objs = HashMap::new();
         for con in &reshare_players {
-            let player = Player::new(
+            let player = Player::<_, V>::new(
                 con.clone(),
                 Some(output.public.clone()),
                 contributors.clone(),
@@ -342,7 +359,7 @@ mod tests {
         }
 
         // Create arbiter
-        let mut arb = Arbiter::new(
+        let mut arb = Arbiter::<_, V>::new(
             Some(output.public),
             contributors.clone(),
             reshare_players.clone(),
@@ -360,7 +377,11 @@ mod tests {
                 // Process share
                 let player_obj = reshare_player_objs.get_mut(player).unwrap();
                 player_obj
-                    .share(dealer.clone(), commitment.clone(), shares[player_idx])
+                    .share(
+                        dealer.clone(),
+                        commitment.clone(),
+                        shares[player_idx].clone(),
+                    )
                     .unwrap();
 
                 // Collect ack
@@ -388,10 +409,10 @@ mod tests {
         assert_eq!(disqualified.len(), (n_0 - dealers_1) as usize);
 
         // Verify result
-        let output = result.unwrap();
+        let output: Output<V> = result.unwrap();
 
         // Ensure right number of commitments picked
-        let expected_commitments = quorum(n_0).unwrap() as usize;
+        let expected_commitments = quorum(n_0) as usize;
         assert_eq!(output.commitments.len(), expected_commitments);
 
         // Ensure no reveals required
@@ -410,41 +431,47 @@ mod tests {
         }
 
         // Test that can generate proof-of-possession
-        let t = quorum(n_1).unwrap();
+        let t = quorum(n_1);
         let partials = outputs
             .iter()
-            .map(|s| partial_sign_proof_of_possession(&s.public, &s.share))
+            .map(|s| partial_sign_proof_of_possession::<V>(&s.public, &s.share))
             .collect::<Vec<_>>();
         let signature =
-            threshold_signature_recover(t, partials).expect("unable to recover signature");
-        let public_key = public(&outputs[0].public);
-        verify_proof_of_possession(&public_key, &signature).expect("invalid proof of possession");
+            threshold_signature_recover::<V, _>(t, &partials).expect("unable to recover signature");
+        let public_key = public::<V>(&outputs[0].public);
+        verify_proof_of_possession::<V>(public_key, &signature)
+            .expect("invalid proof of possession");
     }
 
     #[test]
     fn test_dkg_and_reshare_all_active() {
-        run_dkg_and_reshare(5, 5, 10, 5, 4);
+        run_dkg_and_reshare::<MinPk>(5, 5, 10, 5, 4);
+        run_dkg_and_reshare::<MinSig>(5, 5, 10, 5, 4);
     }
 
     #[test]
     fn test_dkg_and_reshare_min_active() {
-        run_dkg_and_reshare(4, 3, 4, 3, 4);
+        run_dkg_and_reshare::<MinPk>(4, 3, 4, 3, 4);
+        run_dkg_and_reshare::<MinSig>(4, 3, 4, 3, 4);
     }
 
     #[test]
     fn test_dkg_and_reshare_min_active_different_sizes() {
-        run_dkg_and_reshare(5, 3, 10, 3, 4);
+        run_dkg_and_reshare::<MinPk>(5, 4, 10, 4, 4);
+        run_dkg_and_reshare::<MinSig>(5, 4, 10, 4, 4);
     }
 
     #[test]
     fn test_dkg_and_reshare_min_active_large() {
-        run_dkg_and_reshare(20, 13, 100, 13, 4);
+        run_dkg_and_reshare::<MinPk>(20, 14, 100, 14, 4);
+        run_dkg_and_reshare::<MinSig>(20, 14, 100, 14, 4);
     }
 
     #[test]
     #[should_panic]
     fn test_dkg_and_reshare_insufficient_active() {
-        run_dkg_and_reshare(5, 3, 10, 2, 4);
+        run_dkg_and_reshare::<MinPk>(5, 3, 10, 2, 4);
+        run_dkg_and_reshare::<MinSig>(5, 3, 10, 2, 4);
     }
 
     #[test]
@@ -462,14 +489,14 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, _, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, _, shares) = Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create unrelated commitment of correct degree
-        let t = quorum(n).unwrap();
-        let (public, _) = ops::generate_shares(&mut rng, None, n, t);
+        let t = quorum(n);
+        let (public, _) = ops::generate_shares::<_, MinSig>(&mut rng, None, n, t);
 
         // Create player
-        let mut player = Player::new(
+        let mut player = Player::<_, MinSig>::new(
             contributors[0].clone(),
             None,
             contributors.clone(),
@@ -478,7 +505,7 @@ mod tests {
         );
 
         // Send invalid commitment to player
-        let result = player.share(contributors[0].clone(), public, shares[0]);
+        let result = player.share(contributors[0].clone(), public, shares[0].clone());
         assert!(matches!(result, Err(Error::ShareWrongCommitment)));
     }
 
@@ -497,14 +524,15 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, commitment, shares) =
+            Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create unrelated commitment of correct degree
-        let t = quorum(n).unwrap();
-        let (other_commitment, _) = ops::generate_shares(&mut rng, None, n, t);
+        let t = quorum(n);
+        let (other_commitment, _) = ops::generate_shares::<_, MinSig>(&mut rng, None, n, t);
 
         // Create player
-        let mut player = Player::new(
+        let mut player = Player::<_, MinSig>::new(
             contributors[0].clone(),
             None,
             contributors.clone(),
@@ -514,11 +542,11 @@ mod tests {
 
         // Send valid commitment to player
         player
-            .share(contributors[0].clone(), commitment, shares[0])
+            .share(contributors[0].clone(), commitment, shares[0].clone())
             .unwrap();
 
         // Send alternative commitment to player
-        let result = player.share(contributors[0].clone(), other_commitment, shares[0]);
+        let result = player.share(contributors[0].clone(), other_commitment, shares[0].clone());
         assert!(matches!(result, Err(Error::MismatchedCommitment)));
     }
 
@@ -537,14 +565,15 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, commitment, shares) =
+            Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create unrelated commitment of correct degree
-        let t = quorum(n).unwrap();
-        let (_, other_shares) = ops::generate_shares(&mut rng, None, n, t);
+        let t = quorum(n);
+        let (_, other_shares) = ops::generate_shares::<_, MinSig>(&mut rng, None, n, t);
 
         // Create player
-        let mut player = Player::new(
+        let mut player = Player::<_, MinSig>::new(
             contributors[0].clone(),
             None,
             contributors.clone(),
@@ -554,11 +583,15 @@ mod tests {
 
         // Send valid share to player
         player
-            .share(contributors[0].clone(), commitment.clone(), shares[0])
+            .share(
+                contributors[0].clone(),
+                commitment.clone(),
+                shares[0].clone(),
+            )
             .unwrap();
 
         // Send alternative share to player
-        let result = player.share(contributors[0].clone(), commitment, other_shares[0]);
+        let result = player.share(contributors[0].clone(), commitment, other_shares[0].clone());
         assert!(matches!(result, Err(Error::MismatchedShare)));
     }
 
@@ -577,10 +610,11 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, commitment, shares) =
+            Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create player
-        let mut player = Player::new(
+        let mut player = Player::<_, MinSig>::new(
             contributors[0].clone(),
             None,
             contributors.clone(),
@@ -590,11 +624,15 @@ mod tests {
 
         // Send valid share to player
         player
-            .share(contributors[0].clone(), commitment.clone(), shares[0])
+            .share(
+                contributors[0].clone(),
+                commitment.clone(),
+                shares[0].clone(),
+            )
             .unwrap();
 
         // Send alternative share to player
-        let result = player.share(contributors[0].clone(), commitment, shares[0]);
+        let result = player.share(contributors[0].clone(), commitment, shares[0].clone());
         assert!(matches!(result, Err(Error::DuplicateShare)));
     }
 
@@ -613,10 +651,11 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, commitment, shares) =
+            Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create player
-        let mut player = Player::new(
+        let mut player = Player::<_, MinSig>::new(
             contributors[0].clone(),
             None,
             contributors.clone(),
@@ -625,7 +664,11 @@ mod tests {
         );
 
         // Send misdirected share to player
-        let result = player.share(contributors[0].clone(), commitment.clone(), shares[1]);
+        let result = player.share(
+            contributors[0].clone(),
+            commitment.clone(),
+            shares[1].clone(),
+        );
         assert!(matches!(result, Err(Error::MisdirectedShare)));
     }
 
@@ -644,10 +687,11 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, commitment, shares) =
+            Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create player
-        let mut player = Player::new(
+        let mut player = Player::<_, MinSig>::new(
             contributors[0].clone(),
             None,
             contributors.clone(),
@@ -657,11 +701,12 @@ mod tests {
 
         // Send share from invalid dealer
         let dealer = Ed25519::from_seed(n as u64).public_key();
-        let result = player.share(dealer.clone(), commitment.clone(), shares[0]);
+        let result = player.share(dealer.clone(), commitment.clone(), shares[0].clone());
         assert!(matches!(result, Err(Error::DealerInvalid)));
 
         // Create arbiter
-        let mut arb = Arbiter::new(None, contributors.clone(), contributors.clone(), 1);
+        let mut arb =
+            Arbiter::<_, MinSig>::new(None, contributors.clone(), contributors.clone(), 1);
 
         // Send commitment from invalid dealer
         let result = arb.commitment(dealer, commitment, vec![0, 1, 2, 3], Vec::new());
@@ -683,13 +728,13 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, _, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, _, shares) = Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create invalid commitment
-        let (public, _) = ops::generate_shares(&mut rng, None, n * 2, 1);
+        let (public, _) = ops::generate_shares::<_, MinSig>(&mut rng, None, n * 2, 1);
 
         // Create player
-        let mut player = Player::new(
+        let mut player = Player::<_, MinSig>::new(
             contributors[0].clone(),
             None,
             contributors.clone(),
@@ -698,11 +743,12 @@ mod tests {
         );
 
         // Send invalid commitment to player
-        let result = player.share(contributors[0].clone(), public.clone(), shares[0]);
+        let result = player.share(contributors[0].clone(), public.clone(), shares[0].clone());
         assert!(matches!(result, Err(Error::CommitmentWrongDegree)));
 
         // Create arbiter
-        let mut arb = Arbiter::new(None, contributors.clone(), contributors.clone(), 1);
+        let mut arb =
+            Arbiter::<_, MinSig>::new(None, contributors.clone(), contributors.clone(), 1);
 
         // Send invalid commitment to arbiter
         let result = arb.commitment(
@@ -729,17 +775,19 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, commitment, shares) =
+            Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create arbiter
-        let mut arb = Arbiter::new(None, contributors.clone(), contributors.clone(), 1);
+        let mut arb =
+            Arbiter::<_, MinSig>::new(None, contributors.clone(), contributors.clone(), 1);
 
         // Add commitment to arbiter
         arb.commitment(
             contributors[0].clone(),
             commitment,
             vec![0, 1, 2, 3],
-            vec![shares[4]],
+            vec![shares[4].clone()],
         )
         .unwrap();
     }
@@ -747,7 +795,8 @@ mod tests {
     #[test]
     fn test_arbiter_reveals() {
         // Initialize test
-        let n = 5;
+        let n = 11;
+        let q = quorum(n as u32) as usize;
         let mut rng = StdRng::seed_from_u64(0);
 
         // Create contributors (must be in sorted order)
@@ -759,19 +808,23 @@ mod tests {
         contributors.sort();
 
         // Create arbiter
-        let mut arb = Arbiter::new(None, contributors.clone(), contributors.clone(), 1);
+        let mut arb =
+            Arbiter::<_, MinSig>::new(None, contributors.clone(), contributors.clone(), 1);
 
         // Create dealers
         let mut commitments = Vec::with_capacity(n);
         let mut reveals = Vec::with_capacity(n);
         for con in &contributors {
             // Create dealer
-            let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+            let (_, commitment, shares) =
+                Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
             commitments.push(commitment.clone());
-            reveals.push(shares[4]);
+            reveals.push(shares[q].clone());
 
             // Add commitment to arbiter
-            arb.commitment(con.clone(), commitment, vec![0, 1, 2, 3], vec![shares[4]])
+            let acks: Vec<u32> = (0..q as u32).collect();
+            let reveals = shares[q..n].to_vec();
+            arb.commitment(con.clone(), commitment, acks, reveals)
                 .unwrap();
         }
 
@@ -780,8 +833,8 @@ mod tests {
         let output = result.unwrap();
 
         // Ensure commitments and reveals are correct
-        assert_eq!(output.commitments.len(), 3);
-        for (dealer_idx, commitment) in commitments.iter().enumerate().take(3) {
+        assert_eq!(output.commitments.len(), q);
+        for (dealer_idx, commitment) in commitments.iter().enumerate().take(q) {
             let dealer_idx = dealer_idx as u32;
             assert_eq!(output.commitments.get(&dealer_idx).unwrap(), commitment);
             assert_eq!(
@@ -809,17 +862,19 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, commitment, shares) =
+            Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create arbiter
-        let mut arb = Arbiter::new(None, contributors.clone(), contributors.clone(), 1);
+        let mut arb =
+            Arbiter::<_, MinSig>::new(None, contributors.clone(), contributors.clone(), 1);
 
         // Add commitment to arbiter
         arb.commitment(
             contributors[0].clone(),
             commitment.clone(),
             vec![0, 1, 2, 3],
-            vec![shares[4]],
+            vec![shares[4].clone()],
         )
         .unwrap();
 
@@ -828,7 +883,7 @@ mod tests {
             contributors[0].clone(),
             commitment,
             vec![0, 1, 2, 3],
-            vec![shares[4]],
+            vec![shares[4].clone()],
         );
         assert!(matches!(result, Err(Error::DuplicateCommitment)));
     }
@@ -848,17 +903,19 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, commitment, shares) =
+            Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create arbiter
-        let mut arb = Arbiter::new(None, contributors.clone(), contributors.clone(), 1);
+        let mut arb =
+            Arbiter::<_, MinSig>::new(None, contributors.clone(), contributors.clone(), 1);
 
         // Add commitment to arbiter
         let result = arb.commitment(
             contributors[0].clone(),
             commitment,
             vec![0, 1, 2, 3],
-            vec![shares[3]],
+            vec![shares[3].clone()],
         );
         assert!(matches!(result, Err(Error::AlreadyActive)));
     }
@@ -878,10 +935,11 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, commitment, _) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, commitment, _) = Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create arbiter
-        let mut arb = Arbiter::new(None, contributors.clone(), contributors.clone(), 1);
+        let mut arb =
+            Arbiter::<_, MinSig>::new(None, contributors.clone(), contributors.clone(), 1);
 
         // Add commitment to arbiter
         let result = arb.commitment(
@@ -917,10 +975,11 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, commitment, _) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, commitment, _) = Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create arbiter
-        let mut arb = Arbiter::new(None, contributors.clone(), contributors.clone(), 1);
+        let mut arb =
+            Arbiter::<_, MinSig>::new(None, contributors.clone(), contributors.clone(), 1);
 
         // Disqualify dealer
         arb.disqualify(contributors[0].clone());
@@ -950,17 +1009,19 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, commitment, shares) =
+            Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create arbiter
-        let mut arb = Arbiter::new(None, contributors.clone(), contributors.clone(), 1);
+        let mut arb =
+            Arbiter::<_, MinSig>::new(None, contributors.clone(), contributors.clone(), 1);
 
         // Add commitment to arbiter
         let result = arb.commitment(
             contributors[0].clone(),
             commitment,
             vec![0, 1, 2],
-            vec![shares[3], shares[4]],
+            vec![shares[3].clone(), shares[4].clone()],
         );
         assert!(matches!(result, Err(Error::TooManyReveals)));
     }
@@ -980,21 +1041,22 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, commitment, _) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, commitment, _) = Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create invalid shares
-        let t = quorum(n).unwrap();
-        let (_, shares) = ops::generate_shares(&mut rng, None, n, t);
+        let t = quorum(n);
+        let (_, shares) = ops::generate_shares::<_, MinSig>(&mut rng, None, n, t);
 
         // Create arbiter
-        let mut arb = Arbiter::new(None, contributors.clone(), contributors.clone(), 1);
+        let mut arb =
+            Arbiter::<_, MinSig>::new(None, contributors.clone(), contributors.clone(), 1);
 
         // Add commitment to arbiter
         let result = arb.commitment(
             contributors[0].clone(),
             commitment,
             vec![0, 1, 2, 3],
-            vec![shares[4]],
+            vec![shares[4].clone()],
         );
         assert!(matches!(result, Err(Error::ShareWrongCommitment)));
     }
@@ -1014,13 +1076,15 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, commitment, shares) =
+            Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create arbiter
-        let mut arb = Arbiter::new(None, contributors.clone(), contributors.clone(), 1);
+        let mut arb =
+            Arbiter::<_, MinSig>::new(None, contributors.clone(), contributors.clone(), 1);
 
         // Swap share value
-        let mut share = shares[3];
+        let mut share = shares[3].clone();
         share.index = 4;
 
         // Add commitment to arbiter
@@ -1048,10 +1112,11 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, commitment, _) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, commitment, _) = Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create arbiter
-        let mut arb = Arbiter::new(None, contributors.clone(), contributors.clone(), 1);
+        let mut arb =
+            Arbiter::<_, MinSig>::new(None, contributors.clone(), contributors.clone(), 1);
 
         // Add commitment to arbiter
         let result = arb.commitment(
@@ -1078,10 +1143,11 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, commitment, _) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, commitment, _) = Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create arbiter
-        let mut arb = Arbiter::new(None, contributors.clone(), contributors.clone(), 1);
+        let mut arb =
+            Arbiter::<_, MinSig>::new(None, contributors.clone(), contributors.clone(), 1);
 
         // Add commitment to arbiter
         let result = arb.commitment(
@@ -1108,13 +1174,15 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        let (_, commitment, shares) =
+            Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Create arbiter
-        let mut arb = Arbiter::new(None, contributors.clone(), contributors.clone(), 1);
+        let mut arb =
+            Arbiter::<_, MinSig>::new(None, contributors.clone(), contributors.clone(), 1);
 
         // Swap share value
-        let mut share = shares[3];
+        let mut share = shares[3].clone();
         share.index = 10;
 
         // Add commitment to arbiter
@@ -1142,7 +1210,7 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (mut dealer, _, _) = Dealer::new(&mut rng, None, contributors.clone());
+        let (mut dealer, _, _) = Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Ack all players
         for player in &contributors {
@@ -1170,7 +1238,7 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (mut dealer, _, _) = Dealer::new(&mut rng, None, contributors.clone());
+        let (mut dealer, _, _) = Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Ack all players
         for player in contributors.iter().take(4) {
@@ -1198,7 +1266,7 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (mut dealer, _, _) = Dealer::new(&mut rng, None, contributors.clone());
+        let (mut dealer, _, _) = Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Ack all players
         for player in contributors.iter().take(2) {
@@ -1224,7 +1292,7 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (mut dealer, _, _) = Dealer::new(&mut rng, None, contributors.clone());
+        let (mut dealer, _, _) = Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Ack player
         let player = contributors[0].clone();
@@ -1250,7 +1318,7 @@ mod tests {
         contributors.sort();
 
         // Create dealer
-        let (mut dealer, _, _) = Dealer::new(&mut rng, None, contributors.clone());
+        let (mut dealer, _, _) = Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
 
         // Ack invalid player
         let player = Ed25519::from_seed(n as u64).public_key();
@@ -1261,7 +1329,8 @@ mod tests {
     #[test]
     fn test_player_reveals() {
         // Initialize test
-        let n = 5;
+        let n = 11;
+        let q = quorum(n as u32) as usize;
         let mut rng = StdRng::seed_from_u64(0);
 
         // Create contributors (must be in sorted order)
@@ -1273,7 +1342,7 @@ mod tests {
         contributors.sort();
 
         // Create player
-        let mut player = Player::new(
+        let mut player = Player::<_, MinSig>::new(
             contributors[0].clone(),
             None,
             contributors.clone(),
@@ -1283,26 +1352,30 @@ mod tests {
 
         // Send shares to player
         let mut commitments = HashMap::new();
-        for (i, con) in contributors.iter().enumerate().take(2) {
-            let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        for (i, con) in contributors.iter().enumerate().take(q - 1) {
+            let (_, commitment, shares) =
+                Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
             player
-                .share(con.clone(), commitment.clone(), shares[0])
+                .share(con.clone(), commitment.clone(), shares[0].clone())
                 .unwrap();
             commitments.insert(i as u32, commitment);
         }
 
         // Finalize player with reveal
-        let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
-        commitments.insert(2, commitment);
+        let last = (q - 1) as u32;
+        let (_, commitment, shares) =
+            Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
+        commitments.insert(last, commitment);
         let mut reveals = HashMap::new();
-        reveals.insert(2, shares[0]);
+        reveals.insert(last, shares[0].clone());
         player.finalize(commitments, reveals).unwrap();
     }
 
     #[test]
     fn test_player_missing_reveal() {
         // Initialize test
-        let n = 5;
+        let n = 11;
+        let q = quorum(n as u32) as usize;
         let mut rng = StdRng::seed_from_u64(0);
 
         // Create contributors (must be in sorted order)
@@ -1314,7 +1387,7 @@ mod tests {
         contributors.sort();
 
         // Create player
-        let mut player = Player::new(
+        let mut player = Player::<_, MinSig>::new(
             contributors[0].clone(),
             None,
             contributors.clone(),
@@ -1324,17 +1397,19 @@ mod tests {
 
         // Send shares to player
         let mut commitments = HashMap::new();
-        for (i, con) in contributors.iter().enumerate().take(2) {
-            let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        for (i, con) in contributors.iter().enumerate().take(q - 1) {
+            let (_, commitment, shares) =
+                Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
             player
-                .share(con.clone(), commitment.clone(), shares[0])
+                .share(con.clone(), commitment.clone(), shares[0].clone())
                 .unwrap();
             commitments.insert(i as u32, commitment);
         }
 
         // Finalize player with reveal
-        let (_, commitment, _) = Dealer::new(&mut rng, None, contributors.clone());
-        commitments.insert(2, commitment);
+        let last = (q - 1) as u32;
+        let (_, commitment, _) = Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
+        commitments.insert(last, commitment);
         let result = player.finalize(commitments, HashMap::new());
         assert!(matches!(result, Err(Error::MissingShare)));
     }
@@ -1354,7 +1429,7 @@ mod tests {
         contributors.sort();
 
         // Create player
-        let mut player = Player::new(
+        let mut player = Player::<_, MinSig>::new(
             contributors[0].clone(),
             None,
             contributors.clone(),
@@ -1365,9 +1440,10 @@ mod tests {
         // Send shares to player
         let mut commitments = HashMap::new();
         for (i, con) in contributors.iter().enumerate().take(2) {
-            let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+            let (_, commitment, shares) =
+                Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
             player
-                .share(con.clone(), commitment.clone(), shares[0])
+                .share(con.clone(), commitment.clone(), shares[0].clone())
                 .unwrap();
             commitments.insert(i as u32, commitment);
         }
@@ -1380,7 +1456,8 @@ mod tests {
     #[test]
     fn test_player_misdirected_reveal() {
         // Initialize test
-        let n = 5;
+        let n = 11;
+        let q = quorum(n as u32) as usize;
         let mut rng = StdRng::seed_from_u64(0);
 
         // Create contributors (must be in sorted order)
@@ -1392,7 +1469,7 @@ mod tests {
         contributors.sort();
 
         // Create player
-        let mut player = Player::new(
+        let mut player = Player::<_, MinSig>::new(
             contributors[0].clone(),
             None,
             contributors.clone(),
@@ -1402,19 +1479,22 @@ mod tests {
 
         // Send shares to player
         let mut commitments = HashMap::new();
-        for (i, con) in contributors.iter().enumerate().take(2) {
-            let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        for (i, con) in contributors.iter().enumerate().take(q - 1) {
+            let (_, commitment, shares) =
+                Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
             player
-                .share(con.clone(), commitment.clone(), shares[0])
+                .share(con.clone(), commitment.clone(), shares[0].clone())
                 .unwrap();
             commitments.insert(i as u32, commitment);
         }
 
         // Finalize player with reveal
-        let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
-        commitments.insert(2, commitment);
+        let last = (q - 1) as u32;
+        let (_, commitment, shares) =
+            Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
+        commitments.insert(last, commitment);
         let mut reveals = HashMap::new();
-        reveals.insert(2, shares[1]);
+        reveals.insert(last, shares[1].clone());
         let result = player.finalize(commitments, reveals);
         assert!(matches!(result, Err(Error::MisdirectedShare)));
     }
@@ -1422,7 +1502,8 @@ mod tests {
     #[test]
     fn test_player_invalid_commitment() {
         // Initialize test
-        let n = 5;
+        let n = 11;
+        let q = quorum(n as u32) as usize;
         let mut rng = StdRng::seed_from_u64(0);
 
         // Create contributors (must be in sorted order)
@@ -1434,7 +1515,7 @@ mod tests {
         contributors.sort();
 
         // Create player
-        let mut player = Player::new(
+        let mut player = Player::<_, MinSig>::new(
             contributors[0].clone(),
             None,
             contributors.clone(),
@@ -1444,19 +1525,21 @@ mod tests {
 
         // Send shares to player
         let mut commitments = HashMap::new();
-        for (i, con) in contributors.iter().enumerate().take(2) {
-            let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        for (i, con) in contributors.iter().enumerate().take(q - 1) {
+            let (_, commitment, shares) =
+                Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
             player
-                .share(con.clone(), commitment.clone(), shares[0])
+                .share(con.clone(), commitment.clone(), shares[0].clone())
                 .unwrap();
             commitments.insert(i as u32, commitment);
         }
 
         // Finalize player with reveal
-        let (commitment, shares) = ops::generate_shares(&mut rng, None, n, 1);
-        commitments.insert(2, commitment);
+        let last = (q - 1) as u32;
+        let (commitment, shares) = ops::generate_shares::<_, MinSig>(&mut rng, None, n as u32, 1);
+        commitments.insert(last, commitment);
         let mut reveals = HashMap::new();
-        reveals.insert(2, shares[0]);
+        reveals.insert(last, shares[0].clone());
         let result = player.finalize(commitments, reveals);
         assert!(matches!(result, Err(Error::CommitmentWrongDegree)));
     }
@@ -1464,7 +1547,8 @@ mod tests {
     #[test]
     fn test_player_invalid_reveal() {
         // Initialize test
-        let n = 5;
+        let n = 11;
+        let q = quorum(n as u32) as usize;
         let mut rng = StdRng::seed_from_u64(0);
 
         // Create contributors (must be in sorted order)
@@ -1476,7 +1560,7 @@ mod tests {
         contributors.sort();
 
         // Create player
-        let mut player = Player::new(
+        let mut player = Player::<_, MinSig>::new(
             contributors[0].clone(),
             None,
             contributors.clone(),
@@ -1486,21 +1570,24 @@ mod tests {
 
         // Send shares to player
         let mut commitments = HashMap::new();
-        for (i, con) in contributors.iter().enumerate().take(2) {
-            let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
+        for (i, con) in contributors.iter().enumerate().take(q - 1) {
+            let (_, commitment, shares) =
+                Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
             player
-                .share(con.clone(), commitment.clone(), shares[0])
+                .share(con.clone(), commitment.clone(), shares[0].clone())
                 .unwrap();
             commitments.insert(i as u32, commitment);
         }
 
         // Finalize player with reveal
-        let (_, commitment, shares) = Dealer::new(&mut rng, None, contributors.clone());
-        commitments.insert(2, commitment);
+        let last = (q - 1) as u32;
+        let (_, commitment, shares) =
+            Dealer::<_, MinSig>::new(&mut rng, None, contributors.clone());
+        commitments.insert(last, commitment);
         let mut reveals = HashMap::new();
-        let mut share = shares[1];
+        let mut share = shares[1].clone();
         share.index = 0;
-        reveals.insert(2, share);
+        reveals.insert(last, share);
         let result = player.finalize(commitments, reveals);
         assert!(matches!(result, Err(Error::ShareWrongCommitment)));
     }

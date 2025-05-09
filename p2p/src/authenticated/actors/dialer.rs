@@ -5,7 +5,9 @@ use crate::authenticated::{
     metrics,
 };
 use commonware_cryptography::Scheme;
-use commonware_runtime::{Clock, Handle, Listener, Metrics, Network, Sink, Spawner, Stream};
+use commonware_runtime::{
+    telemetry::traces::status, Clock, Handle, Metrics, Network, SinkOf, Spawner, StreamOf,
+};
 use commonware_stream::public_key::{Config as StreamConfig, Connection};
 use governor::{
     clock::Clock as GClock,
@@ -16,8 +18,8 @@ use governor::{
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use rand::{CryptoRng, Rng};
-use std::{marker::PhantomData, time::Duration};
-use tracing::debug;
+use std::time::Duration;
+use tracing::{debug, debug_span, Instrument};
 
 pub struct Config<C: Scheme> {
     pub stream_cfg: StreamConfig<C>,
@@ -25,13 +27,7 @@ pub struct Config<C: Scheme> {
     pub dial_rate: Quota,
 }
 
-pub struct Actor<
-    Si: Sink,
-    St: Stream,
-    L: Listener<Si, St>,
-    E: Spawner + Clock + GClock + Network<L, Si, St> + Metrics,
-    C: Scheme,
-> {
+pub struct Actor<E: Spawner + Clock + GClock + Network + Metrics, C: Scheme> {
     context: E,
 
     stream_cfg: StreamConfig<C>,
@@ -40,20 +36,9 @@ pub struct Actor<
     dial_limiter: RateLimiter<NotKeyed, InMemoryState, E, NoOpMiddleware<E::Instant>>,
 
     dial_attempts: Family<metrics::Peer, Counter>,
-
-    _phantom_si: PhantomData<Si>,
-    _phantom_st: PhantomData<St>,
-    _phantom_l: PhantomData<L>,
 }
 
-impl<
-        Si: Sink,
-        St: Stream,
-        L: Listener<Si, St>,
-        E: Spawner + Clock + GClock + Network<L, Si, St> + Rng + CryptoRng + Metrics,
-        C: Scheme,
-    > Actor<Si, St, L, E, C>
-{
+impl<E: Spawner + Clock + GClock + Network + Rng + CryptoRng + Metrics, C: Scheme> Actor<E, C> {
     pub fn new(context: E, cfg: Config<C>) -> Self {
         let dial_attempts = Family::<metrics::Peer, Counter>::default();
         context.register(
@@ -67,16 +52,13 @@ impl<
             dial_frequency: cfg.dial_frequency,
             dial_limiter: RateLimiter::direct_with_clock(cfg.dial_rate, &context),
             dial_attempts,
-            _phantom_si: PhantomData,
-            _phantom_st: PhantomData,
-            _phantom_l: PhantomData,
         }
     }
 
     async fn dial_peers(
         &self,
-        tracker: &mut tracker::Mailbox<E, C::PublicKey>,
-        supervisor: &mut spawner::Mailbox<E, Si, St, C::PublicKey>,
+        tracker: &mut tracker::Mailbox<E, C>,
+        supervisor: &mut spawner::Mailbox<E, SinkOf<E>, StreamOf<E>, C>,
     ) {
         for (peer, address, reservation) in tracker.dialable().await {
             // Check if we have hit rate limit for dialing and if so, skip (we don't
@@ -94,15 +76,20 @@ impl<
                 let config = self.stream_cfg.clone();
                 let mut supervisor = supervisor.clone();
                 move |context| async move {
+                    // Create span
+                    let span = debug_span!("dialer", ?peer, ?address);
+                    let guard = span.enter();
+
                     // Attempt to dial peer
-                    let (sink, stream) = match context.dial(address).await {
-                        Ok(stream) => stream,
-                        Err(e) => {
-                            debug!(?peer, error = ?e, "failed to dial peer");
-                            return;
-                        }
-                    };
-                    debug!(?peer, address = address.to_string(), "dialed peer");
+                    let (sink, stream) =
+                        match context.dial(address).instrument(debug_span!("dial")).await {
+                            Ok(stream) => stream,
+                            Err(e) => {
+                                status::error(&span, "failed to dial peer", Some(&e));
+                                return;
+                            }
+                        };
+                    debug!("dialed peer");
 
                     // Upgrade connection
                     let instance = match Connection::upgrade_dialer(
@@ -112,15 +99,20 @@ impl<
                         stream,
                         peer.clone(),
                     )
+                    .instrument(debug_span!("upgrade"))
                     .await
                     {
                         Ok(instance) => instance,
                         Err(e) => {
-                            debug!(?peer, error = ?e, "failed to upgrade connection");
+                            status::error(&span, "failed to upgrade connection", Some(&e));
                             return;
                         }
                     };
-                    debug!(?peer, "upgraded connection");
+                    debug!("upgraded connection");
+
+                    // Set status to OK
+                    status::ok(&span);
+                    drop(guard);
 
                     // Start peer to handle messages
                     supervisor.spawn(peer, instance, reservation).await;
@@ -131,8 +123,8 @@ impl<
 
     pub fn start(
         self,
-        tracker: tracker::Mailbox<E, C::PublicKey>,
-        supervisor: spawner::Mailbox<E, Si, St, C::PublicKey>,
+        tracker: tracker::Mailbox<E, C>,
+        supervisor: spawner::Mailbox<E, SinkOf<E>, StreamOf<E>, C>,
     ) -> Handle<()> {
         self.context
             .clone()
@@ -141,8 +133,8 @@ impl<
 
     async fn run(
         mut self,
-        mut tracker: tracker::Mailbox<E, C::PublicKey>,
-        mut supervisor: spawner::Mailbox<E, Si, St, C::PublicKey>,
+        mut tracker: tracker::Mailbox<E, C>,
+        mut supervisor: spawner::Mailbox<E, SinkOf<E>, StreamOf<E>, C>,
     ) {
         loop {
             // Attempt to dial peers we know about

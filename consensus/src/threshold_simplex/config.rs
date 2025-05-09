@@ -1,18 +1,21 @@
-use super::{Context, View};
-use crate::{Automaton, Committer, Relay, ThresholdSupervisor};
-use commonware_cryptography::{bls12381::primitives::group, Scheme};
-use commonware_utils::Array;
+use super::types::{Activity, Context, View};
+use crate::{Automaton, Relay, Reporter, ThresholdSupervisor};
+use commonware_cryptography::{
+    bls12381::primitives::{group, variant::Variant},
+    Digest, Scheme,
+};
 use governor::Quota;
 use std::time::Duration;
 
 /// Configuration for the consensus engine.
 pub struct Config<
     C: Scheme,
-    D: Array,
+    V: Variant,
+    D: Digest,
     A: Automaton<Context = Context<D>>,
     R: Relay,
-    F: Committer,
-    S: ThresholdSupervisor<Seed = group::Signature, Index = View, Share = group::Share>,
+    F: Reporter<Activity = Activity<V, D>>,
+    S: ThresholdSupervisor<Seed = V::Signature, Index = View, Share = group::Share>,
 > {
     /// Cryptographic primitives.
     pub crypto: C,
@@ -23,11 +26,17 @@ pub struct Config<
     /// Relay for the consensus engine.
     pub relay: R,
 
-    /// Committer for the consensus engine.
-    pub committer: F,
+    /// Reporter for the consensus engine.
+    pub reporter: F,
 
     /// Supervisor for the consensus engine.
     pub supervisor: S,
+
+    /// Partition for the consensus engine.
+    pub partition: String,
+
+    /// Compression level for the consensus engine.
+    pub compression: Option<u8>,
 
     /// Maximum number of messages to buffer on channels inside the consensus
     /// engine before blocking.
@@ -38,6 +47,9 @@ pub struct Config<
 
     /// Number of views to replay concurrently during startup.
     pub replay_concurrency: usize,
+
+    /// Number of bytes to buffer when replaying during startup.
+    pub replay_buffer: usize,
 
     /// Amount of time to wait for a leader to propose a payload
     /// in a view.
@@ -52,17 +64,21 @@ pub struct Config<
     pub nullify_retry: Duration,
 
     /// Number of views behind finalized tip to track
-    /// activity derived from validator messages.
+    /// and persist activity derived from validator messages.
     pub activity_timeout: View,
+
+    /// Move to nullify immediately if the selected leader has been inactive
+    /// for this many views.
+    ///
+    /// This number should be less than or equal to `activity_timeout` (how
+    /// many views we are tracking).
+    pub skip_timeout: View,
 
     /// Timeout to wait for a peer to respond to a request.
     pub fetch_timeout: Duration,
 
     /// Maximum number of notarizations/nullifications to request/respond with at once.
     pub max_fetch_count: usize,
-
-    /// Maximum number of bytes to respond with at once.
-    pub max_fetch_size: usize,
 
     /// Maximum rate of requests to send to a given peer.
     ///
@@ -75,12 +91,13 @@ pub struct Config<
 
 impl<
         C: Scheme,
-        D: Array,
+        V: Variant,
+        D: Digest,
         A: Automaton<Context = Context<D>>,
         R: Relay,
-        F: Committer,
-        S: ThresholdSupervisor<Seed = group::Signature, Index = View, Share = group::Share>,
-    > Config<C, D, A, R, F, S>
+        F: Reporter<Activity = Activity<V, D>>,
+        S: ThresholdSupervisor<Seed = V::Signature, Index = View, Share = group::Share>,
+    > Config<C, V, D, A, R, F, S>
 {
     /// Assert enforces that all configuration values are valid.
     pub fn assert(&self) {
@@ -105,16 +122,20 @@ impl<
             "activity timeout must be greater than zero"
         );
         assert!(
+            self.skip_timeout > 0,
+            "skip timeout must be greater than zero"
+        );
+        assert!(
+            self.skip_timeout <= self.activity_timeout,
+            "skip timeout must be less than or equal to activity timeout"
+        );
+        assert!(
             self.fetch_timeout > Duration::default(),
             "fetch timeout must be greater than zero"
         );
         assert!(
             self.max_fetch_count > 0,
             "it must be possible to fetch at least one container per request"
-        );
-        assert!(
-            self.max_fetch_size > 0,
-            "it must be possible to fetch at least one byte"
         );
         assert!(
             self.fetch_concurrent > 0,

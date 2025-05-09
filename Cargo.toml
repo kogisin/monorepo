@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "broadcast",
+    "codec",
     "consensus",
     "cryptography",
     "deployer",
@@ -19,17 +20,18 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-commonware-broadcast = { version = "0.0.7", path = "broadcast" }
-commonware-consensus = { version = "0.0.14", path = "consensus" }
-commonware-cryptography = { version = "0.0.25", path = "cryptography" }
-commonware-deployer = { version = "0.0.4", path = "deployer" }
-commonware-macros = { version = "0.0.16", path = "macros" }
-commonware-p2p = { version = "0.0.36", path = "p2p" }
-commonware-resolver = { version = "0.0.5", path = "resolver" }
-commonware-runtime = { version = "0.0.22", path = "runtime" }
-commonware-storage = { version = "0.0.17", path = "storage" }
-commonware-stream = { version = "0.0.14", path = "stream" }
-commonware-utils = { version = "0.0.17", path = "utils" }
+commonware-broadcast = { version = "0.0.50", path = "broadcast" }
+commonware-codec = { version = "0.0.50", path = "codec" }
+commonware-consensus = { version = "0.0.50", path = "consensus" }
+commonware-cryptography = { version = "0.0.50", path = "cryptography" }
+commonware-deployer = { version = "0.0.50", path = "deployer", default-features = false }
+commonware-macros = { version = "0.0.50", path = "macros" }
+commonware-p2p = { version = "0.0.50", path = "p2p" }
+commonware-resolver = { version = "0.0.50", path = "resolver" }
+commonware-runtime = { version = "0.0.50", path = "runtime" }
+commonware-storage = { version = "0.0.50", path = "storage" }
+commonware-stream = { version = "0.0.50", path = "stream" }
+commonware-utils = { version = "0.0.50", path = "utils" }
 thiserror = "2.0.12"
 bytes = "1.7.1"
 sha2 = "0.10.8"
@@ -40,6 +42,7 @@ futures-util = "0.3.31"
 tokio = "1.43.0"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
+paste = "1.0.15"
 prost = "0.13.5"
 prost-build = "0.13.5"
 governor = "0.6.3"
@@ -58,6 +61,13 @@ reqwest = "0.12.12"
 uuid = "1.15.1"
 serde = "1.0.218"
 serde_yaml = "0.9.34"
+either = "1.13.0"
+opentelemetry = "0.28.0"
+opentelemetry-otlp = "0.28.0"
+opentelemetry_sdk =  "0.28.0"
+tracing-opentelemetry = "0.29.0"
+rayon = "1.10.0"
+async-lock = "3.4.0"
 
 [profile.bench]
 # Because we enable overflow checks in "release," we should benchmark with them.
@@ -72,6 +82,12 @@ overflow-checks = true
 # To guard against unexpected behavior in production, we enable overflow checks in
 # "release" although they incur some performance penalty.
 overflow-checks = true
+
+[profile.release-with-debug]
+inherits = "release"
+# Setting debug to true instructs cargo to include debug symbols in the release
+# binary (not to disable optimizations).
+debug = true
 
 [profile.test]
 # Although overflow checks are enabled by default in "test", we explicitly

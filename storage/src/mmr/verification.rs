@@ -5,12 +5,14 @@ use crate::mmr::{
     hasher::Hasher,
     iterator::{PathIterator, PeakIterator},
     Error,
+    Error::*,
 };
 use bytes::{Buf, BufMut};
-use commonware_cryptography::Hasher as CHasher;
-use commonware_utils::{Array, SizedSerialize};
+use commonware_codec::{FixedSize, ReadExt};
+use commonware_cryptography::{Digest, Hasher as CHasher};
 use futures::future::try_join_all;
 use std::future::Future;
+use tracing::debug;
 
 /// Contains the information necessary for proving the inclusion of an element, or some range of elements, in the MMR
 /// from its root hash.
@@ -32,15 +34,12 @@ pub struct Proof<H: CHasher> {
 }
 
 /// A trait that allows generic generation of an MMR inclusion proof.
-pub trait Storage<H: CHasher> {
+pub trait Storage<D: Digest> {
     /// Return the number of elements in the MMR.
-    fn size(&self) -> impl Future<Output = Result<u64, Error>>;
+    fn size(&self) -> u64;
 
     /// Return the specified node of the MMR if it exists & hasn't been pruned.
-    fn get_node(
-        &self,
-        position: u64,
-    ) -> impl Future<Output = Result<Option<H::Digest>, Error>> + Send;
+    fn get_node(&self, position: u64) -> impl Future<Output = Result<Option<D>, Error>> + Send;
 }
 
 impl<H: CHasher> PartialEq for Proof<H> {
@@ -55,34 +54,60 @@ impl<H: CHasher> Proof<H> {
     pub fn verify_element_inclusion(
         &self,
         hasher: &mut H,
-        element: &H::Digest,
+        element: &[u8],
         element_pos: u64,
         root_hash: &H::Digest,
     ) -> bool {
-        self.verify_range_inclusion(
-            hasher,
-            &[element.clone()],
-            element_pos,
-            element_pos,
-            root_hash,
-        )
+        self.verify_range_inclusion(hasher, &[element], element_pos, element_pos, root_hash)
     }
 
     /// Return true if `proof` proves that the `elements` appear consecutively between positions
     /// `start_element_pos` through `end_element_pos` (inclusive) within the MMR with root hash
     /// `root_hash`.
-    pub fn verify_range_inclusion(
+    pub fn verify_range_inclusion<T>(
         &self,
         hasher: &mut H,
-        elements: &[H::Digest],
+        elements: T,
         start_element_pos: u64,
         end_element_pos: u64,
         root_hash: &H::Digest,
-    ) -> bool {
+    ) -> bool
+    where
+        T: IntoIterator<Item: AsRef<[u8]>>,
+    {
+        let peak_hashes = match self.reconstruct_peak_hashes(
+            hasher,
+            elements,
+            start_element_pos,
+            end_element_pos,
+        ) {
+            Ok(peak_hashes) => peak_hashes,
+            Err(e) => {
+                debug!("failed to reconstruct peak hashes from proof: {:?}", e);
+                return false;
+            }
+        };
+        let mut mmr_hasher = Hasher::<H>::new(hasher);
+        *root_hash == mmr_hasher.root_hash(self.size, peak_hashes.iter())
+    }
+
+    /// Reconstruct the peak hashes of the MMR that produced this proof, returning `MissingHashes`
+    /// error if there are not enough proof hashes, or `ExtraHashes` error if not all proof hashes
+    /// were used in the reconstruction.
+    fn reconstruct_peak_hashes<T>(
+        &self,
+        hasher: &mut H,
+        elements: T,
+        start_element_pos: u64,
+        end_element_pos: u64,
+    ) -> Result<Vec<H::Digest>, Error>
+    where
+        T: IntoIterator<Item: AsRef<[u8]>>,
+    {
         let mut proof_hashes_iter = self.hashes.iter();
-        let mut elements_iter = elements.iter();
         let mut siblings_iter = self.hashes.iter().rev();
         let mut mmr_hasher = Hasher::<H>::new(hasher);
+        let mut elements_iter = elements.into_iter();
 
         // Include peak hashes only for trees that have no elements from the range, and keep track
         // of the starting and ending trees of those that do contain some.
@@ -101,34 +126,33 @@ impl<H: CHasher> Proof<H> {
                     &mut siblings_iter,
                 ) {
                     Ok(peak_hash) => peak_hashes.push(peak_hash),
-                    Err(_) => return false, // missing hashes
+                    Err(_) => return Err(MissingHashes),
                 }
             } else if let Some(hash) = proof_hashes_iter.next() {
                 proof_hashes_used += 1;
-                peak_hashes.push(hash.clone());
+                peak_hashes.push(*hash);
             } else {
-                return false;
+                return Err(MissingHashes);
             }
         }
 
         if elements_iter.next().is_some() {
-            return false; // some elements were not used in the proof
+            return Err(ExtraHashes);
         }
         let next_sibling = siblings_iter.next();
         if (proof_hashes_used == 0 && next_sibling.is_some())
             || (next_sibling.is_some()
                 && *next_sibling.unwrap() != self.hashes[proof_hashes_used - 1])
         {
-            // some proof data was not used during verification, so we must return false to prevent
-            // proof malleability attacks.
-            return false;
+            return Err(ExtraHashes);
         }
-        *root_hash == mmr_hasher.root_hash(self.size, peak_hashes.iter())
+
+        Ok(peak_hashes)
     }
 
     /// Return the maximum size in bytes of any serialized `Proof`.
     pub fn max_serialization_size() -> usize {
-        u64::SERIALIZED_LEN + (u8::MAX as usize * H::Digest::SERIALIZED_LEN)
+        u64::SIZE + (u8::MAX as usize * H::Digest::SIZE)
     }
 
     /// Canonically serializes the `Proof` as:
@@ -146,7 +170,7 @@ impl<H: CHasher> Proof<H> {
         );
 
         // Serialize the proof as a byte vector.
-        let bytes_len = u64::SERIALIZED_LEN + (self.hashes.len() * H::Digest::SERIALIZED_LEN);
+        let bytes_len = u64::SIZE + (self.hashes.len() * H::Digest::SIZE);
         let mut bytes = Vec::with_capacity(bytes_len);
         bytes.put_u64(self.size);
         for hash in self.hashes.iter() {
@@ -159,28 +183,44 @@ impl<H: CHasher> Proof<H> {
     /// Deserializes a canonically encoded `Proof`. See `serialize` for the serialization format.
     pub fn deserialize(bytes: &[u8]) -> Option<Self> {
         let mut buf = bytes;
-        if buf.len() < u64::SERIALIZED_LEN {
+        if buf.len() < u64::SIZE {
             return None;
         }
         let size = buf.get_u64();
 
         // A proof should divide neatly into the hash length and not contain more than 255 hashes.
         let buf_remaining = buf.remaining();
-        let hashes_len = buf_remaining / H::Digest::SERIALIZED_LEN;
-        if buf_remaining % H::Digest::SERIALIZED_LEN != 0 || hashes_len > u8::MAX as usize {
+        let hashes_len = buf_remaining / H::Digest::SIZE;
+        if buf_remaining % H::Digest::SIZE != 0 || hashes_len > u8::MAX as usize {
             return None;
         }
         let mut hashes = Vec::with_capacity(hashes_len);
         for _ in 0..hashes_len {
-            let digest = H::Digest::read_from(&mut buf).ok()?;
+            let digest = H::Digest::read(&mut buf).ok()?;
             hashes.push(digest);
         }
         Some(Self { size, hashes })
     }
 
-    /// Return the list of element positions required by the range proof for the specified range of
+    /// Return the list of pruned (pos < `start_pos`) node positions that are still required for
+    /// proving any retained node.
+    ///
+    /// This set consists of every pruned node that is either (1) a peak, or (2) has no descendent
+    /// in the retained section, but its immediate parent does. (A node meeting condition (2) can be
+    /// shown to always be the left-child of its parent.)
+    ///
+    /// This set of nodes does not change with the MMR's size, only the pruning boundary. For a
+    /// given pruning boundary that happens to be a valid MMR size, one can prove that this set is
+    /// exactly the set of peaks for an MMR whose size equals the pruning boundary. If the pruning
+    /// boundary is not a valid MMR size, then the set corresponds to the peaks of the largest MMR
+    /// whose size is less than the pruning boundary.
+    pub fn nodes_to_pin(start_pos: u64) -> impl Iterator<Item = u64> {
+        PeakIterator::new(PeakIterator::to_nearest_size(start_pos)).map(|(pos, _)| pos)
+    }
+
+    /// Return the list of node positions required by the range proof for the specified range of
     /// elements, inclusive of both endpoints.
-    pub fn elements_required_for_range_proof(
+    pub fn nodes_required_for_range_proof(
         size: u64,
         start_element_pos: u64,
         end_element_pos: u64,
@@ -254,49 +294,51 @@ impl<H: CHasher> Proof<H> {
     /// Return an inclusion proof for the specified range of elements, inclusive of both endpoints.
     ///
     /// Returns ElementPruned error if some element needed to generate the proof has been pruned.
-    pub async fn range_proof<S: Storage<H>>(
+    pub async fn range_proof<S: Storage<H::Digest>>(
         mmr: &S,
         start_element_pos: u64,
         end_element_pos: u64,
     ) -> Result<Proof<H>, Error> {
         let mut hashes: Vec<H::Digest> = Vec::new();
-        let positions = Self::elements_required_for_range_proof(
-            mmr.size().await?,
-            start_element_pos,
-            end_element_pos,
-        );
+        let positions =
+            Self::nodes_required_for_range_proof(mmr.size(), start_element_pos, end_element_pos);
 
-        let node_futures = positions.into_iter().map(|pos| mmr.get_node(pos));
+        let node_futures = positions.iter().map(|pos| mmr.get_node(*pos));
         let hash_results = try_join_all(node_futures).await?;
-        for hash_result in hash_results {
+
+        for (i, hash_result) in hash_results.into_iter().enumerate() {
             match hash_result {
                 Some(hash) => hashes.push(hash),
-                // Implementations should check to make sure the range is provable before calling
-                // this function, so this case should not happen in general.
-                None => return Err(Error::ElementPruned),
+                None => return Err(Error::ElementPruned(positions[i])),
             };
         }
+
         Ok(Proof {
-            size: mmr.size().await?,
+            size: mmr.size(),
             hashes,
         })
     }
 }
 
-fn peak_hash_from_range<'a, H: CHasher>(
+fn peak_hash_from_range<'a, H, I, S>(
     hasher: &mut Hasher<H>,
     pos: u64,           // current node position in the tree
     two_h: u64,         // 2^height of the current node
     leftmost_pos: u64,  // leftmost leaf in the tree to be traversed
     rightmost_pos: u64, // rightmost leaf in the tree to be traversed
-    elements: &mut impl Iterator<Item = &'a H::Digest>,
-    sibling_hashes: &mut impl Iterator<Item = &'a H::Digest>,
-) -> Result<H::Digest, ()> {
+    elements: &mut I,
+    sibling_hashes: &mut S,
+) -> Result<H::Digest, ()>
+where
+    H: CHasher,
+    I: Iterator<Item: AsRef<[u8]>>,
+    S: Iterator<Item = &'a H::Digest>,
+{
     assert_ne!(two_h, 0);
     if two_h == 1 {
         // we are at a leaf
         match elements.next() {
-            Some(element) => return Ok(hasher.leaf_hash(pos, element)),
+            Some(element) => return Ok(hasher.leaf_hash(pos, element.as_ref())),
             None => return Err(()),
         }
     }
@@ -339,13 +381,13 @@ fn peak_hash_from_range<'a, H: CHasher>(
 
     if left_hash.is_none() {
         match sibling_hashes.next() {
-            Some(hash) => left_hash = Some(hash.clone()),
+            Some(hash) => left_hash = Some(*hash),
             None => return Err(()),
         }
     }
     if right_hash.is_none() {
         match sibling_hashes.next() {
-            Some(hash) => right_hash = Some(hash.clone()),
+            Some(hash) => right_hash = Some(*hash),
             None => return Err(()),
         }
     }
@@ -355,19 +397,18 @@ fn peak_hash_from_range<'a, H: CHasher>(
 #[cfg(test)]
 mod tests {
     use super::Proof;
-    use crate::mmr::iterator::{oldest_provable_pos, oldest_required_proof_pos, PeakIterator};
     use crate::mmr::mem::Mmr;
     use commonware_cryptography::{hash, sha256::Digest, Sha256};
-    use commonware_runtime::{deterministic::Executor, Runner};
+    use commonware_runtime::{deterministic, Runner};
 
     fn test_digest(v: u8) -> Digest {
         hash(&[v])
     }
 
     #[test]
-    fn test_verify_element() {
-        let (executor, _, _) = Executor::default();
-        executor.start(async move {
+    fn test_verification_verify_element() {
+        let executor = deterministic::Runner::default();
+        executor.start(|_| async move {
             // create an 11 element MMR over which we'll test single-element inclusion proofs
             let mut mmr = Mmr::<Sha256>::new();
             let element = Digest::from(*b"01234567012345670123456701234567");
@@ -458,12 +499,13 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_range() {
-        let (executor, _, _) = Executor::default();
-        executor.start(async move {
+    fn test_verification_verify_range() {
+        let executor = deterministic::Runner::default();
+
+        executor.start(|_| async move {
             // create a new MMR and add a non-trivial amount (49) of elements
             let mut mmr: Mmr<Sha256> = Mmr::default();
-            let mut elements = Vec::<Digest>::new();
+            let mut elements = Vec::new();
             let mut element_positions = Vec::<u64>::new();
             let mut hasher = Sha256::default();
             for i in 0..49 {
@@ -517,7 +559,7 @@ mod tests {
                 assert!(
                     !range_proof.verify_range_inclusion(
                         &mut hasher,
-                        &Vec::new(),
+                        Vec::<&[u8]>::new(),
                         start_pos,
                         end_pos,
                         &root_hash,
@@ -528,15 +570,18 @@ mod tests {
             // confirm proof fails with invalid element hashes
             for i in 0..elements.len() {
                 for j in i..elements.len() {
+                    if i == start_index && j == end_index {
+                        // skip the valid range
+                        continue;
+                    }
                     assert!(
-                        (i == start_index && j == end_index) // exclude the valid element range
-                                    || !range_proof.verify_range_inclusion(
-                                        &mut hasher,
-                                        &elements[i..j + 1],
-                                        start_pos,
-                                        end_pos,
-                                        &root_hash,
-                                    ),
+                        !range_proof.verify_range_inclusion(
+                            &mut hasher,
+                            &elements[i..j + 1],
+                            start_pos,
+                            end_pos,
+                            &root_hash,
+                        ),
                         "range proof with invalid elements should fail {}:{}",
                         i,
                         j
@@ -625,9 +670,9 @@ mod tests {
     }
 
     #[test]
-    fn test_oldest_provable_pos() {
-        let (executor, _, _) = Executor::default();
-        executor.start(async move {
+    fn test_verification_retained_nodes_provable_after_pruning() {
+        let executor = deterministic::Runner::default();
+        executor.start(|_| async move {
             // create a new MMR and add a non-trivial amount (49) of elements
             let mut mmr: Mmr<Sha256> = Mmr::default();
             let mut elements = Vec::<Digest>::new();
@@ -638,17 +683,24 @@ mod tests {
                 element_positions.push(mmr.add(&mut hasher, elements.last().unwrap()));
             }
 
-            // For every node in the MMR, confirm that the computed oldest_provable_pos is indeed
-            // the correct boundary between being able to generate a proof for a leaf or not.
+            // Confirm we can successfully prove all retained elements in the MMR after pruning.
+            let root = mmr.root(&mut hasher);
             for i in 1..mmr.size() {
                 mmr.prune_to_pos(i);
-                let oldest_provable_pos = oldest_provable_pos(PeakIterator::new(mmr.size()), i);
-                for pos in element_positions.iter() {
+                let pruned_root = mmr.root(&mut hasher);
+                assert_eq!(root, pruned_root);
+                for (j, pos) in element_positions.iter().enumerate() {
                     let proof = mmr.proof(*pos).await;
-                    if *pos < oldest_provable_pos {
-                        assert!(proof.is_err(), "proof should fail");
+                    if *pos < i {
+                        assert!(proof.is_err());
                     } else {
-                        assert!(proof.is_ok(), "proof should succeed");
+                        assert!(proof.is_ok());
+                        assert!(proof.unwrap().verify_element_inclusion(
+                            &mut hasher,
+                            &elements[j],
+                            *pos,
+                            &root
+                        ));
                     }
                 }
             }
@@ -656,44 +708,9 @@ mod tests {
     }
 
     #[test]
-    fn test_oldest_required_proof_pos() {
-        let (executor, _, _) = Executor::default();
-        executor.start(async move {
-            // create a new MMR and add a non-trivial amount (49) of elements
-            let mut mmr: Mmr<Sha256> = Mmr::default();
-            let mut elements = Vec::<Digest>::new();
-            let mut element_positions = Vec::<u64>::new();
-            let mut hasher = Sha256::default();
-            for i in 0..49 {
-                elements.push(test_digest(i));
-                element_positions.push(mmr.add(&mut hasher, elements.last().unwrap()));
-            }
-
-            // For every leaf, confirm that pruning to its oldest_required_proof_point allows us to
-            // still prove the leaf, and that pruning even a single node beyond that renders the
-            // leaf unprovable.
-            for &pos in &element_positions {
-                let oldest_required_proof_pos =
-                    oldest_required_proof_pos(PeakIterator::new(mmr.size()), pos);
-
-                let mut mmr = Mmr::default();
-                for _ in 0..49 {
-                    mmr.add(&mut hasher, elements.last().unwrap());
-                }
-                mmr.prune_to_pos(oldest_required_proof_pos);
-                let proof = mmr.proof(pos).await;
-                assert!(proof.is_ok(), "proof should succeed");
-                mmr.prune_to_pos(oldest_required_proof_pos + 1);
-                let proof = mmr.proof(pos).await;
-                assert!(proof.is_err(), "proof should fail");
-            }
-        });
-    }
-
-    #[test]
-    fn test_range_proofs_after_pruning() {
-        let (executor, _, _) = Executor::default();
-        executor.start(async move {
+    fn test_verification_ranges_provable_after_pruning() {
+        let executor = deterministic::Runner::default();
+        executor.start(|_| async move {
             // create a new MMR and add a non-trivial amount (49) of elements
             let mut mmr: Mmr<Sha256> = Mmr::default();
             let mut elements = Vec::<Digest>::new();
@@ -707,9 +724,6 @@ mod tests {
             // prune up to the first peak
             mmr.prune_to_pos(62);
             assert_eq!(mmr.oldest_retained_pos().unwrap(), 62);
-            assert_eq!(mmr.oldest_provable_pos().unwrap(), 62); // peaks are always their own oldest-provable-point
-
-            // Prune the elements from our lists that can no longer be proven after pruning.
             for i in 0..elements.len() {
                 if element_positions[i] > 62 {
                     elements = elements[i..elements.len()].to_vec();
@@ -744,13 +758,12 @@ mod tests {
                 elements.push(test_digest(i));
                 element_positions.push(mmr.add(&mut hasher, elements.last().unwrap()));
             }
-            mmr.prune_to_pos(126); // the new highest peak
-            assert_eq!(mmr.oldest_retained_pos().unwrap(), 126);
-            assert_eq!(mmr.oldest_provable_pos().unwrap(), 126); // peaks are always their own oldest-provable-point
+            mmr.prune_to_pos(130); // a bit after the new highest peak
+            assert_eq!(mmr.oldest_retained_pos().unwrap(), 130);
 
             let updated_root_hash = mmr.root(&mut hasher);
             for i in 0..elements.len() {
-                if element_positions[i] > 126 {
+                if element_positions[i] >= 130 {
                     elements = elements[i..elements.len()].to_vec();
                     element_positions = element_positions[i..element_positions.len()].to_vec();
                     break;
@@ -760,22 +773,22 @@ mod tests {
             let end_pos = *element_positions.last().unwrap();
             let range_proof = mmr.range_proof(start_pos, end_pos).await.unwrap();
             assert!(
-		range_proof.verify_range_inclusion(
+                range_proof.verify_range_inclusion(
                     &mut hasher,
-                    &elements,
+                    elements,
                     start_pos,
                     end_pos,
                     &updated_root_hash,
-		),
-		"valid range proof over remaining elements after 2 pruning rounds should verify successfully",
+                ),
+                "valid range proof over remaining elements after 2 pruning rounds should verify successfully",
             );
         });
     }
 
     #[test]
-    fn test_proof_serialization() {
-        let (executor, _, _) = Executor::default();
-        executor.start(async move {
+    fn test_verification_proof_serialization() {
+        let executor = deterministic::Runner::default();
+        executor.start(|_| async move {
             assert_eq!(
                 Proof::<Sha256>::max_serialization_size(),
                 8168,

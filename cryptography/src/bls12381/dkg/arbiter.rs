@@ -39,7 +39,7 @@
 use crate::{
     bls12381::{
         dkg::{ops, Error},
-        primitives::{group::Share, poly},
+        primitives::{group::Share, poly, variant::Variant},
     },
     Array,
 };
@@ -48,20 +48,20 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Output of the DKG/Resharing procedure.
 #[derive(Clone)]
-pub struct Output {
+pub struct Output<V: Variant> {
     /// The group polynomial output by the DKG/Resharing procedure.
-    pub public: poly::Public,
+    pub public: poly::Public<V>,
 
     /// `2f + 1` commitments used to derive group polynomial.
-    pub commitments: HashMap<u32, poly::Public>,
+    pub commitments: HashMap<u32, poly::Public<V>>,
 
     /// Reveals published by dealers of selected commitments.
     pub reveals: HashMap<u32, Vec<Share>>,
 }
 
 /// Gather commitments, acknowledgements, and reveals from all dealers.
-pub struct Arbiter<P: Array> {
-    previous: Option<poly::Public>,
+pub struct Arbiter<P: Array, V: Variant> {
+    previous: Option<poly::Public<V>>,
     dealer_threshold: u32,
     player_threshold: u32,
     concurrency: usize,
@@ -69,14 +69,15 @@ pub struct Arbiter<P: Array> {
     dealers: HashMap<P, u32>,
     players: Vec<P>,
 
-    commitments: BTreeMap<u32, (poly::Public, Vec<u32>, Vec<Share>)>,
+    #[allow(clippy::type_complexity)]
+    commitments: BTreeMap<u32, (poly::Public<V>, Vec<u32>, Vec<Share>)>,
     disqualified: HashSet<P>,
 }
 
-impl<P: Array> Arbiter<P> {
+impl<P: Array, V: Variant> Arbiter<P, V> {
     /// Create a new arbiter for a DKG/Resharing procedure.
     pub fn new(
-        previous: Option<poly::Public>,
+        previous: Option<poly::Public<V>>,
         mut dealers: Vec<P>,
         mut players: Vec<P>,
         concurrency: usize,
@@ -89,8 +90,8 @@ impl<P: Array> Arbiter<P> {
             .collect::<HashMap<P, _>>();
         players.sort();
         Self {
-            dealer_threshold: quorum(dealers.len() as u32).expect("insufficient dealers"),
-            player_threshold: quorum(players.len() as u32).expect("insufficient players"),
+            dealer_threshold: quorum(dealers.len() as u32),
+            player_threshold: quorum(players.len() as u32),
             previous,
             concurrency,
 
@@ -111,7 +112,7 @@ impl<P: Array> Arbiter<P> {
     pub fn commitment(
         &mut self,
         dealer: P,
-        commitment: poly::Public,
+        commitment: poly::Public<V>,
         acks: Vec<u32>,
         reveals: Vec<Share>,
     ) -> Result<(), Error> {
@@ -134,7 +135,7 @@ impl<P: Array> Arbiter<P> {
         }
 
         // Verify the commitment is valid
-        if let Err(e) = ops::verify_commitment(
+        if let Err(e) = ops::verify_commitment::<V>(
             self.previous.as_ref(),
             idx,
             &commitment,
@@ -163,7 +164,7 @@ impl<P: Array> Arbiter<P> {
 
         // Ensure reveals less than max_faults and for players not yet ack'd
         let reveals_len = reveals.len();
-        let max_faults = max_faults(players_len).unwrap() as usize;
+        let max_faults = max_faults(players_len) as usize;
         if reveals_len > max_faults {
             self.disqualified.insert(dealer);
             return Err(Error::TooManyReveals);
@@ -178,13 +179,13 @@ impl<P: Array> Arbiter<P> {
             }
 
             // Ensure index not already active
-            if active.contains(&share.index) {
+            if !active.insert(&share.index) {
                 self.disqualified.insert(dealer);
                 return Err(Error::AlreadyActive);
             }
 
             // Verify share
-            ops::verify_share(
+            ops::verify_share::<V>(
                 self.previous.as_ref(),
                 idx,
                 &commitment,
@@ -192,9 +193,6 @@ impl<P: Array> Arbiter<P> {
                 share.index,
                 share,
             )?;
-
-            // Record active
-            active.insert(&share.index);
         }
 
         // Active must be equal to number of players
@@ -216,7 +214,7 @@ impl<P: Array> Arbiter<P> {
     /// Recover the group polynomial and return `2f + 1` commitments and reveals from dealers.
     ///
     /// Return the disqualified dealers.
-    pub fn finalize(mut self) -> (Result<Output, Error>, HashSet<P>) {
+    pub fn finalize(mut self) -> (Result<Output<V>, Error>, HashSet<P>) {
         // Drop commitments from disqualified dealers
         for disqualified in self.disqualified.iter() {
             let idx = self.dealers.get(disqualified).unwrap();
@@ -252,7 +250,7 @@ impl<P: Array> Arbiter<P> {
                 for (dealer_idx, (commitment, _, _)) in &selected {
                     commitments.insert(*dealer_idx, commitment.clone());
                 }
-                match ops::recover_public(
+                match ops::recover_public::<V>(
                     &previous,
                     commitments,
                     self.player_threshold,
@@ -267,7 +265,7 @@ impl<P: Array> Arbiter<P> {
                 for (_, (commitment, _, _)) in &selected {
                     commitments.push(commitment.clone());
                 }
-                match ops::construct_public(commitments, self.player_threshold) {
+                match ops::construct_public::<V>(commitments, self.player_threshold) {
                     Ok(public) => public,
                     Err(e) => return (Err(e), self.disqualified),
                 }

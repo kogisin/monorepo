@@ -1,6 +1,7 @@
-use commonware_utils::{Array, SizedSerialize};
+use bytes::{Buf, BufMut};
+use commonware_codec::{Error as CodecError, FixedSize, Read, ReadExt, Write};
+use commonware_utils::Array;
 use std::{fmt, ops::Deref};
-use thiserror::Error;
 
 /// A key that can be used for testing
 #[derive(Clone, Default, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
@@ -25,41 +26,22 @@ impl Deref for Key {
     }
 }
 
-impl TryFrom<&[u8]> for Key {
-    type Error = Error;
-    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if value.len() != 1 {
-            return Err(Error::TryFrom);
-        }
-        Ok(Key(value[0]))
+impl Write for Key {
+    fn write(&self, buf: &mut impl BufMut) {
+        self.0.write(buf);
     }
 }
 
-impl TryFrom<&Vec<u8>> for Key {
-    type Error = Error;
-    fn try_from(value: &Vec<u8>) -> Result<Self, Self::Error> {
-        Self::try_from(value.as_slice())
+impl Read for Key {
+    type Cfg = ();
+
+    fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
+        u8::read(buf).map(Self)
     }
 }
 
-impl TryFrom<Vec<u8>> for Key {
-    type Error = Error;
-    fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
-        Self::try_from(value.as_slice())
-    }
+impl FixedSize for Key {
+    const SIZE: usize = u8::SIZE;
 }
 
-impl SizedSerialize for Key {
-    const SERIALIZED_LEN: usize = 1;
-}
-
-impl Array for Key {
-    type Error = Error;
-}
-
-/// Error type for the Array trait
-#[derive(Error, Debug, PartialEq)]
-pub enum Error {
-    #[error("try_from failed")]
-    TryFrom,
-}
+impl Array for Key {}

@@ -1,86 +1,87 @@
 use super::{
     actors::{resolver, voter},
     config::Config,
-    Context, View,
+    types::{Activity, Context, View},
 };
-use crate::{Automaton, Committer, Relay, ThresholdSupervisor};
+use crate::{Automaton, Relay, Reporter, ThresholdSupervisor};
 use commonware_cryptography::{
-    bls12381::primitives::{group, poly},
-    Scheme,
+    bls12381::primitives::{group, poly, variant::Variant},
+    Digest, Scheme,
 };
 use commonware_macros::select;
 use commonware_p2p::{Receiver, Sender};
-use commonware_runtime::{Blob, Clock, Handle, Metrics, Spawner, Storage};
-use commonware_storage::journal::variable::Journal;
-use commonware_utils::Array;
+use commonware_runtime::{Clock, Handle, Metrics, Spawner, Storage};
 use governor::clock::Clock as GClock;
 use rand::{CryptoRng, Rng};
 use tracing::debug;
 
 /// Instance of `threshold-simplex` consensus engine.
 pub struct Engine<
-    B: Blob,
-    E: Clock + GClock + Rng + CryptoRng + Spawner + Storage<B> + Metrics,
+    E: Clock + GClock + Rng + CryptoRng + Spawner + Storage + Metrics,
     C: Scheme,
-    D: Array,
+    V: Variant,
+    D: Digest,
     A: Automaton<Context = Context<D>, Digest = D>,
     R: Relay<Digest = D>,
-    F: Committer<Digest = D>,
+    F: Reporter<Activity = Activity<V, D>>,
     S: ThresholdSupervisor<
-        Seed = group::Signature,
+        Seed = V::Signature,
         Index = View,
         Share = group::Share,
-        Identity = poly::Public,
+        Identity = poly::Public<V>,
         PublicKey = C::PublicKey,
     >,
 > {
     context: E,
 
-    voter: voter::Actor<B, E, C, D, A, R, F, S>,
-    voter_mailbox: voter::Mailbox<D>,
-    resolver: resolver::Actor<E, C, D, S>,
-    resolver_mailbox: resolver::Mailbox,
+    voter: voter::Actor<E, C, V, D, A, R, F, S>,
+    voter_mailbox: voter::Mailbox<V, D>,
+    resolver: resolver::Actor<E, C, V, D, S>,
+    resolver_mailbox: resolver::Mailbox<V, D>,
 }
 
 impl<
-        B: Blob,
-        E: Clock + GClock + Rng + CryptoRng + Spawner + Storage<B> + Metrics,
+        E: Clock + GClock + Rng + CryptoRng + Spawner + Storage + Metrics,
         C: Scheme,
-        D: Array,
+        V: Variant,
+        D: Digest,
         A: Automaton<Context = Context<D>, Digest = D>,
         R: Relay<Digest = D>,
-        F: Committer<Digest = D>,
+        F: Reporter<Activity = Activity<V, D>>,
         S: ThresholdSupervisor<
-            Seed = group::Signature,
+            Seed = V::Signature,
             Index = View,
             Share = group::Share,
-            Identity = poly::Public,
+            Identity = poly::Public<V>,
             PublicKey = C::PublicKey,
         >,
-    > Engine<B, E, C, D, A, R, F, S>
+    > Engine<E, C, V, D, A, R, F, S>
 {
     /// Create a new `threshold-simplex` consensus engine.
-    pub fn new(context: E, journal: Journal<B, E>, cfg: Config<C, D, A, R, F, S>) -> Self {
+    pub fn new(context: E, cfg: Config<C, V, D, A, R, F, S>) -> Self {
         // Ensure configuration is valid
         cfg.assert();
 
         // Create voter
         let (voter, voter_mailbox) = voter::Actor::new(
             context.clone(),
-            journal,
             voter::Config {
                 crypto: cfg.crypto.clone(),
                 automaton: cfg.automaton,
                 relay: cfg.relay,
-                committer: cfg.committer,
+                reporter: cfg.reporter,
                 supervisor: cfg.supervisor.clone(),
+                partition: cfg.partition,
+                compression: cfg.compression,
                 mailbox_size: cfg.mailbox_size,
                 namespace: cfg.namespace.clone(),
                 leader_timeout: cfg.leader_timeout,
                 notarization_timeout: cfg.notarization_timeout,
                 nullify_retry: cfg.nullify_retry,
                 activity_timeout: cfg.activity_timeout,
+                skip_timeout: cfg.skip_timeout,
                 replay_concurrency: cfg.replay_concurrency,
+                replay_buffer: cfg.replay_buffer,
             },
         );
 
@@ -96,7 +97,6 @@ impl<
                 fetch_timeout: cfg.fetch_timeout,
                 fetch_concurrent: cfg.fetch_concurrent,
                 max_fetch_count: cfg.max_fetch_count,
-                max_fetch_size: cfg.max_fetch_size,
                 fetch_rate_per_peer: cfg.fetch_rate_per_peer,
             },
         );

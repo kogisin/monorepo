@@ -35,6 +35,10 @@
 //!
 //! Update binaries (and configurations) in-place on all instances.
 //!
+//! ### `authorize`
+//!
+//! Add the deployer's current IP (or the one provided) to all security groups.
+//!
 //! ### `destroy`
 //!
 //! Destroy all resources associated with a given deployment.

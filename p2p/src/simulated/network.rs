@@ -6,13 +6,11 @@ use super::{
 };
 use crate::{Channel, Message, Recipients};
 use bytes::Bytes;
+use commonware_codec::{DecodeExt, FixedSize};
 use commonware_macros::select;
-use commonware_runtime::{
-    deterministic::{Listener, Sink, Stream},
-    Clock, Handle, Listener as _, Metrics, Network as RNetwork, Spawner,
-};
+use commonware_runtime::{Clock, Handle, Listener as _, Metrics, Network as RNetwork, Spawner};
 use commonware_stream::utils::codec::{recv_frame, send_frame};
-use commonware_utils::{Array, SizedSerialize};
+use commonware_utils::Array;
 use futures::{
     channel::{mpsc, oneshot},
     SinkExt, StreamExt,
@@ -21,7 +19,7 @@ use prometheus_client::metrics::{counter::Counter, family::Family};
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
@@ -37,8 +35,7 @@ pub struct Config {
 }
 
 /// Implementation of a simulated network.
-pub struct Network<E: RNetwork<Listener, Sink, Stream> + Spawner + Rng + Clock + Metrics, P: Array>
-{
+pub struct Network<E: RNetwork + Spawner + Rng + Clock + Metrics, P: Array> {
     context: E,
 
     // Maximum size of a message that can be sent over the network
@@ -63,14 +60,15 @@ pub struct Network<E: RNetwork<Listener, Sink, Stream> + Spawner + Rng + Clock +
     // A map from a public key to a peer
     peers: BTreeMap<P, Peer<P>>,
 
+    // A map of peers blocking each other
+    blocks: HashSet<(P, P)>,
+
     // Metrics for received and sent messages
     received_messages: Family<metrics::Message, Counter>,
     sent_messages: Family<metrics::Message, Counter>,
 }
 
-impl<E: RNetwork<Listener, Sink, Stream> + Spawner + Rng + Clock + Metrics, P: Array>
-    Network<E, P>
-{
+impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: Array> Network<E, P> {
     /// Create a new simulated network with a given runtime and configuration.
     ///
     /// Returns a tuple containing the network instance and the oracle that can
@@ -102,10 +100,11 @@ impl<E: RNetwork<Listener, Sink, Stream> + Spawner + Rng + Clock + Metrics, P: A
                 receiver,
                 links: HashMap::new(),
                 peers: BTreeMap::new(),
+                blocks: HashSet::new(),
                 received_messages,
                 sent_messages,
             },
-            Oracle::new(oracle_sender),
+            Oracle::new(oracle_sender.clone()),
         )
     }
 
@@ -230,6 +229,9 @@ impl<E: RNetwork<Listener, Sink, Stream> + Spawner + Rng + Clock + Metrics, P: A
                 }
                 send_result(result, Ok(()))
             }
+            ingress::Message::Block { from, to } => {
+                self.blocks.insert((from, to));
+            }
         }
     }
 
@@ -256,12 +258,16 @@ impl<E: RNetwork<Listener, Sink, Stream> + Spawner + Rng + Clock + Metrics, P: A
                 continue;
             }
 
+            // Determine if the sender or recipient has blocked the other
+            let o_r = (origin.clone(), recipient.clone());
+            let r_o = (recipient.clone(), origin.clone());
+            if self.blocks.contains(&o_r) || self.blocks.contains(&r_o) {
+                trace!(?origin, ?recipient, reason = "blocked", "dropping message");
+                continue;
+            }
+
             // Determine if there is a link between the sender and recipient
-            let mut link = match self
-                .links
-                .get(&(origin.clone(), recipient.clone()))
-                .cloned()
-            {
+            let mut link = match self.links.get(&o_r).cloned() {
                 Some(link) => link,
                 None => {
                     trace!(?origin, ?recipient, reason = "no link", "dropping message",);
@@ -491,7 +497,7 @@ impl<P: Array> Peer<P> {
     ///
     /// The peer will listen for incoming connections on the given `socket` address.
     /// `max_size` is the maximum size of a message that can be sent to the peer.
-    fn new<E: Spawner + RNetwork<Listener, Sink, Stream> + Metrics>(
+    fn new<E: Spawner + RNetwork + Metrics>(
         context: &mut E,
         public_key: P,
         socket: SocketAddr,
@@ -583,7 +589,7 @@ impl<P: Array> Peer<P> {
                                     return;
                                 }
                             };
-                            let Ok(dialer) = P::try_from(dialer.as_ref()) else {
+                            let Ok(dialer) = P::decode(dialer.as_ref()) else {
                                 error!("received public key is invalid");
                                 return;
                             };
@@ -591,9 +597,9 @@ impl<P: Array> Peer<P> {
                             // Continually receive messages from the dialer and send them to the inbox
                             while let Ok(data) = recv_frame(&mut stream, max_size).await {
                                 let channel = Channel::from_be_bytes(
-                                    data[..Channel::SERIALIZED_LEN].try_into().unwrap(),
+                                    data[..Channel::SIZE].try_into().unwrap(),
                                 );
-                                let message = data.slice(Channel::SERIALIZED_LEN..);
+                                let message = data.slice(Channel::SIZE..);
                                 if let Err(err) = inbox_sender
                                     .send((channel, (dialer.clone(), message)))
                                     .await
@@ -639,7 +645,7 @@ struct Link {
 }
 
 impl Link {
-    fn new<E: Spawner + RNetwork<Listener, Sink, Stream> + Metrics, P: Array>(
+    fn new<E: Spawner + RNetwork + Metrics, P: Array>(
         context: &mut E,
         dialer: P,
         socket: SocketAddr,
@@ -663,14 +669,13 @@ impl Link {
                 // Dial the peer and handshake by sending it the dialer's public key
                 let (mut sink, _) = context.dial(socket).await.unwrap();
                 if let Err(err) = send_frame(&mut sink, &dialer, max_size).await {
-                    error!(?err, "failed to send public key to dialee");
+                    error!(?err, "failed to send public key to listener");
                     return;
                 }
 
                 // For any item placed in the inbox, send it to the sink
                 while let Some((channel, message)) = outbox.next().await {
-                    let mut data =
-                        bytes::BytesMut::with_capacity(Channel::SERIALIZED_LEN + message.len());
+                    let mut data = bytes::BytesMut::with_capacity(Channel::SIZE + message.len());
                     data.extend_from_slice(&channel.to_be_bytes());
                     data.extend_from_slice(&message);
                     let data = data.freeze();
@@ -694,18 +699,15 @@ impl Link {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_cryptography::{Ed25519, Scheme};
-    use commonware_runtime::{
-        deterministic::{Context, Executor},
-        Runner,
-    };
+    use commonware_cryptography::{Ed25519, Signer, Specification};
+    use commonware_runtime::{deterministic, Runner};
 
     const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 
     #[test]
     fn test_register_and_link() {
-        let (executor, context, _) = Executor::default();
-        executor.start(async move {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
             let cfg = Config {
                 max_size: MAX_MESSAGE_SIZE,
             };
@@ -753,27 +755,31 @@ mod tests {
         let cfg = Config {
             max_size: MAX_MESSAGE_SIZE,
         };
-        let (_, context, _) = Executor::default();
-        type PublicKey = <Ed25519 as Scheme>::PublicKey;
-        let (mut network, _) = Network::<Context, PublicKey>::new(context.clone(), cfg);
+        let runner = deterministic::Runner::default();
 
-        // Test that the next socket address is incremented correctly
-        let mut original = network.next_addr;
-        let next = network.get_next_socket();
-        assert_eq!(next, original);
-        let next = network.get_next_socket();
-        original.set_port(1);
-        assert_eq!(next, original);
+        runner.start(|context| async move {
+            type PublicKey = <Ed25519 as Specification>::PublicKey;
+            let (mut network, _) =
+                Network::<deterministic::Context, PublicKey>::new(context.clone(), cfg);
 
-        // Test that the port number overflows correctly
-        let max_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 0, 255, 255)), 65535);
-        network.next_addr = max_addr;
-        let next = network.get_next_socket();
-        assert_eq!(next, max_addr);
-        let next = network.get_next_socket();
-        assert_eq!(
-            next,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 1, 0, 0)), 0)
-        );
+            // Test that the next socket address is incremented correctly
+            let mut original = network.next_addr;
+            let next = network.get_next_socket();
+            assert_eq!(next, original);
+            let next = network.get_next_socket();
+            original.set_port(1);
+            assert_eq!(next, original);
+
+            // Test that the port number overflows correctly
+            let max_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 0, 255, 255)), 65535);
+            network.next_addr = max_addr;
+            let next = network.get_next_socket();
+            assert_eq!(next, max_addr);
+            let next = network.get_next_socket();
+            assert_eq!(
+                next,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 1, 0, 0)), 0)
+            );
+        });
     }
 }

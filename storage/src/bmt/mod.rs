@@ -41,8 +41,8 @@
 //! ```
 
 use bytes::Buf;
+use commonware_codec::{FixedSize, ReadExt};
 use commonware_cryptography::Hasher;
-use commonware_utils::{Array, SizedSerialize};
 use thiserror::Error;
 
 /// Errors that can occur when working with a Binary Merkle Tree (BMT).
@@ -127,7 +127,7 @@ impl<H: Hasher> Tree<H> {
         // Construct the tree level-by-level
         let mut current_level = levels.last().unwrap();
         while current_level.len() > 1 {
-            let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);
+            let mut next_level = Vec::with_capacity(current_level.len().div_ceil(2));
             for chunk in current_level.chunks(2) {
                 // Hash the left child
                 hasher.update(&chunk[0]);
@@ -153,7 +153,7 @@ impl<H: Hasher> Tree<H> {
 
     /// Returns the root of the tree.
     pub fn root(&self) -> H::Digest {
-        self.levels.last().unwrap().first().unwrap().clone()
+        *self.levels.last().unwrap().first().unwrap()
     }
 
     /// Generates a Merkle proof for the leaf at `position`.
@@ -175,13 +175,13 @@ impl<H: Hasher> Tree<H> {
             }
             let sibling_index = if index % 2 == 0 { index + 1 } else { index - 1 };
             let sibling = if sibling_index < level.len() {
-                level[sibling_index].clone()
+                level[sibling_index]
             } else {
                 // If no right child exists, use a duplicate of the current node.
                 //
                 // This doesn't affect the robustness of the proof (allow a non-existent position
                 // to be proven or enable multiple proofs to be generated from a single leaf).
-                level[index].clone()
+                level[index]
             };
             siblings.push(sibling);
             index /= 2;
@@ -258,7 +258,7 @@ impl<H: Hasher> Proof<H> {
         );
 
         // Serialize the proof as the concatenation of each hash.
-        let bytes_len = self.siblings.len() * H::Digest::SERIALIZED_LEN;
+        let bytes_len = self.siblings.len() * H::Digest::SIZE;
         let mut bytes = Vec::with_capacity(bytes_len);
         for hash in &self.siblings {
             bytes.extend_from_slice(hash.as_ref());
@@ -271,12 +271,12 @@ impl<H: Hasher> Proof<H> {
         // It is ok to have an empty proof (just means the provided leaf is the root).
 
         // If the remaining buffer is not a multiple of the hash size, it's invalid.
-        if buf.remaining() % H::Digest::SERIALIZED_LEN != 0 {
+        if buf.remaining() % H::Digest::SIZE != 0 {
             return Err(Error::UnalignedProof);
         }
 
         // If the number of siblings is too large, it's invalid.
-        let num_siblings = buf.len() / H::Digest::SERIALIZED_LEN;
+        let num_siblings = buf.len() / H::Digest::SIZE;
         if num_siblings > u8::MAX as usize {
             return Err(Error::TooManySiblings(num_siblings));
         }
@@ -284,7 +284,7 @@ impl<H: Hasher> Proof<H> {
         // Deserialize the siblings
         let mut siblings = Vec::with_capacity(num_siblings);
         for _ in 0..num_siblings {
-            let hash = H::Digest::read_from(&mut buf).map_err(|_| Error::InvalidDigest)?;
+            let hash = H::Digest::read(&mut buf).map_err(|_| Error::InvalidDigest)?;
             siblings.push(hash);
         }
         Ok(Self { siblings })
@@ -644,7 +644,7 @@ mod tests {
         let mut proof = tree.proof(0).unwrap();
 
         // Tamper with proof
-        proof.siblings.push(element.clone());
+        proof.siblings.push(*element);
 
         // Fail verification with an empty proof.
         let mut hasher = Sha256::default();

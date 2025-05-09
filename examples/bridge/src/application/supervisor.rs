@@ -1,9 +1,11 @@
+use commonware_codec::Encode;
 use commonware_consensus::{
-    threshold_simplex::View, Activity, Proof, Supervisor as Su, ThresholdSupervisor as TSu,
+    threshold_simplex::types::View, Supervisor as Su, ThresholdSupervisor as TSu,
 };
 use commonware_cryptography::bls12381::primitives::{
-    group::{self, Element},
-    poly::{self, Poly},
+    group,
+    poly::Public,
+    variant::{MinSig, Variant},
 };
 use commonware_utils::{modulo, Array};
 use std::collections::HashMap;
@@ -11,7 +13,7 @@ use std::collections::HashMap;
 /// Implementation of `commonware-consensus::Supervisor`.
 #[derive(Clone)]
 pub struct Supervisor<P: Array> {
-    identity: Poly<group::Public>,
+    identity: Public<MinSig>,
     participants: Vec<P>,
     participants_map: HashMap<P, u32>,
 
@@ -19,11 +21,7 @@ pub struct Supervisor<P: Array> {
 }
 
 impl<P: Array> Supervisor<P> {
-    pub fn new(
-        identity: Poly<group::Public>,
-        mut participants: Vec<P>,
-        share: group::Share,
-    ) -> Self {
+    pub fn new(identity: Public<MinSig>, mut participants: Vec<P>, share: group::Share) -> Self {
         // Setup participants
         participants.sort();
         let mut participants_map = HashMap::new();
@@ -56,20 +54,15 @@ impl<P: Array> Su for Supervisor<P> {
     fn is_participant(&self, _: Self::Index, candidate: &Self::PublicKey) -> Option<u32> {
         self.participants_map.get(candidate).cloned()
     }
-
-    async fn report(&self, _: Activity, _: Proof) {
-        // We don't report activity in this example but you would otherwise use
-        // this to collect uptime and fraud proofs.
-    }
 }
 
 impl<P: Array> TSu for Supervisor<P> {
-    type Seed = group::Signature;
-    type Identity = poly::Public;
+    type Seed = <MinSig as Variant>::Signature;
+    type Identity = Public<MinSig>;
     type Share = group::Share;
 
     fn leader(&self, _: Self::Index, seed: Self::Seed) -> Option<Self::PublicKey> {
-        let seed = seed.serialize();
+        let seed = seed.encode();
         let index = modulo(&seed, self.participants.len() as u64);
         Some(self.participants[index as usize].clone())
     }

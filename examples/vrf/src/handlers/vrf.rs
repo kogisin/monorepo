@@ -1,18 +1,17 @@
 use crate::handlers::wire;
+use commonware_codec::{DecodeExt, Encode};
 use commonware_cryptography::bls12381::{
     dkg::player::Output,
     primitives::{
-        group::{self, Element},
         ops,
-        poly::PartialSignature,
+        variant::{MinSig, Variant},
     },
 };
 use commonware_macros::select;
 use commonware_p2p::{Receiver, Recipients, Sender};
 use commonware_runtime::{Clock, Handle, Spawner};
-use commonware_utils::{hex, Array};
+use commonware_utils::Array;
 use futures::{channel::mpsc, StreamExt};
-use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -27,7 +26,7 @@ pub struct Vrf<E: Clock + Spawner, P: Array> {
     threshold: u32,
     contributors: Vec<P>,
     ordered_contributors: HashMap<P, u32>,
-    requests: mpsc::Receiver<(u64, Output)>,
+    requests: mpsc::Receiver<(u64, Output<MinSig>)>,
 }
 
 impl<E: Clock + Spawner, P: Array> Vrf<E, P> {
@@ -36,7 +35,7 @@ impl<E: Clock + Spawner, P: Array> Vrf<E, P> {
         timeout: Duration,
         threshold: u32,
         mut contributors: Vec<P>,
-        requests: mpsc::Receiver<(u64, Output)>,
+        requests: mpsc::Receiver<(u64, Output<MinSig>)>,
     ) -> Self {
         contributors.sort();
         let ordered_contributors = contributors
@@ -56,14 +55,15 @@ impl<E: Clock + Spawner, P: Array> Vrf<E, P> {
 
     async fn run_round(
         &self,
-        output: &Output,
+        output: &Output<MinSig>,
         round: u64,
         sender: &mut impl Sender<PublicKey = P>,
         receiver: &mut impl Receiver<PublicKey = P>,
-    ) -> Option<group::Signature> {
+    ) -> Option<<MinSig as Variant>::Signature> {
         // Construct payload
         let payload = round.to_be_bytes();
-        let signature = ops::partial_sign_message(&output.share, Some(VRF_NAMESPACE), &payload);
+        let signature =
+            ops::partial_sign_message::<MinSig>(&output.share, Some(VRF_NAMESPACE), &payload);
 
         // Construct partial signature
         let mut partials = vec![signature.clone()];
@@ -72,12 +72,7 @@ impl<E: Clock + Spawner, P: Array> Vrf<E, P> {
         sender
             .send(
                 Recipients::Some(self.contributors.clone()),
-                wire::Vrf {
-                    round,
-                    signature: signature.serialize(),
-                }
-                .encode_to_vec()
-                .into(),
+                wire::Vrf { round, signature }.encode().into(),
                 true,
             )
             .await
@@ -121,16 +116,9 @@ impl<E: Clock + Spawner, P: Array> Vrf<E, P> {
                                 );
                                 continue;
                             }
-                            let signature = match PartialSignature::deserialize(&msg.signature) {
-                                Some(signature) => signature,
-                                None => {
-                                    warn!(round, dealer, "received invalid signature");
-                                    continue;
-                                }
-                            };
-                            match ops::partial_verify_message(&output.public, Some(VRF_NAMESPACE), &payload, &signature) {
+                            match ops::partial_verify_message::<MinSig>(&output.public, Some(VRF_NAMESPACE), &payload, &msg.signature) {
                                 Ok(_) => {
-                                    partials.push(signature);
+                                    partials.push(msg.signature);
                                     debug!(round, dealer, "received partial signature");
                                 }
                                 Err(_) => {
@@ -148,7 +136,7 @@ impl<E: Clock + Spawner, P: Array> Vrf<E, P> {
         }
 
         // Aggregate partial signatures
-        match ops::threshold_signature_recover(self.threshold, partials) {
+        match ops::threshold_signature_recover::<MinSig, _>(self.threshold, &partials) {
             Ok(signature) => Some(signature),
             Err(_) => {
                 warn!(round, "failed to aggregate partial signatures");
@@ -183,8 +171,7 @@ impl<E: Clock + Spawner, P: Array> Vrf<E, P> {
                 .await
             {
                 Some(signature) => {
-                    let signature = signature.serialize();
-                    info!(round, signature = hex(&signature), "generated signature");
+                    info!(round, ?signature, "generated signature");
                 }
                 None => {
                     warn!(round, "failed to generate signature");

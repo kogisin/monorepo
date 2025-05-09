@@ -1,9 +1,12 @@
 //! Leverage common functionality across multiple primitives.
 
-use prost::{encode_length_delimiter, length_delimiter_len};
+use bytes::{BufMut, BytesMut};
+use commonware_codec::{EncodeSize, Write};
 
 pub mod array;
 pub use array::Array;
+mod bitvec;
+pub use bitvec::{BitIterator, BitVec};
 mod time;
 pub use time::SystemTimeExt;
 mod priority_set;
@@ -27,10 +30,7 @@ pub fn from_hex(hex: &str) -> Option<Vec<u8>> {
 
     (0..hex.len())
         .step_by(2)
-        .map(|i| match u8::from_str_radix(&hex[i..i + 2], 16) {
-            Ok(byte) => Some(byte),
-            Err(_) => None,
-        })
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
         .collect()
 }
 
@@ -42,21 +42,22 @@ pub fn from_hex_formatted(hex: &str) -> Option<Vec<u8>> {
     from_hex(res)
 }
 
-/// Compute the maximum value of `f` (faults) that can be tolerated given `n = 3f + 1`.
-pub fn max_faults(n: u32) -> Option<u32> {
-    let f = n.checked_sub(1)? / 3;
-    if f == 0 {
-        return None;
-    }
-    Some(f)
+/// Compute the maximum number of `f` (faults) that can be tolerated for a given set of `n`
+/// participants. This is the maximum integer `f` such that `n >= 3*f + 1`. `f` may be zero.
+pub fn max_faults(n: u32) -> u32 {
+    n.saturating_sub(1) / 3
 }
 
-/// Assuming that `n = 3f + 1`, compute the minimum size of `q` such that `q >= 2f + 1`.
+/// Compute the quorum size for a given set of `n` participants. This is the minimum integer `q`
+/// such that `3*q >= 2*n + 1`. It is also equal to `n - f`, where `f` is the maximum number of
+/// faults.
 ///
-/// If the value of `n` is too small to tolerate any faults, this function returns `None`.
-pub fn quorum(n: u32) -> Option<u32> {
-    let f = max_faults(n)?;
-    Some((2 * f) + 1)
+/// # Panics
+///
+/// Panics if `n` is zero.
+pub fn quorum(n: u32) -> u32 {
+    assert!(n > 0, "n must not be zero");
+    n - max_faults(n)
 }
 
 /// Computes the union of two byte slices.
@@ -71,12 +72,12 @@ pub fn union(a: &[u8], b: &[u8]) -> Vec<u8> {
 ///
 /// This produces a unique byte sequence (i.e. no collisions) for each `(namespace, msg)` pair.
 pub fn union_unique(namespace: &[u8], msg: &[u8]) -> Vec<u8> {
-    let ld_len = length_delimiter_len(namespace.len());
-    let mut result = Vec::with_capacity(ld_len + namespace.len() + msg.len());
-    encode_length_delimiter(namespace.len(), &mut result).unwrap();
-    result.extend_from_slice(namespace);
-    result.extend_from_slice(msg);
-    result
+    let len_prefix = namespace.len();
+    let mut buf = BytesMut::with_capacity(len_prefix.encode_size() + namespace.len() + msg.len());
+    len_prefix.write(&mut buf);
+    buf.put_slice(namespace);
+    buf.put_slice(msg);
+    buf.into()
 }
 
 /// Compute the modulo of bytes interpreted as a big-endian integer.
@@ -92,29 +93,34 @@ pub fn modulo(bytes: &[u8], n: u64) -> u64 {
     result
 }
 
-/// Types with a constant encoded length.
-pub trait SizedSerialize {
-    const SERIALIZED_LEN: usize;
+/// A macro to create a `NonZeroUsize` from a value, panicking if the value is zero.
+#[macro_export]
+macro_rules! NZUsize {
+    ($val:expr) => {
+        // This will panic at runtime if $val is zero.
+        // For literals, the compiler *might* optimize, but the check is still conceptually there.
+        std::num::NonZeroUsize::new($val).expect("value must be non-zero")
+    };
 }
 
-impl SizedSerialize for u8 {
-    const SERIALIZED_LEN: usize = 1;
+/// A macro to create a `NonZeroU32` from a value, panicking if the value is zero.
+#[macro_export]
+macro_rules! NZU32 {
+    ($val:expr) => {
+        // This will panic at runtime if $val is zero.
+        // For literals, the compiler *might* optimize, but the check is still conceptually there.
+        std::num::NonZeroU32::new($val).expect("value must be non-zero")
+    };
 }
 
-impl SizedSerialize for u16 {
-    const SERIALIZED_LEN: usize = 2;
-}
-
-impl SizedSerialize for u32 {
-    const SERIALIZED_LEN: usize = 4;
-}
-
-impl SizedSerialize for u64 {
-    const SERIALIZED_LEN: usize = 8;
-}
-
-impl SizedSerialize for u128 {
-    const SERIALIZED_LEN: usize = 16;
+/// A macro to create a `NonZeroU64` from a value, panicking if the value is zero.
+#[macro_export]
+macro_rules! NZU64 {
+    ($val:expr) => {
+        // This will panic at runtime if $val is zero.
+        // For literals, the compiler *might* optimize, but the check is still conceptually there.
+        std::num::NonZeroU64::new($val).expect("value must be non-zero")
+    };
 }
 
 #[cfg(test)]
@@ -195,18 +201,48 @@ mod tests {
     }
 
     #[test]
-    fn test_quorum() {
-        // Test case 0: n = 3 (3*0 + 1)
-        assert_eq!(quorum(3), None);
+    fn test_max_faults_zero() {
+        assert_eq!(max_faults(0), 0);
+    }
 
-        // Test case 1: n = 4 (3*1 + 1)
-        assert_eq!(quorum(4), Some(3));
+    #[test]
+    #[should_panic]
+    fn test_quorum_zero() {
+        quorum(0);
+    }
 
-        // Test case 2: n = 7 (3*2 + 1)
-        assert_eq!(quorum(7), Some(5));
+    #[test]
+    fn test_quorum_and_max_faults() {
+        // n, expected_f, expected_q
+        let test_cases = [
+            (1, 0, 1),
+            (2, 0, 2),
+            (3, 0, 3),
+            (4, 1, 3),
+            (5, 1, 4),
+            (6, 1, 5),
+            (7, 2, 5),
+            (8, 2, 6),
+            (9, 2, 7),
+            (10, 3, 7),
+            (11, 3, 8),
+            (12, 3, 9),
+            (13, 4, 9),
+            (14, 4, 10),
+            (15, 4, 11),
+            (16, 5, 11),
+            (17, 5, 12),
+            (18, 5, 13),
+            (19, 6, 13),
+            (20, 6, 14),
+            (21, 6, 15),
+        ];
 
-        // Test case 3: n = 10 (3*3 + 1)
-        assert_eq!(quorum(10), Some(7));
+        for (n, ef, eq) in test_cases {
+            assert_eq!(max_faults(n), ef);
+            assert_eq!(quorum(n), eq);
+            assert_eq!(n, ef + eq);
+        }
     }
 
     #[test]
@@ -292,5 +328,18 @@ mod tests {
             let utils_modulo = modulo(&bytes, n);
             assert_eq!(big_modulo, BigUint::from(utils_modulo));
         }
+    }
+
+    #[test]
+    fn test_non_zero_macros() {
+        // Test case 0: zero value
+        assert!(std::panic::catch_unwind(|| NZUsize!(0)).is_err());
+        assert!(std::panic::catch_unwind(|| NZU32!(0)).is_err());
+        assert!(std::panic::catch_unwind(|| NZU64!(0)).is_err());
+
+        // Test case 1: non-zero value
+        assert_eq!(NZUsize!(1).get(), 1);
+        assert_eq!(NZU32!(2).get(), 2);
+        assert_eq!(NZU64!(3).get(), 3);
     }
 }

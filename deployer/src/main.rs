@@ -20,7 +20,7 @@ async fn main() -> std::process::ExitCode {
     // Define application
     let matches = Command::new("deployer")
         .version(crate_version())
-        .about("TBD")
+        .about("Deploy infrastructure across cloud providers.")
         .arg(
             Arg::new(VERBOSE_FLAG)
                 .short('v')
@@ -53,6 +53,23 @@ async fn main() -> std::process::ExitCode {
                         ),
                 )
                 .subcommand(
+                    Command::new(ec2::AUTHORIZE_CMD)
+                        .about("Add the deployer's public IP (or the one provided) to all security groups.")
+                        .arg(
+                            Arg::new("config")
+                                .long("config")
+                                .required(true)
+                                .help("Path to YAML config file")
+                                .value_parser(clap::value_parser!(PathBuf)),
+                        )
+                        .arg(
+                            Arg::new("ip")
+                                .long("ip")
+                                .help("IPv4 address to add to security groups instead of the current IP. If not provided, the current public IPv4 address will be used.")
+                                .value_parser(clap::value_parser!(String)),
+                        ),
+                )
+                .subcommand(
                     Command::new(ec2::DESTROY_CMD)
                         .about("Destroy all resources associated with a given deployment.")
                         .arg(
@@ -62,7 +79,7 @@ async fn main() -> std::process::ExitCode {
                                 .help("Path to YAML config file")
                                 .value_parser(clap::value_parser!(PathBuf)),
                         ),
-                ),
+                )
         )
         .get_matches();
 
@@ -89,6 +106,15 @@ async fn main() -> std::process::ExitCode {
                 let config_path = matches.get_one::<PathBuf>("config").unwrap();
                 if let Err(e) = ec2::update(config_path).await {
                     error!(error=?e, "failed to update EC2 deployment");
+                } else {
+                    return std::process::ExitCode::SUCCESS;
+                }
+            }
+            Some((ec2::AUTHORIZE_CMD, matches)) => {
+                let config_path = matches.get_one::<PathBuf>("config").unwrap();
+                let ip = matches.get_one::<String>("ip").cloned();
+                if let Err(e) = ec2::authorize(config_path, ip).await {
+                    error!(error=?e, "failed to authorize EC2 deployment");
                 } else {
                     return std::process::ExitCode::SUCCESS;
                 }

@@ -1,33 +1,29 @@
-use commonware_consensus::{
-    simplex::Context, Automaton as Au, Committer as Co, Proof, Relay as Re,
-};
-use commonware_utils::Array;
+use commonware_consensus::{simplex::types::Context, Automaton as Au, Relay as Re};
+use commonware_cryptography::Digest;
 use futures::{
     channel::{mpsc, oneshot},
     SinkExt,
 };
 
-pub enum Message<D: Array> {
+pub enum Message<D: Digest> {
     Genesis { response: oneshot::Sender<D> },
     Propose { response: oneshot::Sender<D> },
     Verify { response: oneshot::Sender<bool> },
-    Prepared { proof: Proof, payload: D },
-    Finalized { proof: Proof, payload: D },
 }
 
 /// Mailbox for the application.
 #[derive(Clone)]
-pub struct Mailbox<D: Array> {
+pub struct Mailbox<D: Digest> {
     sender: mpsc::Sender<Message<D>>,
 }
 
-impl<D: Array> Mailbox<D> {
+impl<D: Digest> Mailbox<D> {
     pub(super) fn new(sender: mpsc::Sender<Message<D>>) -> Self {
         Self { sender }
     }
 }
 
-impl<D: Array> Au for Mailbox<D> {
+impl<D: Digest> Au for Mailbox<D> {
     type Digest = D;
     type Context = Context<Self::Digest>;
 
@@ -69,7 +65,7 @@ impl<D: Array> Au for Mailbox<D> {
     }
 }
 
-impl<D: Array> Re for Mailbox<D> {
+impl<D: Digest> Re for Mailbox<D> {
     type Digest = D;
 
     async fn broadcast(&mut self, _: Self::Digest) {
@@ -77,23 +73,5 @@ impl<D: Array> Re for Mailbox<D> {
         //
         // If we were building an EVM blockchain, for example, we'd
         // send the block to other peers here.
-    }
-}
-
-impl<D: Array> Co for Mailbox<D> {
-    type Digest = D;
-
-    async fn prepared(&mut self, proof: Proof, payload: Self::Digest) {
-        self.sender
-            .send(Message::Prepared { proof, payload })
-            .await
-            .expect("Failed to send notarized");
-    }
-
-    async fn finalized(&mut self, proof: Proof, payload: Self::Digest) {
-        self.sender
-            .send(Message::Finalized { proof, payload })
-            .await
-            .expect("Failed to send finalized");
     }
 }

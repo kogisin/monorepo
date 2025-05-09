@@ -5,37 +5,22 @@
 //! `commonware-consensus` is **ALPHA** software and is not yet recommended for production use. Developers should
 //! expect breaking changes and occasional instability.
 
-use bytes::Bytes;
-use commonware_utils::Array;
-
+pub mod ordered_broadcast;
 pub mod simplex;
 pub mod threshold_simplex;
 
-/// Activity is specified by the underlying consensus implementation and can be interpreted if desired.
-///
-/// Examples of activity would be "vote", "finalize", or "fault". Various consensus implementations may
-/// want to reward (or penalize) participation in different ways and in different places. For example,
-/// validators could be required to send multiple types of messages (i.e. vote and finalize) and rewarding
-/// both equally may better align incentives with desired behavior.
-pub type Activity = u8;
-
-/// Proof is a blob that attests to some data.
-pub type Proof = Bytes;
-
 cfg_if::cfg_if! {
     if #[cfg(not(target_arch = "wasm32"))] {
-        use futures::channel::oneshot;
+        use commonware_utils::Array;
+        use commonware_cryptography::Digest;
+        use futures::channel::{oneshot, mpsc};
         use std::future::Future;
 
-        /// Parsed is a wrapper around a message that has a parsable digest.
-        #[derive(Clone)]
-        struct Parsed<Message, Digest: Array> {
-            /// Raw message that has some field that can be parsed into a digest.
-            pub message: Message,
-
-            /// Parsed digest.
-            pub digest: Digest,
-        }
+        /// Histogram buckets for measuring consensus latency.
+        const LATENCY: [f64; 20] = [
+            0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8,
+            0.9, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0,
+        ];
 
         /// Automaton is the interface responsible for driving the consensus forward by proposing new payloads
         /// and verifying payloads proposed by other participants.
@@ -46,7 +31,7 @@ cfg_if::cfg_if! {
             type Context;
 
             /// Hash of an arbitrary payload.
-            type Digest: Array;
+            type Digest: Digest;
 
             /// Payload used to initialize the consensus engine.
             fn genesis(&mut self) -> impl Future<Output = Self::Digest> + Send;
@@ -78,7 +63,7 @@ cfg_if::cfg_if! {
         /// to the relay to efficiently broadcast the full payload to other participants.
         pub trait Relay: Clone + Send + 'static {
             /// Hash of an arbitrary payload.
-            type Digest: Array;
+            type Digest: Digest;
 
             /// Called once consensus begins working towards a proposal provided by `Automaton` (i.e.
             /// it isn't dropped).
@@ -88,18 +73,18 @@ cfg_if::cfg_if! {
             fn broadcast(&mut self, payload: Self::Digest) -> impl Future<Output = ()> + Send;
         }
 
-        /// Committer is the interface responsible for handling notifications of payload status.
-        pub trait Committer: Clone + Send + 'static {
-            /// Hash of an arbitrary payload.
-            type Digest: Array;
-
-            /// Event that a payload has made some progress towards finalization but is not yet finalized.
+        /// Reporter is the interface responsible for reporting activity to some external actor.
+        pub trait Reporter: Clone + Send + 'static {
+            /// Activity is specified by the underlying consensus implementation and can be interpreted if desired.
             ///
-            /// This is often used to provide an early ("best guess") confirmation to users.
-            fn prepared(&mut self, proof: Proof, payload: Self::Digest) -> impl Future<Output = ()> + Send;
+            /// Examples of activity would be "vote", "finalize", or "fault". Various consensus implementations may
+            /// want to reward (or penalize) participation in different ways and in different places. For example,
+            /// validators could be required to send multiple types of messages (i.e. vote and finalize) and rewarding
+            /// both equally may better align incentives with desired behavior.
+            type Activity;
 
-            /// Event indicating the container has been finalized.
-            fn finalized(&mut self, proof: Proof, payload: Self::Digest) -> impl Future<Output = ()> + Send;
+            /// Report some activity observed by the consensus implementation.
+            fn report(&mut self, activity: Self::Activity) -> impl Future<Output = ()> + Send;
         }
 
         /// Supervisor is the interface responsible for managing which participants are active at a given time.
@@ -132,9 +117,6 @@ cfg_if::cfg_if! {
 
             // Indicate whether some candidate is a participant at the given view.
             fn is_participant(&self, index: Self::Index, candidate: &Self::PublicKey) -> Option<u32>;
-
-            /// Report some activity observed by the consensus implementation.
-            fn report(&self, activity: Activity, proof: Proof) -> impl Future<Output = ()> + Send;
         }
 
         /// ThresholdSupervisor is the interface responsible for managing which `identity` (typically a group polynomial with
@@ -142,7 +124,7 @@ cfg_if::cfg_if! {
         ///
         /// ## Synchronization
         ///
-        /// The same considerations for `Supervisor` apply here.
+        /// The same considerations for [`Supervisor`](crate::Supervisor) apply here.
         pub trait ThresholdSupervisor: Supervisor {
             /// Seed is some random value used to bias the leader selection process.
             type Seed;
@@ -165,6 +147,21 @@ cfg_if::cfg_if! {
             /// Returns share to sign with at a given index. After resharing, the share
             /// may change (and old shares may be deleted).
             fn share(&self, index: Self::Index) -> Option<&Self::Share>;
+        }
+
+        /// Monitor is the interface an external actor can use to observe the progress of a consensus implementation.
+        ///
+        /// Monitor is used to implement mechanisms that share the same set of active participants as consensus and/or
+        /// perform some activity that requires some synchronization with the progress of consensus.
+        ///
+        /// Monitor can be implemented using [`Reporter`](crate::Reporter) to avoid introducing complexity
+        /// into any particular consensus implementation.
+        pub trait Monitor: Clone + Send + 'static {
+            /// Index is the type used to indicate the in-progress consensus decision.
+            type Index;
+
+            /// Create a channel that will receive updates when the latest index (also provided) changes.
+            fn subscribe(&mut self) -> impl Future<Output = (Self::Index, mpsc::Receiver<Self::Index>)> + Send;
         }
     }
 }

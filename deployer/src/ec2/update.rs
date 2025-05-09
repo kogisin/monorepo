@@ -94,7 +94,6 @@ pub async fn update(config_path: &PathBuf) -> Result<(), Error> {
             let private_key = private_key_path.to_str().unwrap();
             let binary_path = instance_config.binary.clone();
             let config_path = instance_config.config.clone();
-            let ip = ip.clone();
             let future = async move {
                 update_instance(private_key, &ip, &binary_path, &config_path).await?;
                 info!(name, ip, "updated instance");
@@ -125,9 +124,13 @@ async fn update_instance(
     // Wait for the service to become inactive
     poll_service_inactive(private_key, ip, "binary").await?;
 
+    // Remove the existing binary and config (to ensure new copy is used)
+    ssh_execute(private_key, ip, "rm -f /home/ubuntu/binary").await?;
+    ssh_execute(private_key, ip, "rm -f /home/ubuntu/config.conf").await?;
+
     // Push the latest binary and config
-    scp_file(private_key, binary_path, ip, "/home/ubuntu/binary").await?;
-    scp_file(private_key, config_path, ip, "/home/ubuntu/config.conf").await?;
+    rsync_file(private_key, binary_path, ip, "/home/ubuntu/binary").await?;
+    rsync_file(private_key, config_path, ip, "/home/ubuntu/config.conf").await?;
 
     // Ensure the binary is executable
     ssh_execute(private_key, ip, "chmod +x /home/ubuntu/binary").await?;

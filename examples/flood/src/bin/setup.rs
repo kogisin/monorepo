@@ -1,5 +1,5 @@
 use clap::{value_parser, Arg, Command};
-use commonware_cryptography::{Ed25519, Scheme};
+use commonware_cryptography::{Ed25519, Signer};
 use commonware_deployer::ec2;
 use commonware_flood::Config;
 use rand::{rngs::OsRng, seq::IteratorRandom};
@@ -162,6 +162,7 @@ fn main() {
             storage_class: storage_class.clone(),
             binary: BINARY_NAME.to_string(),
             config: peer_config_file,
+            profiling: true,
         };
         instance_configs.push(instance);
     }
