@@ -22,7 +22,7 @@
 
 use crate::Hasher;
 use bytes::{Buf, BufMut};
-use commonware_codec::{Error as CodecError, FixedSize, Read, ReadExt, Write};
+use commonware_codec::{DecodeExt, Error as CodecError, FixedSize, Read, ReadExt, Write};
 use commonware_utils::{hex, Array};
 use rand::{CryptoRng, Rng};
 use sha2::{Digest as _, Sha256 as ISha256};
@@ -30,6 +30,10 @@ use std::{
     fmt::{Debug, Display},
     ops::Deref,
 };
+use zeroize::Zeroize;
+
+/// Re-export `sha2::Sha256` as `CoreSha256` for external use if needed.
+pub type CoreSha256 = ISha256;
 
 const DIGEST_LENGTH: usize = 32;
 
@@ -58,6 +62,14 @@ impl Clone for Sha256 {
     }
 }
 
+impl Sha256 {
+    /// Convenience function for testing that creates an easily recognizable digest by repeating a
+    /// single byte.
+    pub fn fill(b: u8) -> <Self as Hasher>::Digest {
+        <Self as Hasher>::Digest::decode(vec![b; DIGEST_LENGTH].as_ref()).unwrap()
+    }
+}
+
 impl Hasher for Sha256 {
     type Digest = Digest;
 
@@ -79,12 +91,6 @@ impl Hasher for Sha256 {
 
     fn reset(&mut self) {
         self.hasher = ISha256::new();
-    }
-
-    fn random<R: Rng + CryptoRng>(rng: &mut R) -> Self::Digest {
-        let mut digest = [0u8; DIGEST_LENGTH];
-        rng.fill_bytes(&mut digest);
-        Self::Digest::from(digest)
     }
 }
 
@@ -145,7 +151,19 @@ impl Display for Digest {
     }
 }
 
-impl crate::Digest for Digest {}
+impl crate::Digest for Digest {
+    fn random<R: Rng + CryptoRng>(rng: &mut R) -> Self {
+        let mut array = [0u8; DIGEST_LENGTH];
+        rng.fill_bytes(&mut array);
+        Self(array)
+    }
+}
+
+impl Zeroize for Digest {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 #[cfg(test)]
 mod tests {

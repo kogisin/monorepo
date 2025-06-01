@@ -1,4 +1,4 @@
-use commonware_utils::hex;
+use commonware_utils::{hex, StableBuf};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -94,7 +94,12 @@ impl Blob {
 }
 
 impl crate::Blob for Blob {
-    async fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<(), crate::Error> {
+    async fn read_at(
+        &self,
+        buf: impl Into<StableBuf> + Send,
+        offset: u64,
+    ) -> Result<StableBuf, crate::Error> {
+        let mut buf = buf.into();
         let offset = offset
             .try_into()
             .map_err(|_| crate::Error::OffsetOverflow)?;
@@ -103,11 +108,16 @@ impl crate::Blob for Blob {
         if offset + buf.len() > content_len {
             return Err(crate::Error::BlobInsufficientLength);
         }
-        buf.copy_from_slice(&content[offset..offset + buf.len()]);
-        Ok(())
+        buf.put_slice(&content[offset..offset + buf.len()]);
+        Ok(buf)
     }
 
-    async fn write_at(&self, buf: &[u8], offset: u64) -> Result<(), crate::Error> {
+    async fn write_at(
+        &self,
+        buf: impl Into<StableBuf> + Send,
+        offset: u64,
+    ) -> Result<(), crate::Error> {
+        let buf = buf.into();
         let offset = offset
             .try_into()
             .map_err(|_| crate::Error::OffsetOverflow)?;
@@ -116,7 +126,7 @@ impl crate::Blob for Blob {
         if required > content.len() {
             content.resize(required, 0);
         }
-        content[offset..offset + buf.len()].copy_from_slice(buf);
+        content[offset..offset + buf.len()].copy_from_slice(buf.as_ref());
         Ok(())
     }
 

@@ -22,8 +22,8 @@
 //!
 //! The "height" of a node is 0 for a leaf, 1 for the parent of 2 leaves, and so on.
 //!
-//! The "root hash" of an MMR is the result of hashing together the size of the MMR and the hashes
-//! of every peak in decreasing order of height.
+//! The "root digest" (or just "root") of an MMR is the result of hashing together the size of the
+//! MMR and the digests of every peak in decreasing order of height.
 //!
 //! # Examples
 //!
@@ -67,15 +67,34 @@
 //! )
 //! ```
 
+use crate::mmr::hasher::Hasher;
+use commonware_cryptography::Hasher as CHasher;
 use commonware_utils::array::prefixed_u64::U64;
+use std::future::Future;
 use thiserror::Error;
 
 pub mod bitmap;
-mod hasher;
+pub mod hasher;
 pub mod iterator;
 pub mod journaled;
 pub mod mem;
+pub mod storage;
+#[cfg(test)]
+mod tests;
 pub mod verification;
+
+/// A trait for building an MMR and computing the root.
+pub trait Builder<H: CHasher>: Send + Sync {
+    /// Add an element to the MMR.
+    fn add(
+        &mut self,
+        hasher: &mut impl Hasher<H>,
+        element: &[u8],
+    ) -> impl Future<Output = Result<u64, Error>>;
+
+    /// Return the root hash of the MMR.
+    fn root(&self, hasher: &mut impl Hasher<H>) -> H::Digest;
+}
 
 /// Errors that can occur when interacting with an MMR.
 #[derive(Error, Debug)]
@@ -90,10 +109,10 @@ pub enum Error {
     MissingNode(u64),
     #[error("MMR is empty")]
     Empty,
-    #[error("missing hashes in proof")]
-    MissingHashes,
-    #[error("extra hashes in proof")]
-    ExtraHashes,
+    #[error("missing digests in proof")]
+    MissingDigests,
+    #[error("extra digests in proof")]
+    ExtraDigests,
     #[error("invalid update")]
     InvalidUpdate,
 }

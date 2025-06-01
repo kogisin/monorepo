@@ -17,6 +17,7 @@
 //! `commonware-runtime` is **ALPHA** software and is not yet recommended for production use. Developers should
 //! expect breaking changes and occasional instability.
 
+use commonware_utils::StableBuf;
 use prometheus_client::registry::Metric;
 use std::io::Error as IoError;
 use std::{
@@ -25,6 +26,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 use thiserror::Error;
+
+#[macro_use]
+mod macros;
 
 pub mod deterministic;
 pub mod mocks;
@@ -39,6 +43,8 @@ mod storage;
 pub mod telemetry;
 mod utils;
 pub use utils::*;
+#[cfg(any(feature = "iouring-storage", feature = "iouring-network"))]
+mod iouring;
 
 /// Prefix for runtime metrics.
 const METRICS_PREFIX: &str = "runtime";
@@ -120,11 +126,7 @@ pub trait Spawner: Clone + Send + Sync + 'static {
 
     /// Enqueue a task to be executed (without consuming the context).
     ///
-    /// Unlike a future, a spawned task will start executing immediately (even if the caller
-    /// does not await the handle).
-    ///
-    /// In some cases, it may be useful to spawn a task without consuming the context (e.g. starting
-    /// an actor that already has a reference to context).
+    /// The semantics are the same as [Spawner::spawn].
     ///
     /// # Warning
     ///
@@ -137,14 +139,39 @@ pub trait Spawner: Clone + Send + Sync + 'static {
 
     /// Enqueue a blocking task to be executed.
     ///
-    /// This method is designed for synchronous, potentially long-running operations that should
-    /// not block the asynchronous event loop. The task starts executing immediately, and the
-    /// returned handle can be awaited to retrieve the result.
+    /// This method is designed for synchronous, potentially long-running operations. Tasks can either
+    /// be executed in a shared thread (tasks that are expected to finish on their own) or a dedicated
+    /// thread (tasks that are expected to run indefinitely).
+    ///
+    /// The task starts executing immediately, and the returned handle can be awaited to retrieve the
+    /// result.
+    ///
+    /// # Motivation
+    ///
+    /// Most runtimes allocate a limited number of threads for executing async tasks, running whatever
+    /// isn't waiting. If blocking tasks are spawned this way, they can dramatically reduce the efficiency
+    /// of said runtimes.
     ///
     /// # Warning
     ///
     /// Blocking tasks cannot be aborted.
-    fn spawn_blocking<F, T>(self, f: F) -> Handle<T>
+    fn spawn_blocking<F, T>(self, dedicated: bool, f: F) -> Handle<T>
+    where
+        F: FnOnce(Self) -> T + Send + 'static,
+        T: Send + 'static;
+
+    /// Enqueue a blocking task to be executed (without consuming the context).
+    ///
+    /// The semantics are the same as [Spawner::spawn_blocking].
+    ///
+    /// # Warning
+    ///
+    /// If this function is used to spawn multiple tasks from the same context,
+    /// the runtime will panic to prevent accidental misuse.
+    fn spawn_blocking_ref<F, T>(
+        &mut self,
+        dedicated: bool,
+    ) -> impl FnOnce(F) -> Handle<T> + 'static
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static;
@@ -272,7 +299,10 @@ pub trait Listener: Sync + Send + 'static {
 /// messages over a network connection.
 pub trait Sink: Sync + Send + 'static {
     /// Send a message to the sink.
-    fn send(&mut self, msg: &[u8]) -> impl Future<Output = Result<(), Error>> + Send;
+    fn send(
+        &mut self,
+        msg: impl Into<StableBuf> + Send,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
 }
 
 /// Interface that any runtime must implement to receive
@@ -280,7 +310,10 @@ pub trait Sink: Sync + Send + 'static {
 pub trait Stream: Sync + Send + 'static {
     /// Receive a message from the stream, storing it in the given buffer.
     /// Reads exactly the number of bytes that fit in the buffer.
-    fn recv(&mut self, buf: &mut [u8]) -> impl Future<Output = Result<(), Error>> + Send;
+    fn recv(
+        &mut self,
+        buf: impl Into<StableBuf> + Send,
+    ) -> impl Future<Output = Result<StableBuf, Error>> + Send;
 }
 
 /// Interface to interact with storage.
@@ -336,12 +369,16 @@ pub trait Blob: Clone + Send + Sync + 'static {
     /// only returns once the entire buffer has been filled.
     fn read_at(
         &self,
-        buf: &mut [u8],
+        buf: impl Into<StableBuf> + Send,
+        offset: u64,
+    ) -> impl Future<Output = Result<StableBuf, Error>> + Send;
+
+    /// Write `buf` to the blob at the given offset.
+    fn write_at(
+        &self,
+        buf: impl Into<StableBuf> + Send,
         offset: u64,
     ) -> impl Future<Output = Result<(), Error>> + Send;
-
-    /// Write to the blob at the given offset.
-    fn write_at(&self, buf: &[u8], offset: u64) -> impl Future<Output = Result<(), Error>> + Send;
 
     /// Truncate the blob to the given length.
     fn truncate(&self, len: u64) -> impl Future<Output = Result<(), Error>> + Send;
@@ -356,6 +393,7 @@ pub trait Blob: Clone + Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use commonware_macros::select;
     use futures::channel::oneshot;
     use futures::{channel::mpsc, future::ready, join, SinkExt, StreamExt};
@@ -549,7 +587,7 @@ mod tests {
 
             // Write data to the blob
             let data = b"Hello, Storage!";
-            blob.write_at(data, 0)
+            blob.write_at(Vec::from(data), 0)
                 .await
                 .expect("Failed to write to blob");
 
@@ -557,11 +595,11 @@ mod tests {
             blob.sync().await.expect("Failed to sync blob");
 
             // Read data from the blob
-            let mut buffer = vec![0u8; data.len()];
-            blob.read_at(&mut buffer, 0)
+            let read = blob
+                .read_at(vec![0; data.len()], 0)
                 .await
                 .expect("Failed to read from blob");
-            assert_eq!(&buffer, data);
+            assert_eq!(read.as_ref(), data);
 
             // Close the blob
             blob.close().await.expect("Failed to close blob");
@@ -581,11 +619,11 @@ mod tests {
             assert_eq!(len, data.len() as u64);
 
             // Read data part of message back
-            let mut buffer = vec![0u8; 7];
-            blob.read_at(&mut buffer, 7)
+            let read = blob
+                .read_at(vec![0u8; 7], 7)
                 .await
                 .expect("Failed to read data");
-            assert_eq!(&buffer, b"Storage");
+            assert_eq!(read.as_ref(), b"Storage");
 
             // Close the blob
             blob.close().await.expect("Failed to close blob");
@@ -632,38 +670,37 @@ mod tests {
             // Write data at different offsets
             let data1 = b"Hello";
             let data2 = b"World";
-            blob.write_at(data1, 0)
+            blob.write_at(Vec::from(data1), 0)
                 .await
                 .expect("Failed to write data1");
-            blob.write_at(data2, 5)
+            blob.write_at(Vec::from(data2), 5)
                 .await
                 .expect("Failed to write data2");
 
             // Read data back
-            let mut buffer = vec![0u8; 10];
-            blob.read_at(&mut buffer, 0)
+            let read = blob
+                .read_at(vec![0u8; 10], 0)
                 .await
                 .expect("Failed to read data");
-            assert_eq!(&buffer[..5], data1);
-            assert_eq!(&buffer[5..], data2);
+            assert_eq!(&read.as_ref()[..5], data1);
+            assert_eq!(&read.as_ref()[5..], data2);
 
             // Rewrite data without affecting length
             let data3 = b"Store";
-            blob.write_at(data3, 5)
+            blob.write_at(Vec::from(data3), 5)
                 .await
                 .expect("Failed to write data3");
 
             // Truncate the blob
             blob.truncate(5).await.expect("Failed to truncate blob");
-            let mut buffer = vec![0u8; 5];
-            blob.read_at(&mut buffer, 0)
+            let read = blob
+                .read_at(vec![0; 5], 0)
                 .await
                 .expect("Failed to read data");
-            assert_eq!(&buffer[..5], data1);
+            assert_eq!(&read.as_ref()[..5], data1);
 
             // Full read after truncation
-            let mut buffer = vec![0u8; 10];
-            let result = blob.read_at(&mut buffer, 0).await;
+            let result = blob.read_at(vec![0u8; 10], 0).await;
             assert!(result.is_err());
 
             // Close the blob
@@ -689,10 +726,10 @@ mod tests {
                     .expect("Failed to open blob");
 
                 // Write data at different offsets
-                blob.write_at(data1, 0)
+                blob.write_at(Vec::from(data1), 0)
                     .await
                     .expect("Failed to write data1");
-                blob.write_at(data2, 5 + additional as u64)
+                blob.write_at(Vec::from(data2), 5 + additional as u64)
                     .await
                     .expect("Failed to write data2");
 
@@ -709,12 +746,12 @@ mod tests {
                 assert_eq!(len, (data1.len() + data2.len() + additional) as u64);
 
                 // Read data back
-                let mut buffer = vec![0u8; 10 + additional];
-                blob.read_at(&mut buffer, 0)
+                let read = blob
+                    .read_at(vec![0u8; 10 + additional], 0)
                     .await
                     .expect("Failed to read data");
-                assert_eq!(&buffer[..5], b"Hello");
-                assert_eq!(&buffer[5 + additional..], b"World");
+                assert_eq!(&read.as_ref()[..5], b"Hello");
+                assert_eq!(&read.as_ref()[5 + additional..], b"World");
 
                 // Close the blob
                 blob.close().await.expect("Failed to close blob");
@@ -737,19 +774,17 @@ mod tests {
                 .expect("Failed to open blob");
 
             // Read data past file length (empty file)
-            let mut buffer = vec![0u8; 10];
-            let result = blob.read_at(&mut buffer, 0).await;
+            let result = blob.read_at(vec![0u8; 10], 0).await;
             assert!(result.is_err());
 
             // Write data to the blob
-            let data = b"Hello, Storage!";
+            let data = b"Hello, Storage!".to_vec();
             blob.write_at(data, 0)
                 .await
                 .expect("Failed to write to blob");
 
             // Read data past file length (non-empty file)
-            let mut buffer = vec![0u8; 20];
-            let result = blob.read_at(&mut buffer, 0).await;
+            let result = blob.read_at(vec![0u8; 20], 0).await;
             assert!(result.is_err());
         })
     }
@@ -770,7 +805,7 @@ mod tests {
 
             // Write data to the blob
             let data = b"Hello, Storage!";
-            blob.write_at(data, 0)
+            blob.write_at(Vec::from(data), 0)
                 .await
                 .expect("Failed to write to blob");
 
@@ -781,21 +816,21 @@ mod tests {
             let check1 = context.with_label("check1").spawn({
                 let blob = blob.clone();
                 move |_| async move {
-                    let mut buffer = vec![0u8; data.len()];
-                    blob.read_at(&mut buffer, 0)
+                    let read = blob
+                        .read_at(vec![0u8; data.len()], 0)
                         .await
                         .expect("Failed to read from blob");
-                    assert_eq!(&buffer, data);
+                    assert_eq!(read.as_ref(), data);
                 }
             });
             let check2 = context.with_label("check2").spawn({
                 let blob = blob.clone();
                 move |_| async move {
-                    let mut buffer = vec![0u8; data.len()];
-                    blob.read_at(&mut buffer, 0)
+                    let read = blob
+                        .read_at(vec![0; data.len()], 0)
                         .await
                         .expect("Failed to read from blob");
-                    assert_eq!(&buffer, data);
+                    assert_eq!(read.as_ref(), data);
                 }
             });
 
@@ -805,11 +840,11 @@ mod tests {
             assert!(result.1.is_ok());
 
             // Read data from the blob
-            let mut buffer = vec![0u8; data.len()];
-            blob.read_at(&mut buffer, 0)
+            let read = blob
+                .read_at(vec![0; data.len()], 0)
                 .await
                 .expect("Failed to read from blob");
-            assert_eq!(&buffer, data);
+            assert_eq!(read.as_ref(), data);
 
             // Close the blob
             blob.close().await.expect("Failed to close blob");
@@ -908,25 +943,51 @@ mod tests {
         });
     }
 
-    fn test_spawn_blocking<R: Runner>(runner: R)
+    fn test_spawn_blocking<R: Runner>(runner: R, dedicated: bool)
     where
         R::Context: Spawner,
     {
         runner.start(|context| async move {
-            let handle = context.spawn_blocking(|| 42);
+            let handle = context.spawn_blocking(dedicated, |_| 42);
             let result = handle.await;
             assert!(matches!(result, Ok(42)));
         });
     }
 
-    fn test_spawn_blocking_abort<R: Runner>(runner: R)
+    fn test_spawn_blocking_ref<R: Runner>(runner: R, dedicated: bool)
+    where
+        R::Context: Spawner,
+    {
+        runner.start(|mut context| async move {
+            let spawn = context.spawn_blocking_ref(dedicated);
+            let handle = spawn(|| 42);
+            let result = handle.await;
+            assert!(matches!(result, Ok(42)));
+        });
+    }
+
+    fn test_spawn_blocking_ref_duplicate<R: Runner>(runner: R, dedicated: bool)
+    where
+        R::Context: Spawner,
+    {
+        runner.start(|mut context| async move {
+            let spawn = context.spawn_blocking_ref(dedicated);
+            let result = spawn(|| 42).await;
+            assert!(matches!(result, Ok(42)));
+
+            // Ensure context is consumed
+            context.spawn_blocking(dedicated, |_| 42);
+        });
+    }
+
+    fn test_spawn_blocking_abort<R: Runner>(runner: R, dedicated: bool)
     where
         R::Context: Spawner,
     {
         runner.start(|context| async move {
             // Create task
             let (sender, mut receiver) = oneshot::channel();
-            let handle = context.spawn_blocking(move || {
+            let handle = context.spawn_blocking(dedicated, move |_| {
                 // Wait for abort to be called
                 loop {
                     if receiver.try_recv().is_ok() {
@@ -1115,26 +1176,49 @@ mod tests {
 
     #[test]
     fn test_deterministic_spawn_blocking() {
-        let executor = deterministic::Runner::default();
-        test_spawn_blocking(executor);
+        for dedicated in [false, true] {
+            let executor = deterministic::Runner::default();
+            test_spawn_blocking(executor, dedicated);
+        }
     }
 
     #[test]
     #[should_panic(expected = "blocking task panicked")]
     fn test_deterministic_spawn_blocking_panic() {
-        let executor = deterministic::Runner::default();
-        executor.start(|context| async move {
-            let handle = context.spawn_blocking(|| {
-                panic!("blocking task panicked");
+        for dedicated in [false, true] {
+            let executor = deterministic::Runner::default();
+            executor.start(|context| async move {
+                let handle = context.spawn_blocking(dedicated, |_| {
+                    panic!("blocking task panicked");
+                });
+                handle.await.unwrap();
             });
-            handle.await.unwrap();
-        });
+        }
     }
 
     #[test]
     fn test_deterministic_spawn_blocking_abort() {
-        let executor = deterministic::Runner::default();
-        test_spawn_blocking_abort(executor);
+        for dedicated in [false, true] {
+            let executor = deterministic::Runner::default();
+            test_spawn_blocking_abort(executor, dedicated);
+        }
+    }
+
+    #[test]
+    fn test_deterministic_spawn_blocking_ref() {
+        for dedicated in [false, true] {
+            let executor = deterministic::Runner::default();
+            test_spawn_blocking_ref(executor, dedicated);
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_deterministic_spawn_blocking_ref_duplicate() {
+        for dedicated in [false, true] {
+            let executor = deterministic::Runner::default();
+            test_spawn_blocking_ref_duplicate(executor, dedicated);
+        }
     }
 
     #[test]
@@ -1263,26 +1347,49 @@ mod tests {
 
     #[test]
     fn test_tokio_spawn_blocking() {
-        let executor = tokio::Runner::default();
-        test_spawn_blocking(executor);
+        for dedicated in [false, true] {
+            let executor = tokio::Runner::default();
+            test_spawn_blocking(executor, dedicated);
+        }
     }
 
     #[test]
     fn test_tokio_spawn_blocking_panic() {
-        let executor = tokio::Runner::default();
-        executor.start(|context| async move {
-            let handle = context.spawn_blocking(|| {
-                panic!("blocking task panicked");
+        for dedicated in [false, true] {
+            let executor = tokio::Runner::default();
+            executor.start(|context| async move {
+                let handle = context.spawn_blocking(dedicated, |_| {
+                    panic!("blocking task panicked");
+                });
+                let result = handle.await;
+                assert!(matches!(result, Err(Error::Exited)));
             });
-            let result = handle.await;
-            assert!(matches!(result, Err(Error::Exited)));
-        });
+        }
     }
 
     #[test]
     fn test_tokio_spawn_blocking_abort() {
-        let executor = tokio::Runner::default();
-        test_spawn_blocking_abort(executor);
+        for dedicated in [false, true] {
+            let executor = tokio::Runner::default();
+            test_spawn_blocking_abort(executor, dedicated);
+        }
+    }
+
+    #[test]
+    fn test_tokio_spawn_blocking_ref() {
+        for dedicated in [false, true] {
+            let executor = tokio::Runner::default();
+            test_spawn_blocking_ref(executor, dedicated);
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_tokio_spawn_blocking_ref_duplicate() {
+        for dedicated in [false, true] {
+            let executor = tokio::Runner::default();
+            test_spawn_blocking_ref_duplicate(executor, dedicated);
+        }
     }
 
     #[test]
@@ -1325,8 +1432,7 @@ mod tests {
             async fn read_line<St: Stream>(stream: &mut St) -> Result<String, Error> {
                 let mut line = Vec::new();
                 loop {
-                    let mut byte = [0; 1];
-                    stream.recv(&mut byte).await?;
+                    let byte = stream.recv(vec![0; 1]).await?;
                     if byte[0] == b'\n' {
                         if line.last() == Some(&b'\r') {
                             line.pop(); // Remove trailing \r
@@ -1359,9 +1465,8 @@ mod tests {
                 stream: &mut St,
                 content_length: usize,
             ) -> Result<String, Error> {
-                let mut body = vec![0; content_length];
-                stream.recv(&mut body).await?;
-                String::from_utf8(body).map_err(|_| Error::ReadFailed)
+                let read = stream.recv(vec![0; content_length]).await?;
+                String::from_utf8(read.as_ref().to_vec()).map_err(|_| Error::ReadFailed)
             }
 
             // Simulate a client connecting to the server
@@ -1384,7 +1489,7 @@ mod tests {
                         "GET /metrics HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
                         address
                     );
-                    sink.send(request.as_bytes()).await.unwrap();
+                    sink.send(Bytes::from(request).to_vec()).await.unwrap();
 
                     // Read and verify the HTTP status line
                     let status_line = read_line(&mut stream).await.unwrap();

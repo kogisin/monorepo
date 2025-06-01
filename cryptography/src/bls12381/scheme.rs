@@ -20,18 +20,19 @@
 //! ```
 
 use super::primitives::{
-    group::{self, Element, Scalar},
+    group::{self, Scalar},
     ops,
     variant::{MinPk, Variant},
 };
-use crate::{Array, Signer, Specification, Verifier};
+use crate::{Array, BatchScheme, Signer, Specification, Verifier};
 use bytes::{Buf, BufMut};
 use commonware_codec::{
     DecodeExt, EncodeFixed, Error as CodecError, FixedSize, Read, ReadExt, Write,
 };
-use commonware_utils::hex;
+use commonware_utils::{hex, union_unique};
 use rand::{CryptoRng, Rng};
 use std::{
+    borrow::Cow,
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
     ops::Deref,
@@ -77,13 +78,6 @@ impl Signer for Bls12381 {
         Self { private, public }
     }
 
-    fn from(private_key: PrivateKey) -> Option<Self> {
-        let private = private_key.key.clone();
-        let mut public = <MinPk as Variant>::Public::one();
-        public.mul(&private);
-        Some(Self { private, public })
-    }
-
     fn private_key(&self) -> PrivateKey {
         PrivateKey::from(self.private.clone())
     }
@@ -95,6 +89,14 @@ impl Signer for Bls12381 {
     fn sign(&mut self, namespace: Option<&[u8]>, message: &[u8]) -> Signature {
         let signature = ops::sign_message::<MinPk>(&self.private, namespace, message);
         Signature::from(signature)
+    }
+}
+
+impl From<PrivateKey> for Bls12381 {
+    fn from(private_key: PrivateKey) -> Self {
+        let private = private_key.key.clone();
+        let public = ops::compute_public::<MinPk>(&private);
+        Self { private, public }
     }
 }
 
@@ -350,6 +352,50 @@ impl Display for Signature {
     }
 }
 
+/// BLS12-381 batch verifier.
+pub struct Bls12381Batch {
+    publics: Vec<<MinPk as Variant>::Public>,
+    hms: Vec<<MinPk as Variant>::Signature>,
+    signatures: Vec<<MinPk as Variant>::Signature>,
+}
+
+impl Specification for Bls12381Batch {
+    type PublicKey = PublicKey;
+    type Signature = Signature;
+}
+
+impl BatchScheme for Bls12381Batch {
+    fn new() -> Self {
+        Self {
+            publics: Vec::new(),
+            hms: Vec::new(),
+            signatures: Vec::new(),
+        }
+    }
+
+    fn add(
+        &mut self,
+        namespace: Option<&[u8]>,
+        message: &[u8],
+        public_key: &Self::PublicKey,
+        signature: &Self::Signature,
+    ) -> bool {
+        self.publics.push(public_key.key);
+        let payload = match namespace {
+            Some(namespace) => Cow::Owned(union_unique(namespace, message)),
+            None => Cow::Borrowed(message),
+        };
+        let hm = ops::hash_message::<MinPk>(MinPk::MESSAGE, &payload);
+        self.hms.push(hm);
+        self.signatures.push(signature.signature);
+        true
+    }
+
+    fn verify<R: rand::RngCore + CryptoRng>(self, rng: &mut R) -> bool {
+        MinPk::batch_verify(rng, &self.publics, &self.hms, &self.signatures).is_ok()
+    }
+}
+
 /// Test vectors sourced from https://github.com/ethereum/bls12-381-tests/releases/tag/v0.1.2.
 #[cfg(test)]
 mod tests {
@@ -404,8 +450,7 @@ mod tests {
         ];
         for (index, test) in cases.into_iter().enumerate() {
             let (private_key, message, expected) = test;
-            let mut signer =
-                <Bls12381 as Signer>::from(private_key).expect("unable to deserialize private key");
+            let mut signer = Bls12381::from(private_key);
             let signature = signer.sign(None, &message);
             assert_eq!(signature, expected, "vector_sign_{}", index + 1);
         }
@@ -452,6 +497,7 @@ mod tests {
             vector_verify_29(),
         ];
 
+        let mut batch = Bls12381Batch::new();
         for (index, test) in cases.into_iter().enumerate() {
             let (public_key, message, signature, expected) = test;
             let expected = if !expected {
@@ -459,10 +505,14 @@ mod tests {
                     || signature.is_err()
                     || !Bls12381::verify(None, &message, &public_key.unwrap(), &signature.unwrap())
             } else {
-                Bls12381::verify(None, &message, &public_key.unwrap(), &signature.unwrap())
+                let public_key = public_key.unwrap();
+                let signature = signature.unwrap();
+                batch.add(None, &message, &public_key, &signature);
+                Bls12381::verify(None, &message, &public_key, &signature)
             };
             assert!(expected, "vector_verify_{}", index + 1);
         }
+        assert!(batch.verify(&mut rand::thread_rng()));
     }
 
     /// Parse `sign` vector from hex encoded data.
