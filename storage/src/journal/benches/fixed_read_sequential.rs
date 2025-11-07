@@ -3,16 +3,19 @@ use commonware_runtime::{
     benchmarks::{context, tokio},
     tokio::Context,
 };
-use commonware_storage::journal::fixed::Journal;
-use commonware_utils::array::FixedBytes;
+use commonware_storage::journal::contiguous::fixed::Journal;
+use commonware_utils::{sequence::FixedBytes, NZU64};
 use criterion::{black_box, criterion_group, Criterion};
-use std::time::{Duration, Instant};
+use std::{
+    num::NonZeroU64,
+    time::{Duration, Instant},
+};
 
 /// Partition name to use in the journal config.
 const PARTITION: &str = "test_partition";
 
 /// Value of items_per_blob to use in the journal config.
-const ITEMS_PER_BLOB: u64 = 100_000;
+const ITEMS_PER_BLOB: NonZeroU64 = NZU64!(100_000);
 
 /// Size of each journal item in bytes.
 const ITEM_SIZE: usize = 32;
@@ -37,7 +40,7 @@ fn bench_fixed_read_sequential(c: &mut Criterion) {
                     let ctx = context::get::<commonware_runtime::tokio::Context>();
                     let mut j = get_journal::<ITEM_SIZE>(ctx, PARTITION, ITEMS_PER_BLOB).await;
                     append_random_data::<ITEM_SIZE>(&mut j, items).await;
-                    let sz = j.size().await.unwrap();
+                    let sz = j.size();
                     assert_eq!(sz, items);
 
                     // Run the benchmark

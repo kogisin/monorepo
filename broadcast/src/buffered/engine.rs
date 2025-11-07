@@ -1,22 +1,22 @@
 use super::{metrics, Config, Mailbox, Message};
 use crate::buffered::metrics::SequencerLabel;
 use commonware_codec::Codec;
-use commonware_cryptography::{Committable, Digestible};
+use commonware_cryptography::{Committable, Digestible, PublicKey};
 use commonware_macros::select;
 use commonware_p2p::{
     utils::codec::{wrap, WrappedSender},
     Receiver, Recipients, Sender,
 };
 use commonware_runtime::{
+    spawn_cell,
     telemetry::metrics::status::{CounterExt, Status},
-    Clock, Handle, Metrics, Spawner,
+    Clock, ContextCell, Handle, Metrics, Spawner,
 };
-use commonware_utils::Array;
 use futures::{
     channel::{mpsc, oneshot},
     StreamExt,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use tracing::{debug, error, trace, warn};
 
 /// A responder waiting for a message.
@@ -48,11 +48,11 @@ struct Pair<Dc, Dd> {
 /// - Receiving messages from the network
 /// - Storing messages in the cache
 /// - Responding to requests from the application
-pub struct Engine<E: Clock + Spawner + Metrics, P: Array, M: Committable + Digestible + Codec> {
+pub struct Engine<E: Clock + Spawner + Metrics, P: PublicKey, M: Committable + Digestible + Codec> {
     ////////////////////////////////////////
     // Interfaces
     ////////////////////////////////////////
-    context: E,
+    context: ContextCell<E>,
 
     ////////////////////////////////////////
     // Configuration
@@ -77,7 +77,7 @@ pub struct Engine<E: Clock + Spawner + Metrics, P: Array, M: Committable + Diges
 
     /// Pending requests from the application.
     #[allow(clippy::type_complexity)]
-    waiters: HashMap<M::Commitment, Vec<Waiter<P, M::Digest, M>>>,
+    waiters: BTreeMap<M::Commitment, Vec<Waiter<P, M::Digest, M>>>,
 
     ////////////////////////////////////////
     // Cache
@@ -86,7 +86,7 @@ pub struct Engine<E: Clock + Spawner + Metrics, P: Array, M: Committable + Diges
     ///
     /// We store messages outside of the deques to minimize memory usage
     /// when receiving duplicate messages.
-    items: HashMap<M::Commitment, HashMap<M::Digest, M>>,
+    items: BTreeMap<M::Commitment, BTreeMap<M::Digest, M>>,
 
     /// A LRU cache of the latest received identities and digests from each peer.
     ///
@@ -94,13 +94,13 @@ pub struct Engine<E: Clock + Spawner + Metrics, P: Array, M: Committable + Diges
     /// At most `deque_size` digests are stored per peer. This value is expected to be small, so
     /// membership checks are done in linear time.
     #[allow(clippy::type_complexity)]
-    deques: HashMap<P, VecDeque<Pair<M::Commitment, M::Digest>>>,
+    deques: BTreeMap<P, VecDeque<Pair<M::Commitment, M::Digest>>>,
 
     /// The number of times each digest (globally unique) exists in one of the deques.
     ///
     /// Multiple peers can send the same message and we only want to store
     /// the message once.
-    counts: HashMap<M::Digest, usize>,
+    counts: BTreeMap<M::Digest, usize>,
 
     ////////////////////////////////////////
     // Metrics
@@ -109,25 +109,29 @@ pub struct Engine<E: Clock + Spawner + Metrics, P: Array, M: Committable + Diges
     metrics: metrics::Metrics,
 }
 
-impl<E: Clock + Spawner + Metrics, P: Array, M: Committable + Digestible + Codec> Engine<E, P, M> {
+impl<E: Clock + Spawner + Metrics, P: PublicKey, M: Committable + Digestible + Codec>
+    Engine<E, P, M>
+{
     /// Creates a new engine with the given context and configuration.
     /// Returns the engine and a mailbox for sending messages to the engine.
     pub fn new(context: E, cfg: Config<P, M::Cfg>) -> (Self, Mailbox<P, M>) {
         let (mailbox_sender, mailbox_receiver) = mpsc::channel(cfg.mailbox_size);
         let mailbox = Mailbox::<P, M>::new(mailbox_sender);
+
+        // TODO(#1833): Metrics should use the post-start context
         let metrics = metrics::Metrics::init(context.clone());
 
         let result = Self {
-            context,
+            context: ContextCell::new(context),
             public_key: cfg.public_key,
             priority: cfg.priority,
             deque_size: cfg.deque_size,
             codec_config: cfg.codec_config,
             mailbox_receiver,
-            waiters: HashMap::new(),
-            deques: HashMap::new(),
-            items: HashMap::new(),
-            counts: HashMap::new(),
+            waiters: BTreeMap::new(),
+            deques: BTreeMap::new(),
+            items: BTreeMap::new(),
+            counts: BTreeMap::new(),
             metrics,
         };
 
@@ -139,7 +143,7 @@ impl<E: Clock + Spawner + Metrics, P: Array, M: Committable + Digestible + Codec
         mut self,
         network: (impl Sender<PublicKey = P>, impl Receiver<PublicKey = P>),
     ) -> Handle<()> {
-        self.context.spawn_ref()(self.run(network))
+        spawn_cell!(self.context, self.run(network).await)
     }
 
     /// Inner run loop called by `start`.
@@ -156,6 +160,7 @@ impl<E: Clock + Spawner + Metrics, P: Array, M: Committable + Digestible + Codec
                 // Handle shutdown signal
                 _ = &mut shutdown => {
                     debug!("shutdown");
+                    break;
                 },
 
                 // Handle mailbox messages

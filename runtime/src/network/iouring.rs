@@ -1,3 +1,27 @@
+//! This module provides an io_uring-based implementation of the [crate::Network] trait,
+//! offering fast, high-throughput network operations on Linux systems.
+//!
+//! ## Architecture
+//!
+//! Network operations are sent via a [futures::channel::mpsc] channel to a dedicated io_uring event
+//! loop running in a separate thread. Operation results are returned via a [futures::channel::oneshot]
+//! channel. This implementation uses two separate io_uring instances: one for send operations and
+//! one for receive operations.
+//!
+//! ## Memory Safety
+//!
+//! We pass to the kernel, via io_uring, a pointer to the buffer being read from/written into.
+//! Therefore, we ensure that the memory location is valid for the duration of the operation.
+//! That is, it doesn't move or go out of scope until the operation completes.
+//!
+//! ## Feature Flag
+//!
+//! This implementation is enabled by using the `iouring-network` feature.
+//!
+//! ## Linux Only
+//!
+//! This implementation is only available on Linux systems that support io_uring.
+
 use crate::iouring::{self, should_retry};
 use commonware_utils::StableBuf;
 use futures::{
@@ -13,10 +37,23 @@ use std::{
     sync::Arc,
 };
 use tokio::net::{TcpListener, TcpStream};
+use tracing::warn;
+
+#[derive(Clone, Debug, Default)]
+pub struct Config {
+    /// If Some, explicitly sets TCP_NODELAY on the socket.
+    /// Otherwise uses system default.
+    pub tcp_nodelay: Option<bool>,
+    /// Configuration for the iouring instance.
+    pub iouring_config: iouring::Config,
+}
 
 #[derive(Clone, Debug)]
 /// [crate::Network] implementation that uses io_uring to do async I/O.
 pub struct Network {
+    /// If Some, explicitly sets TCP_NODELAY on the socket.
+    /// Otherwise uses system default.
+    tcp_nodelay: Option<bool>,
     /// Used to submit send operations to the send io_uring event loop.
     send_submitter: mpsc::Sender<iouring::Op>,
     /// Used to submit recv operations to the recv io_uring event loop.
@@ -32,26 +69,31 @@ impl Network {
     /// large enough, given the number of connections that will be maintained.
     /// Each ongoing send/recv to/from each connection will consume a slot in the io_uring.
     /// The io_uring `size` should be a multiple of the number of expected connections.
-    pub(crate) fn start(
-        cfg: iouring::Config,
-        registry: &mut Registry,
-    ) -> Result<Self, crate::Error> {
+    pub(crate) fn start(mut cfg: Config, registry: &mut Registry) -> Result<Self, crate::Error> {
         // Create an io_uring instance to handle send operations.
-        let (send_submitter, rx) = mpsc::channel(cfg.size as usize);
+        let (send_submitter, rx) = mpsc::channel(cfg.iouring_config.size as usize);
+
+        // Optimize performance by hinting the kernel that a single task will
+        // submit requests. This is safe because each iouring instance runs in a
+        // dedicated thread, which guarantees that the same thread that creates
+        // the ring is the only thread submitting work to it.
+        cfg.iouring_config.single_issuer = true;
+
         std::thread::spawn({
             let cfg = cfg.clone();
             let registry = registry.sub_registry_with_prefix("iouring_sender");
             let metrics = Arc::new(iouring::Metrics::new(registry));
-            move || block_on(iouring::run(cfg, metrics, rx))
+            move || block_on(iouring::run(cfg.iouring_config, metrics, rx))
         });
 
         // Create an io_uring instance to handle receive operations.
-        let (recv_submitter, rx) = mpsc::channel(cfg.size as usize);
+        let (recv_submitter, rx) = mpsc::channel(cfg.iouring_config.size as usize);
         let registry = registry.sub_registry_with_prefix("iouring_receiver");
         let metrics = Arc::new(iouring::Metrics::new(registry));
-        std::thread::spawn(|| block_on(iouring::run(cfg, metrics, rx)));
+        std::thread::spawn(|| block_on(iouring::run(cfg.iouring_config, metrics, rx)));
 
         Ok(Self {
+            tcp_nodelay: cfg.tcp_nodelay,
             send_submitter,
             recv_submitter,
         })
@@ -66,6 +108,7 @@ impl crate::Network for Network {
             .await
             .map_err(|_| crate::Error::BindFailed)?;
         Ok(Listener {
+            tcp_nodelay: self.tcp_nodelay,
             inner: listener,
             send_submitter: self.send_submitter.clone(),
             recv_submitter: self.recv_submitter.clone(),
@@ -81,6 +124,13 @@ impl crate::Network for Network {
             .map_err(|_| crate::Error::ConnectionFailed)?
             .into_std()
             .map_err(|_| crate::Error::ConnectionFailed)?;
+
+        // Set TCP_NODELAY if configured
+        if let Some(tcp_nodelay) = self.tcp_nodelay {
+            if let Err(err) = stream.set_nodelay(tcp_nodelay) {
+                warn!(?err, "failed to set TCP_NODELAY");
+            }
+        }
 
         // Explicitly set non-blocking mode to true
         stream
@@ -103,6 +153,9 @@ impl crate::Network for Network {
 
 /// Implementation of [crate::Listener] for an io-uring [Network].
 pub struct Listener {
+    /// If Some, explicitly sets TCP_NODELAY on the socket.
+    /// Otherwise uses system default.
+    tcp_nodelay: Option<bool>,
     inner: TcpListener,
     /// Used to submit send operations to the send io_uring event loop.
     send_submitter: mpsc::Sender<iouring::Op>,
@@ -124,6 +177,13 @@ impl crate::Listener for Listener {
         let stream = stream
             .into_std()
             .map_err(|_| crate::Error::ConnectionFailed)?;
+
+        // Set TCP_NODELAY if configured
+        if let Some(tcp_nodelay) = self.tcp_nodelay {
+            if let Err(err) = stream.set_nodelay(tcp_nodelay) {
+                warn!(?err, "failed to set TCP_NODELAY");
+            }
+        }
 
         // Explicitly set non-blocking mode to true
         stream
@@ -282,8 +342,11 @@ impl crate::Stream for Stream {
 #[cfg(test)]
 mod tests {
     use crate::{
-        iouring::Config,
-        network::{iouring::Network, tests},
+        iouring,
+        network::{
+            iouring::{Config, Network},
+            tests,
+        },
     };
     use prometheus_client::registry::Registry;
     use std::time::Duration;
@@ -291,8 +354,17 @@ mod tests {
     #[tokio::test]
     async fn test_trait() {
         tests::test_network_trait(|| {
-            Network::start(Config::default(), &mut Registry::default())
-                .expect("Failed to start io_uring")
+            Network::start(
+                Config {
+                    iouring_config: iouring::Config {
+                        force_poll: Duration::from_millis(100),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                &mut Registry::default(),
+            )
+            .expect("Failed to start io_uring")
         })
         .await;
     }
@@ -303,8 +375,11 @@ mod tests {
         tests::stress_test_network_trait(|| {
             Network::start(
                 Config {
-                    size: 256,
-                    force_poll: Some(Duration::from_millis(100)),
+                    iouring_config: iouring::Config {
+                        size: 256,
+                        force_poll: Duration::from_millis(100),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
                 &mut Registry::default(),

@@ -5,10 +5,13 @@ use crate::ec2::{
     CREATED_FILE_NAME, LOGS_PORT, MONITORING_NAME, MONITORING_REGION, PROFILES_PORT, TRACES_PORT,
 };
 use futures::future::try_join_all;
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::fs::File;
-use std::net::IpAddr;
-use std::path::PathBuf;
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    fs::File,
+    net::IpAddr,
+    path::PathBuf,
+    slice,
+};
 use tokio::process::Command;
 use tracing::info;
 
@@ -62,9 +65,9 @@ pub async fn create(config: &PathBuf) -> Result<(), Error> {
     info!(ip = deployer_ip.as_str(), "recovered public IP");
 
     // Generate SSH key pair
-    let key_name = format!("deployer-{}", tag);
-    let private_key_path = tag_directory.join(format!("id_rsa_{}", tag));
-    let public_key_path = tag_directory.join(format!("id_rsa_{}.pub", tag));
+    let key_name = format!("deployer-{tag}");
+    let private_key_path = tag_directory.join(format!("id_rsa_{tag}"));
+    let public_key_path = tag_directory.join(format!("id_rsa_{tag}.pub"));
     let output = Command::new("ssh-keygen")
         .arg("-t")
         .arg("rsa")
@@ -125,7 +128,7 @@ pub async fn create(config: &PathBuf) -> Result<(), Error> {
         );
 
         // Create VPC, IGW, route table, subnet, security groups, and key pair
-        let vpc_cidr = format!("10.{}.0.0/16", idx);
+        let vpc_cidr = format!("10.{idx}.0.0/16");
         vpc_cidrs.insert(region.clone(), vpc_cidr.clone());
         let vpc_id = create_vpc(&ec2_clients[region], &vpc_cidr, tag).await?;
         info!(
@@ -148,7 +151,7 @@ pub async fn create(config: &PathBuf) -> Result<(), Error> {
             region = region.as_str(),
             "created route table"
         );
-        let subnet_cidr = format!("10.{}.1.0/24", idx);
+        let subnet_cidr = format!("10.{idx}.1.0/24");
         subnet_cidrs.insert(region.clone(), subnet_cidr.clone());
         let subnet_id = create_subnet(
             &ec2_clients[region],
@@ -310,10 +313,12 @@ pub async fn create(config: &PathBuf) -> Result<(), Error> {
         )
         .await?[0]
             .clone();
-        monitoring_ip =
-            wait_for_instances_running(monitoring_ec2_client, &[monitoring_instance_id.clone()])
-                .await?[0]
-                .clone();
+        monitoring_ip = wait_for_instances_running(
+            monitoring_ec2_client,
+            slice::from_ref(&monitoring_instance_id),
+        )
+        .await?[0]
+            .clone();
         monitoring_private_ip =
             get_private_ip(monitoring_ec2_client, &monitoring_instance_id).await?;
     }
@@ -372,8 +377,9 @@ pub async fn create(config: &PathBuf) -> Result<(), Error> {
             )
             .await?[0]
                 .clone();
-            let ip =
-                wait_for_instances_running(ec2_client, &[instance_id.clone()]).await?[0].clone();
+            let ip = wait_for_instances_running(ec2_client, slice::from_ref(&instance_id)).await?
+                [0]
+            .clone();
             info!(
                 ip = ip.as_str(),
                 instance = instance.name.as_str(),
@@ -409,10 +415,6 @@ pub async fn create(config: &PathBuf) -> Result<(), Error> {
     std::fs::write(&pyroscope_agent_timer_path, PYROSCOPE_AGENT_TIMER)?;
     let binary_service_path = tag_directory.join("binary.service");
     std::fs::write(&binary_service_path, BINARY_SERVICE)?;
-    let memleak_agent_service_path = tag_directory.join("memleak-agent.service");
-    std::fs::write(&memleak_agent_service_path, MEMLEAK_AGENT_SERVICE)?;
-    let memleak_agent_script_path = tag_directory.join("memleak-agent.sh");
-    std::fs::write(&memleak_agent_script_path, MEMLEAK_AGENT_SCRIPT)?;
 
     // Write logrotate configuration file
     let logrotate_conf_path = tag_directory.join("logrotate.conf");
@@ -581,7 +583,11 @@ pub async fn create(config: &PathBuf) -> Result<(), Error> {
     for deployment in &deployments {
         let tag_directory = tag_directory.clone();
         let instance = deployment.instance.clone();
-        wait_for_instances_ready(&ec2_clients[&instance.region], &[deployment.id.clone()]).await?;
+        wait_for_instances_ready(
+            &ec2_clients[&instance.region],
+            slice::from_ref(&deployment.id),
+        )
+        .await?;
         let ip = deployment.ip.clone();
         let monitoring_private_ip = monitoring_private_ip.clone();
         let hosts_path = hosts_path.clone();
@@ -592,8 +598,6 @@ pub async fn create(config: &PathBuf) -> Result<(), Error> {
         let binary_service_path = binary_service_path.clone();
         let pyroscope_agent_service_path = pyroscope_agent_service_path.clone();
         let pyroscope_agent_timer_path = pyroscope_agent_timer_path.clone();
-        let memleak_agent_service_path = memleak_agent_service_path.clone();
-        let memleak_agent_script_path = memleak_agent_script_path.clone();
         let future = async move {
             rsync_file(private_key, &instance.binary, &ip, "/home/ubuntu/binary").await?;
             rsync_file(
@@ -686,20 +690,6 @@ pub async fn create(config: &PathBuf) -> Result<(), Error> {
                 pyroscope_agent_timer_path.to_str().unwrap(),
                 &ip,
                 "/home/ubuntu/pyroscope-agent.timer",
-            )
-            .await?;
-            rsync_file(
-                private_key,
-                memleak_agent_service_path.to_str().unwrap(),
-                &ip,
-                "/home/ubuntu/memleak-agent.service",
-            )
-            .await?;
-            rsync_file(
-                private_key,
-                memleak_agent_script_path.to_str().unwrap(),
-                &ip,
-                "/home/ubuntu/memleak-agent.sh",
             )
             .await?;
             enable_bbr(private_key, &ip, bbr_conf_path.to_str().unwrap()).await?;

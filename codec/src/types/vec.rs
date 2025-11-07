@@ -1,22 +1,38 @@
 //! Codec implementation for [`Vec<T>`].
 //!
 //! For portability and consistency between architectures,
-//! the length of the vector must fit within a [`u32`].
+//! the length of the vector must fit within a [u32].
 
 use crate::{EncodeSize, Error, RangeCfg, Read, Write};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 use bytes::{Buf, BufMut};
 
 impl<T: Write> Write for Vec<T> {
     #[inline]
     fn write(&self, buf: &mut impl BufMut) {
+        self.as_slice().write(buf)
+    }
+}
+
+impl<T: EncodeSize> EncodeSize for Vec<T> {
+    #[inline]
+    fn encode_size(&self) -> usize {
+        self.as_slice().encode_size()
+    }
+}
+
+impl<T: Write> Write for &[T] {
+    #[inline]
+    fn write(&self, buf: &mut impl BufMut) {
         self.len().write(buf);
-        for item in self {
+        for item in self.iter() {
             item.write(buf);
         }
     }
 }
 
-impl<T: EncodeSize> EncodeSize for Vec<T> {
+impl<T: EncodeSize> EncodeSize for &[T] {
     #[inline]
     fn encode_size(&self) -> usize {
         self.len().encode_size() + self.iter().map(EncodeSize::encode_size).sum::<usize>()
@@ -24,7 +40,7 @@ impl<T: EncodeSize> EncodeSize for Vec<T> {
 }
 
 impl<T: Read> Read for Vec<T> {
-    type Cfg = (RangeCfg, T::Cfg);
+    type Cfg = (RangeCfg<usize>, T::Cfg);
 
     #[inline]
     fn read_cfg(buf: &mut impl Buf, (range, cfg): &Self::Cfg) -> Result<Self, Error> {
@@ -41,13 +57,42 @@ impl<T: Read> Read for Vec<T> {
 mod tests {
     use super::*;
     use crate::{DecodeRangeExt, Encode};
+    #[cfg(not(feature = "std"))]
+    use alloc::vec;
 
     #[test]
     fn test_vec() {
         let vec_values = [vec![], vec![1u8], vec![1u8, 2u8, 3u8]];
         for value in vec_values {
             let encoded = value.encode();
-            assert_eq!(encoded.len(), value.len() * std::mem::size_of::<u8>() + 1);
+            assert_eq!(encoded.len(), value.len() * core::mem::size_of::<u8>() + 1);
+
+            // Valid decoding
+            let len = value.len();
+            let decoded = Vec::<u8>::decode_range(encoded, len..=len).unwrap();
+            assert_eq!(value, decoded);
+
+            // Failure for too long
+            assert!(matches!(
+                Vec::<u8>::decode_range(value.encode(), 0..len),
+                Err(Error::InvalidLength(_))
+            ));
+
+            // Failure for too short
+            assert!(matches!(
+                Vec::<u8>::decode_range(value.encode(), len + 1..),
+                Err(Error::InvalidLength(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_slice() {
+        let slice_values: [&[u8]; 3] =
+            [[].as_slice(), [1u8].as_slice(), [1u8, 2u8, 3u8].as_slice()];
+        for value in slice_values {
+            let encoded = value.encode();
+            assert_eq!(encoded.len(), core::mem::size_of_val(value) + 1);
 
             // Valid decoding
             let len = value.len();

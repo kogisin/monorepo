@@ -1,12 +1,12 @@
 //! Send succinct consensus certificates between two networks.
 //!
-//! This example demonstrates how to build an application that employs [commonware_consensus::threshold_simplex].
+//! This example demonstrates how to build an application that employs [commonware_consensus::simplex].
 //! Whenever it is a participant's turn to build a block, they either randomly generate a 16-byte message or
 //! include a succinct consensus certificate from the other network (if available). They then upload the block to an
 //! `indexer` and send a digest of the block to other participants. Participants in the network will fetch the block
 //! from the `indexer` and verify it contains a 16-byte message or a valid consensus certificate from the other network.
 //! Once a block is finalized, all participants attempt to post the emitted succinct consensus certificate to the `indexer`.
-//! Leader election is performed using the embedded VRF provided by [commonware_consensus::threshold_simplex].
+//! Leader election is performed using the embedded VRF provided by [commonware_consensus::simplex].
 //!
 //! # Architecture
 //!
@@ -35,7 +35,7 @@
 //!
 //! # Broadcast and Backfilling
 //!
-//! This example demonstrates how [commonware_consensus::threshold_simplex] can minimally be used to efficiently power
+//! This example demonstrates how [commonware_consensus::simplex] can minimally be used to efficiently power
 //! interoperability between two networks. To simplify the example, an `indexer` is used both to distribute blocks
 //! and to collect finality certificates. A production-grade implementation would likely replace the `indexer` with
 //! a p2p broadcast mechanism.
@@ -84,7 +84,7 @@
 //!
 //! ## Start Indexer
 //!
-//! The `indexer` is a simple service that uses [commonware_stream::public_key] to accept blocks and finality certificates from a known set of participants outside
+//! The `indexer` is a simple service that uses [commonware_stream] to accept blocks and finality certificates from a known set of participants outside
 //! of the p2p instances maintained by each network.
 //!
 //! ```sh
@@ -147,6 +147,16 @@
 //! ```sh
 //! cargo run --release --bin validator -- --me 8@3008 --bootstrappers 5@127.0.0.1:3005 --participants 5,6,7,8 --storage-dir /tmp/commonware-bridge/8 --indexer 0@127.0.0.1:3000 --identity a311e2573501053c4b0dc00b64462d5d47c787d143a5b3cfe22c16a9023b89734074356ea0ce70ab71fe2042c2e426f58ff12f093cfbe796aa417ffa938be43cfe13ac8fe8c9bc1fddddfe8de840b8372d3165aa172fe930ed6ade9501dbe2ac80e9c5debaaad3eed786c1670b3f13a03712bfe6f326e57f48bb536522c3fb0a465e95a2de83ef3159675523842ef892 --share 0000000255ccd5a1f8962ce3e665d75f504d27e33db466838eb38476a162a32e4e73341a --other-public a4a1b4b8a3fb2c11f4dba5c6c57743554f746d2211cd519c3c980b8d8019f8fa328b97e44e19dcc6150688da5f38fbcd
 //! ```
+
+#![doc(
+    html_logo_url = "https://commonware.xyz/imgs/rustdoc_logo.svg",
+    html_favicon_url = "https://commonware.xyz/favicon.ico"
+)]
+
+use commonware_consensus::simplex::signing_scheme::bls12381_threshold;
+use commonware_cryptography::{bls12381::primitives::variant::MinSig, ed25519::PublicKey};
+
+pub type Scheme = bls12381_threshold::Scheme<PublicKey, MinSig>;
 
 #[doc(hidden)]
 pub mod application;

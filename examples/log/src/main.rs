@@ -12,9 +12,9 @@
 //!
 //! # Broadcast and Backfilling
 //!
-//! This example demonstrates how [commonware_consensus::simplex] can minimally be used. It purposely avoids introducing
-//! logic to handle broadcasting secret messages and/or backfilling old hashes/messages. Think of this as an exercise
-//! for the reader.
+//! This example demonstrates how [commonware_consensus::simplex] can minimally be used. It purposely avoids
+//! introducing logic to handle broadcasting secret messages and/or backfilling old hashes/messages. Think of this as
+//! an exercise for the reader.
 //!
 //! # Usage (Run at Least 3 to Make Progress)
 //!
@@ -49,13 +49,16 @@ mod gui;
 
 use clap::{value_parser, Arg, Command};
 use commonware_consensus::simplex;
-use commonware_cryptography::{Ed25519, Sha256, Signer};
-use commonware_p2p::authenticated::{self, Network};
-use commonware_runtime::{tokio, Metrics, Runner};
-use commonware_utils::{union, NZU32};
+use commonware_cryptography::{ed25519, PrivateKeyExt as _, Sha256, Signer as _};
+use commonware_p2p::{authenticated::discovery, Manager};
+use commonware_runtime::{buffer::PoolRef, tokio, Metrics, Runner};
+use commonware_utils::{set::Ordered, union, NZUsize, NZU32};
 use governor::Quota;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::{str::FromStr, time::Duration};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    str::FromStr,
+    time::Duration,
+};
 
 /// Unique namespace to avoid message replay attacks.
 const APPLICATION_NAMESPACE: &[u8] = b"_COMMONWARE_LOG";
@@ -92,7 +95,7 @@ fn main() {
         panic!("Identity not well-formed");
     }
     let key = parts[0].parse::<u64>().expect("Key not well-formed");
-    let signer = Ed25519::from_seed(key);
+    let signer = ed25519::PrivateKey::from_seed(key);
     tracing::info!(key = ?signer.public_key(), "loaded signer");
 
     // Configure my port
@@ -100,7 +103,6 @@ fn main() {
     tracing::info!(port, "loaded port");
 
     // Configure allowed peers
-    let mut validators = Vec::new();
     let participants = matches
         .get_many::<u64>("participants")
         .expect("Please provide allowed keys")
@@ -109,11 +111,14 @@ fn main() {
     if participants.is_empty() {
         panic!("Please provide at least one participant");
     }
-    for peer in &participants {
-        let verifier = Ed25519::from_seed(*peer).public_key();
-        tracing::info!(key = ?verifier, "registered authorized key",);
-        validators.push(verifier);
-    }
+    let validators = participants
+        .iter()
+        .map(|peer| {
+            let verifier = ed25519::PrivateKey::from_seed(*peer).public_key();
+            tracing::info!(key = ?verifier, "registered authorized key",);
+            verifier
+        })
+        .collect::<Ordered<_>>();
 
     // Configure bootstrappers (if provided)
     let bootstrappers = matches.get_many::<String>("bootstrappers");
@@ -124,7 +129,7 @@ fn main() {
             let bootstrapper_key = parts[0]
                 .parse::<u64>()
                 .expect("Bootstrapper key not well-formed");
-            let verifier = Ed25519::from_seed(bootstrapper_key).public_key();
+            let verifier = ed25519::PrivateKey::from_seed(bootstrapper_key).public_key();
             let bootstrapper_address =
                 SocketAddr::from_str(parts[1]).expect("Bootstrapper address not well-formed");
             bootstrapper_identities.push((verifier, bootstrapper_address));
@@ -141,7 +146,7 @@ fn main() {
     let executor = tokio::Runner::new(runtime_cfg.clone());
 
     // Configure network
-    let p2p_cfg = authenticated::Config::aggressive(
+    let p2p_cfg = discovery::Config::local(
         signer.clone(),
         &union(APPLICATION_NAMESPACE, b"_P2P"),
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
@@ -153,56 +158,60 @@ fn main() {
     // Start context
     executor.start(async |context| {
         // Initialize network
-        let (mut network, mut oracle) = Network::new(context.with_label("network"), p2p_cfg);
+        let (mut network, mut oracle) =
+            discovery::Network::new(context.with_label("network"), p2p_cfg);
 
         // Provide authorized peers
         //
         // In a real-world scenario, this would be updated as new peer sets are created (like when
         // the composition of a validator set changes).
-        oracle.register(0, validators.clone()).await;
+        oracle.update(0, validators.clone()).await;
 
         // Register consensus channels
         //
         // If you want to maximize the number of views per second, increase the rate limit
         // for this channel.
-        let (voter_sender, voter_receiver) = network.register(
+        let (pending_sender, pending_receiver) = network.register(
             0,
             Quota::per_second(NZU32!(10)),
             256, // 256 messages in flight
-            Some(3),
         );
-        let (resolver_sender, resolver_receiver) = network.register(
+        let (recovered_sender, recovered_receiver) = network.register(
             1,
             Quota::per_second(NZU32!(10)),
             256, // 256 messages in flight
-            Some(3),
+        );
+        let (resolver_sender, resolver_receiver) = network.register(
+            2,
+            Quota::per_second(NZU32!(10)),
+            256, // 256 messages in flight
         );
 
         // Initialize application
         let namespace = union(APPLICATION_NAMESPACE, b"_CONSENSUS");
-        let (application, supervisor, mailbox) = application::Application::new(
+        let (application, scheme, reporter, mailbox) = application::Application::new(
             context.with_label("application"),
             application::Config {
                 hasher: Sha256::default(),
                 mailbox_size: 1024,
                 participants: validators.clone(),
+                private_key: signer.clone(),
             },
         );
 
         // Initialize consensus
-        let cfg = simplex::Config::<_, _, _, _, _, _> {
-            crypto: signer.clone(),
+        let cfg = simplex::Config {
+            scheme,
+            blocker: oracle,
             automaton: mailbox.clone(),
             relay: mailbox.clone(),
-            reporter: supervisor.clone(),
-            supervisor,
+            reporter: reporter.clone(),
             namespace,
             partition: String::from("log"),
-            compression: Some(3),
             mailbox_size: 1024,
-            replay_concurrency: 1,
-            replay_buffer: 1024 * 1024,
-            write_buffer: 1024 * 1024,
+            epoch: 0,
+            replay_buffer: NZUsize!(1024 * 1024),
+            write_buffer: NZUsize!(1024 * 1024),
             leader_timeout: Duration::from_secs(1),
             notarization_timeout: Duration::from_secs(2),
             nullify_retry: Duration::from_secs(10),
@@ -210,9 +219,9 @@ fn main() {
             activity_timeout: 10,
             skip_timeout: 5,
             max_fetch_count: 32,
-            max_participants: participants.len(),
             fetch_concurrent: 2,
             fetch_rate_per_peer: Quota::per_second(NZU32!(1)),
+            buffer_pool: PoolRef::new(NZUsize!(16_384), NZUsize!(10_000)),
         };
         let engine = simplex::Engine::new(context.with_label("engine"), cfg);
 
@@ -220,7 +229,8 @@ fn main() {
         application.start();
         network.start();
         engine.start(
-            (voter_sender, voter_receiver),
+            (pending_sender, pending_receiver),
+            (recovered_sender, recovered_receiver),
             (resolver_sender, resolver_receiver),
         );
 

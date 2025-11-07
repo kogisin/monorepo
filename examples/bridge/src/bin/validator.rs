@@ -3,22 +3,25 @@ use commonware_bridge::{
     application, APPLICATION_NAMESPACE, CONSENSUS_SUFFIX, INDEXER_NAMESPACE, P2P_SUFFIX,
 };
 use commonware_codec::{Decode, DecodeExt};
-use commonware_consensus::threshold_simplex::{self, Engine};
+use commonware_consensus::simplex::{self, Engine};
 use commonware_cryptography::{
     bls12381::primitives::{
         group,
         poly::{Poly, Public},
         variant::{MinSig, Variant},
     },
-    Ed25519, Sha256, Signer,
+    ed25519, PrivateKeyExt as _, Sha256, Signer as _,
 };
-use commonware_p2p::authenticated;
-use commonware_runtime::{tokio, Metrics, Network, Runner};
-use commonware_stream::public_key::{self, Connection};
-use commonware_utils::{from_hex, quorum, union, NZU32};
+use commonware_p2p::{authenticated, Manager};
+use commonware_runtime::{buffer::PoolRef, tokio, Metrics, Network, Runner};
+use commonware_stream::{dial, Config as StreamConfig};
+use commonware_utils::{from_hex, quorum, set::Ordered, union, NZUsize, NZU32};
 use governor::Quota;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::{str::FromStr, time::Duration};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    str::FromStr,
+    time::Duration,
+};
 
 fn main() {
     // Parse arguments
@@ -61,7 +64,7 @@ fn main() {
         panic!("Identity not well-formed");
     }
     let key = parts[0].parse::<u64>().expect("Key not well-formed");
-    let signer = Ed25519::from_seed(key);
+    let signer = ed25519::PrivateKey::from_seed(key);
     tracing::info!(key = ?signer.public_key(), "loaded signer");
 
     // Configure my port
@@ -69,7 +72,6 @@ fn main() {
     tracing::info!(port, "loaded port");
 
     // Configure allowed peers
-    let mut validators = Vec::new();
     let participants = matches
         .get_many::<u64>("participants")
         .expect("Please provide allowed keys")
@@ -77,11 +79,14 @@ fn main() {
     if participants.len() == 0 {
         panic!("Please provide at least one participant");
     }
-    for peer in participants {
-        let verifier = Ed25519::from_seed(peer).public_key();
-        tracing::info!(key = ?verifier, "registered authorized key");
-        validators.push(verifier);
-    }
+    let validators = participants
+        .into_iter()
+        .map(|peer| {
+            let verifier = ed25519::PrivateKey::from_seed(peer).public_key();
+            tracing::info!(key = ?verifier, "registered authorized key");
+            verifier
+        })
+        .collect::<Ordered<_>>();
 
     // Configure bootstrappers (if provided)
     let bootstrappers = matches.get_many::<String>("bootstrappers");
@@ -92,7 +97,7 @@ fn main() {
             let bootstrapper_key = parts[0]
                 .parse::<u64>()
                 .expect("Bootstrapper key not well-formed");
-            let verifier = Ed25519::from_seed(bootstrapper_key).public_key();
+            let verifier = ed25519::PrivateKey::from_seed(bootstrapper_key).public_key();
             let bootstrapper_address =
                 SocketAddr::from_str(parts[1]).expect("Bootstrapper address not well-formed");
             bootstrapper_identities.push((verifier, bootstrapper_address));
@@ -126,7 +131,7 @@ fn main() {
     let indexer_key = parts[0]
         .parse::<u64>()
         .expect("Indexer key not well-formed");
-    let indexer = Ed25519::from_seed(indexer_key).public_key();
+    let indexer = ed25519::PrivateKey::from_seed(indexer_key).public_key();
     let indexer_address = SocketAddr::from_str(parts[1]).expect("Indexer address not well-formed");
 
     // Configure other public
@@ -142,8 +147,8 @@ fn main() {
     let executor = tokio::Runner::new(runtime_cfg.clone());
 
     // Configure indexer
-    let indexer_cfg = public_key::Config {
-        crypto: signer.clone(),
+    let indexer_cfg = StreamConfig {
+        signing_key: signer.clone(),
         namespace: INDEXER_NAMESPACE.to_vec(),
         max_message_size: 1024 * 1024,
         synchrony_bound: Duration::from_secs(1),
@@ -152,7 +157,7 @@ fn main() {
     };
 
     // Configure network
-    let p2p_cfg = authenticated::Config::aggressive(
+    let p2p_cfg = authenticated::discovery::Config::local(
         signer.clone(),
         &union(APPLICATION_NAMESPACE, P2P_SUFFIX),
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
@@ -168,20 +173,25 @@ fn main() {
             .dial(indexer_address)
             .await
             .expect("Failed to dial indexer");
-        let indexer =
-            Connection::upgrade_dialer(context.clone(), indexer_cfg, sink, stream, indexer)
-                .await
-                .expect("Failed to upgrade connection with indexer");
+        let indexer = dial(
+            context.with_label("dialer"),
+            indexer_cfg,
+            indexer,
+            stream,
+            sink,
+        )
+        .await
+        .expect("Failed to upgrade connection with indexer");
 
         // Setup p2p
         let (mut network, mut oracle) =
-            authenticated::Network::new(context.with_label("network"), p2p_cfg);
+            authenticated::discovery::Network::new(context.with_label("network"), p2p_cfg);
 
         // Provide authorized peers
         //
         // In a real-world scenario, this would be updated as new peer sets are created (like when
         // the composition of a validator set changes).
-        oracle.register(0, validators.clone()).await;
+        oracle.update(0, validators.clone()).await;
 
         // Register consensus channels
         //
@@ -191,24 +201,21 @@ fn main() {
             0,
             Quota::per_second(NZU32!(10)),
             256, // 256 messages in flight
-            Some(3),
         );
         let (recovered_sender, recovered_receiver) = network.register(
             1,
             Quota::per_second(NZU32!(10)),
             256, // 256 messages in flight
-            Some(3),
         );
         let (resolver_sender, resolver_receiver) = network.register(
             2,
             Quota::per_second(NZU32!(10)),
             256, // 256 messages in flight
-            Some(3),
         );
 
         // Initialize application
         let consensus_namespace = union(APPLICATION_NAMESPACE, CONSENSUS_SUFFIX);
-        let (application, supervisor, mailbox) = application::Application::new(
+        let (application, scheme, mailbox) = application::Application::new(
             context.with_label("application"),
             application::Config {
                 indexer,
@@ -225,20 +232,18 @@ fn main() {
         // Initialize consensus
         let engine = Engine::new(
             context.with_label("engine"),
-            threshold_simplex::Config {
-                crypto: signer.clone(),
+            simplex::Config {
+                scheme,
                 blocker: oracle,
                 automaton: mailbox.clone(),
                 relay: mailbox.clone(),
                 reporter: mailbox.clone(),
-                supervisor,
                 partition: String::from("log"),
-                compression: Some(3),
-                namespace: consensus_namespace,
                 mailbox_size: 1024,
-                replay_concurrency: 1,
-                replay_buffer: 1024 * 1024,
-                write_buffer: 1024 * 1024,
+                epoch: 0,
+                namespace: consensus_namespace,
+                replay_buffer: NZUsize!(1024 * 1024),
+                write_buffer: NZUsize!(1024 * 1024),
                 leader_timeout: Duration::from_secs(1),
                 notarization_timeout: Duration::from_secs(2),
                 nullify_retry: Duration::from_secs(10),
@@ -248,6 +253,7 @@ fn main() {
                 max_fetch_count: 32,
                 fetch_concurrent: 2,
                 fetch_rate_per_peer: Quota::per_second(NZU32!(1)),
+                buffer_pool: PoolRef::new(NZUsize!(16_384), NZUsize!(10_000)),
             },
         );
 

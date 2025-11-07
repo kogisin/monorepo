@@ -1,6 +1,28 @@
+//! This module provides an io_uring-based implementation of the [crate::Storage] trait,
+//! offering fast, high-throughput file operations on Linux systems.
+//!
+//! ## Architecture
+//!
+//! I/O operations are sent via a [futures::channel::mpsc] channel to a dedicated io_uring event loop
+//! running in another thread. Operation results are returned via a [futures::channel::oneshot] channel.
+//!
+//! ## Memory Safety
+//!
+//! We pass to the kernel, via io_uring, a pointer to the buffer being read from/written into.
+//! Therefore, we ensure that the memory location is valid for the duration of the operation.
+//! That is, it doesn't move or go out of scope until the operation completes.
+//!
+//! ## Feature Flag
+//!
+//! This implementation is enabled by using the `iouring-storage` feature.
+//!
+//! ## Linux Only
+//!
+//! This implementation is only available on Linux systems that support io_uring.
+
 use crate::{
     iouring::{self, should_retry},
-    Error,
+    Blob as _, Error,
 };
 use commonware_utils::{from_hex, hex, StableBuf};
 use futures::{
@@ -10,19 +32,40 @@ use futures::{
 };
 use io_uring::{opcode, types};
 use prometheus_client::registry::Registry;
-use std::fs::{self, File};
-use std::io::Error as IoError;
-use std::os::fd::AsRawFd;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{
+    fs::{self, File},
+    io::Error as IoError,
+    os::fd::AsRawFd,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+/// Syncs a directory to ensure directory entry changes are durable.
+/// On Unix, directory metadata (file creation/deletion) must be explicitly fsynced.
+fn sync_dir(path: &Path) -> Result<(), Error> {
+    let dir = File::open(path).map_err(|e| {
+        Error::BlobOpenFailed(
+            path.to_string_lossy().to_string(),
+            "directory".to_string(),
+            e,
+        )
+    })?;
+    dir.sync_all().map_err(|e| {
+        Error::BlobSyncFailed(
+            path.to_string_lossy().to_string(),
+            "directory".to_string(),
+            e,
+        )
+    })
+}
 
 #[derive(Clone, Debug)]
 /// Configuration for a [Storage].
 pub struct Config {
     /// Where to store blobs.
     pub storage_directory: PathBuf,
-    /// Configuration for the io_uring instance.
-    pub ring_config: iouring::Config,
+    /// Configuration for the iouring instance.
+    pub iouring_config: iouring::Config,
 }
 
 #[derive(Clone)]
@@ -33,15 +76,22 @@ pub struct Storage {
 
 impl Storage {
     /// Returns a new `Storage` instance.
-    pub fn start(cfg: Config, registry: &mut Registry) -> Self {
-        let (io_sender, receiver) = mpsc::channel::<iouring::Op>(cfg.ring_config.size as usize);
+    pub fn start(mut cfg: Config, registry: &mut Registry) -> Self {
+        let (io_sender, receiver) = mpsc::channel::<iouring::Op>(cfg.iouring_config.size as usize);
 
         let storage = Storage {
             storage_directory: cfg.storage_directory.clone(),
             io_sender,
         };
         let metrics = Arc::new(iouring::Metrics::new(registry));
-        std::thread::spawn(|| block_on(iouring::run(cfg.ring_config, metrics, receiver)));
+
+        // Optimize performance by hinting the kernel that a single task will
+        // submit requests. This is safe because each iouring instance runs in a
+        // dedicated thread, which guarantees that the same thread that creates
+        // the ring is the only thread submitting work to it.
+        cfg.iouring_config.single_issuer = true;
+
+        std::thread::spawn(|| block_on(iouring::run(cfg.iouring_config, metrics, receiver)));
         storage
     }
 }
@@ -56,10 +106,13 @@ impl crate::Storage for Storage {
             .parent()
             .ok_or_else(|| Error::PartitionMissing(partition.into()))?;
 
+        // Check if partition exists before creating
+        let parent_existed = parent.exists();
+
         // Create the partition directory if it does not exist
         fs::create_dir_all(parent).map_err(|_| Error::PartitionCreationFailed(partition.into()))?;
 
-        // Open the file in read-write mode, create if it does not exist
+        // Open the file, creating it if it doesn't exist
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -68,13 +121,28 @@ impl crate::Storage for Storage {
             .open(&path)
             .map_err(|e| Error::BlobOpenFailed(partition.into(), hex(name), e))?;
 
-        // Get the file length
+        // Assume empty files are newly created. Existing empty files will be synced too; that's OK.
         let len = file.metadata().map_err(|_| Error::ReadFailed)?.len();
+        let newly_created = len == 0;
 
-        Ok((
-            Blob::new(partition.into(), name, file, self.io_sender.clone()),
-            len,
-        ))
+        // Create the blob
+        let blob = Blob::new(partition.into(), name, file, self.io_sender.clone());
+
+        // Only sync if we created a new file
+        if newly_created {
+            // Sync the blob to ensure it is durably created
+            blob.sync().await?;
+
+            // Sync the parent directory to ensure the directory entry is durable
+            sync_dir(parent)?;
+
+            // Sync storage directory if parent directory did not exist
+            if !parent_existed {
+                sync_dir(&self.storage_directory)?;
+            }
+        }
+
+        Ok((blob, len))
     }
 
     async fn remove(&self, partition: &str, name: Option<&[u8]>) -> Result<(), Error> {
@@ -83,8 +151,14 @@ impl crate::Storage for Storage {
             let blob_path = path.join(hex(name));
             fs::remove_file(blob_path)
                 .map_err(|_| Error::BlobMissing(partition.into(), hex(name)))?;
+
+            // Sync the partition directory to ensure the removal is durable.
+            sync_dir(&path)?;
         } else {
-            fs::remove_dir_all(path).map_err(|_| Error::PartitionMissing(partition.into()))?;
+            fs::remove_dir_all(&path).map_err(|_| Error::PartitionMissing(partition.into()))?;
+
+            // Sync the storage directory to ensure the removal is durable.
+            sync_dir(&self.storage_directory)?;
         }
         Ok(())
     }
@@ -257,9 +331,9 @@ impl crate::Blob for Blob {
     }
 
     // TODO: Make this async. See https://github.com/commonwarexyz/monorepo/issues/831
-    async fn truncate(&self, len: u64) -> Result<(), Error> {
+    async fn resize(&self, len: u64) -> Result<(), Error> {
         self.file.set_len(len).map_err(|e| {
-            Error::BlobTruncateFailed(self.partition.clone(), hex(&self.name), IoError::other(e))
+            Error::BlobResizeFailed(self.partition.clone(), hex(&self.name), IoError::other(e))
         })
     }
 
@@ -303,17 +377,12 @@ impl crate::Blob for Blob {
                 return Err(Error::BlobSyncFailed(
                     self.partition.clone(),
                     hex(&self.name),
-                    IoError::other(format!("error code: {}", return_value)),
+                    IoError::other(format!("error code: {return_value}")),
                 ));
             }
 
             return Ok(());
         }
-    }
-
-    /// Drop all references to self.fd to close that resource.
-    async fn close(self) -> Result<(), Error> {
-        self.sync().await
     }
 }
 
@@ -333,7 +402,7 @@ mod tests {
         let storage = Storage::start(
             Config {
                 storage_directory: storage_directory.clone(),
-                ring_config: Default::default(),
+                iouring_config: Default::default(),
             },
             &mut Registry::default(),
         );

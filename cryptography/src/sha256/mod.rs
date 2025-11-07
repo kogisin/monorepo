@@ -21,15 +21,17 @@
 //! ```
 
 use crate::Hasher;
+#[cfg(not(feature = "std"))]
+use alloc::vec;
 use bytes::{Buf, BufMut};
 use commonware_codec::{DecodeExt, Error as CodecError, FixedSize, Read, ReadExt, Write};
-use commonware_utils::{hex, Array};
-use rand::{CryptoRng, Rng};
-use sha2::{Digest as _, Sha256 as ISha256};
-use std::{
+use commonware_utils::{hex, Array, Span};
+use core::{
     fmt::{Debug, Display},
     ops::Deref,
 };
+use rand_core::CryptoRngCore;
+use sha2::{Digest as _, Sha256 as ISha256};
 use zeroize::Zeroize;
 
 /// Re-export `sha2::Sha256` as `CoreSha256` for external use if needed.
@@ -37,22 +39,10 @@ pub type CoreSha256 = ISha256;
 
 const DIGEST_LENGTH: usize = 32;
 
-/// Generate a SHA-256 digest from a message.
-pub fn hash(message: &[u8]) -> Digest {
-    let array: [u8; DIGEST_LENGTH] = ISha256::digest(message).into();
-    Digest::from(array)
-}
-
 /// SHA-256 hasher.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Sha256 {
     hasher: ISha256,
-}
-
-impl Default for Sha256 {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl Clone for Sha256 {
@@ -73,14 +63,9 @@ impl Sha256 {
 impl Hasher for Sha256 {
     type Digest = Digest;
 
-    fn new() -> Self {
-        Self {
-            hasher: ISha256::new(),
-        }
-    }
-
-    fn update(&mut self, message: &[u8]) {
+    fn update(&mut self, message: &[u8]) -> &mut Self {
         self.hasher.update(message);
+        self
     }
 
     fn finalize(&mut self) -> Self::Digest {
@@ -89,15 +74,20 @@ impl Hasher for Sha256 {
         Self::Digest::from(array)
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self) -> &mut Self {
         self.hasher = ISha256::new();
+        self
+    }
+
+    fn empty() -> Self::Digest {
+        Self::new().finalize()
     }
 }
 
 /// Digest of a SHA-256 hashing operation.
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 #[repr(transparent)]
-pub struct Digest([u8; DIGEST_LENGTH]);
+pub struct Digest(pub [u8; DIGEST_LENGTH]);
 
 impl Write for Digest {
     fn write(&self, buf: &mut impl BufMut) {
@@ -117,6 +107,8 @@ impl Read for Digest {
 impl FixedSize for Digest {
     const SIZE: usize = DIGEST_LENGTH;
 }
+
+impl Span for Digest {}
 
 impl Array for Digest {}
 
@@ -140,19 +132,19 @@ impl Deref for Digest {
 }
 
 impl Debug for Digest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", hex(&self.0))
     }
 }
 
 impl Display for Digest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", hex(&self.0))
     }
 }
 
 impl crate::Digest for Digest {
-    fn random<R: Rng + CryptoRng>(rng: &mut R) -> Self {
+    fn random<R: CryptoRngCore>(rng: &mut R) -> Self {
         let mut array = [0u8; DIGEST_LENGTH];
         rng.fill_bytes(&mut array);
         Self(array)
@@ -171,7 +163,10 @@ mod tests {
     use commonware_codec::{DecodeExt, Encode};
     use commonware_utils::hex;
 
-    const HELLO_DIGEST: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+    const HELLO_DIGEST: [u8; DIGEST_LENGTH] =
+        hex!("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+    const EMPTY_DIGEST: [u8; DIGEST_LENGTH] =
+        hex!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
 
     #[test]
     fn test_sha256() {
@@ -182,22 +177,38 @@ mod tests {
         hasher.update(msg);
         let digest = hasher.finalize();
         assert!(Digest::decode(digest.as_ref()).is_ok());
-        assert_eq!(hex(digest.as_ref()), HELLO_DIGEST);
+        assert_eq!(digest.as_ref(), HELLO_DIGEST);
 
         // Reuse hasher
         hasher.update(msg);
         let digest = hasher.finalize();
         assert!(Digest::decode(digest.as_ref()).is_ok());
-        assert_eq!(hex(digest.as_ref()), HELLO_DIGEST);
+        assert_eq!(digest.as_ref(), HELLO_DIGEST);
 
         // Test simple hasher
-        let hash = hash(msg);
-        assert_eq!(hex(hash.as_ref()), HELLO_DIGEST);
+        let hash = Sha256::hash(msg);
+        assert_eq!(hash.as_ref(), HELLO_DIGEST);
     }
 
     #[test]
     fn test_sha256_len() {
         assert_eq!(Digest::SIZE, DIGEST_LENGTH);
+    }
+
+    #[test]
+    fn test_hash_empty() {
+        let digest1 = Sha256::empty();
+        let digest2 = Sha256::empty();
+
+        assert_eq!(digest1, digest2);
+    }
+
+    #[test]
+    fn test_sha256_empty() {
+        let empty_digest = Sha256::empty();
+        let expected_digest = Digest::from(EMPTY_DIGEST);
+
+        assert_eq!(empty_digest, expected_digest);
     }
 
     #[test]

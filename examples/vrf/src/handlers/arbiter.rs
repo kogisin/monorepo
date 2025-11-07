@@ -1,43 +1,40 @@
-use crate::handlers::{
-    utils::{payload, ACK_NAMESPACE},
-    wire,
-};
+use crate::handlers::{wire, ACK_NAMESPACE};
 use commonware_codec::{Decode, Encode};
 use commonware_cryptography::{
     bls12381::{
-        dkg,
+        dkg::{self},
         primitives::{poly, variant::MinSig},
     },
-    Scheme,
+    PublicKey,
 };
 use commonware_macros::select;
 use commonware_p2p::{Receiver, Recipients, Sender};
-use commonware_runtime::{Clock, Handle, Spawner};
+use commonware_runtime::{spawn_cell, Clock, ContextCell, Handle, Spawner};
+use commonware_utils::set::Ordered;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     time::Duration,
 };
 use tracing::{debug, info, warn};
 
-pub struct Arbiter<E: Clock + Spawner, C: Scheme> {
-    context: E,
+pub struct Arbiter<E: Clock + Spawner, C: PublicKey> {
+    context: ContextCell<E>,
     dkg_frequency: Duration,
     dkg_phase_timeout: Duration,
-    contributors: Vec<C::PublicKey>,
+    contributors: Ordered<C>,
 }
 
 /// Implementation of a "trusted arbiter" that tracks commitments,
 /// acknowledgements, and complaints during a DKG round.
-impl<E: Clock + Spawner, C: Scheme> Arbiter<E, C> {
+impl<E: Clock + Spawner, C: PublicKey> Arbiter<E, C> {
     pub fn new(
         context: E,
         dkg_frequency: Duration,
         dkg_phase_timeout: Duration,
-        mut contributors: Vec<C::PublicKey>,
+        contributors: Ordered<C>,
     ) -> Self {
-        contributors.sort();
         Self {
-            context,
+            context: ContextCell::new(context),
             dkg_frequency,
             dkg_phase_timeout,
             contributors,
@@ -48,9 +45,9 @@ impl<E: Clock + Spawner, C: Scheme> Arbiter<E, C> {
         &self,
         round: u64,
         previous: Option<poly::Public<MinSig>>,
-        sender: &mut impl Sender<PublicKey = C::PublicKey>,
-        receiver: &mut impl Receiver<PublicKey = C::PublicKey>,
-    ) -> (Option<poly::Public<MinSig>>, HashSet<C::PublicKey>) {
+        sender: &mut impl Sender<PublicKey = C>,
+        receiver: &mut impl Receiver<PublicKey = C>,
+    ) -> (Option<poly::Public<MinSig>>, HashSet<C>) {
         // Create a new round
         let start = self.context.current();
         let timeout = start + 4 * self.dkg_phase_timeout; // start -> commitment/share -> ack -> arbiter
@@ -92,40 +89,39 @@ impl<E: Clock + Spawner, C: Scheme> Arbiter<E, C> {
                 },
                 result = receiver.recv() => {
                     match result {
-                        Ok((sender, msg)) =>{
+                        Ok((peer, msg)) =>{
                             // Parse msg
                             let msg = match wire::Dkg::decode_cfg(msg, &self.contributors.len()) {
                                 Ok(msg) => msg,
                                 Err(_) => {
-                                    arbiter.disqualify(sender);
+                                    arbiter.disqualify(peer);
                                     continue;
                                 }
                             };
                             if msg.round != round {
                                 continue;
                             }
-                            let wire::Payload::Commitment{commitment, acks, reveals} = msg.payload else {
+                            let wire::Payload::Commitment { commitment, acks, reveals } = msg.payload else {
                                 // Useless message from previous step
                                 continue;
                             };
 
                             // Validate the signature of each ack
-                            let payload = payload(round, &sender, &commitment);
-                            if !acks.iter().all(|(i, sig)| {
-                                self.contributors.get(*i as usize).map(|signer| {
-                                    C::verify(Some(ACK_NAMESPACE), &payload, signer, sig)
+                            if !acks.iter().all(|ack| {
+                                self.contributors.get(ack.player as usize).map(|signer| {
+                                    ack.verify::<MinSig, _>(ACK_NAMESPACE, signer, round, &peer, &commitment)
                                 }).unwrap_or(false)
                             }) {
-                                arbiter.disqualify(sender);
+                                arbiter.disqualify(peer);
                                 continue;
                             }
 
                             // Check dealer commitment
                             //
                             // Any faults here will be considered as a disqualification.
-                            let ack_indices: Vec<u32> = acks.keys().copied().collect();
-                            if let Err(e) = arbiter.commitment(sender.clone(), commitment, ack_indices, reveals) {
-                                warn!(round, error = ?e, ?sender, "failed to process commitment");
+                            let ack_indices: Vec<u32> = acks.iter().map(|a| a.player).collect();
+                            if let Err(e) = arbiter.commitment(peer.clone(), commitment, ack_indices, reveals) {
+                                warn!(round, error = ?e, ?peer, "failed to process commitment");
                                 break;
                             }
 
@@ -179,16 +175,16 @@ impl<E: Clock + Spawner, C: Scheme> Arbiter<E, C> {
         );
 
         // Broadcast commitments
-        let mut commitments = HashMap::new();
+        let mut commitments = BTreeMap::new();
         for (dealer_idx, commitment) in output.commitments {
             commitments.insert(dealer_idx, commitment);
         }
-        let mut reveals = HashMap::new();
+        let mut reveals = BTreeMap::new();
         for (dealer_idx, shares) in output.reveals {
             for share in shares {
                 reveals
                     .entry(share.index)
-                    .or_insert_with(HashMap::new)
+                    .or_insert_with(BTreeMap::new)
                     .insert(dealer_idx, share);
             }
         }
@@ -216,16 +212,16 @@ impl<E: Clock + Spawner, C: Scheme> Arbiter<E, C> {
 
     pub fn start(
         mut self,
-        sender: impl Sender<PublicKey = C::PublicKey>,
-        receiver: impl Receiver<PublicKey = C::PublicKey>,
+        sender: impl Sender<PublicKey = C>,
+        receiver: impl Receiver<PublicKey = C>,
     ) -> Handle<()> {
-        self.context.spawn_ref()(self.run(sender, receiver))
+        spawn_cell!(self.context, self.run(sender, receiver).await)
     }
 
     async fn run(
         self,
-        mut sender: impl Sender<PublicKey = C::PublicKey>,
-        mut receiver: impl Receiver<PublicKey = C::PublicKey>,
+        mut sender: impl Sender<PublicKey = C>,
+        mut receiver: impl Receiver<PublicKey = C>,
     ) {
         let mut round = 0;
         let mut previous = None;

@@ -5,16 +5,60 @@
 //! `commonware-consensus` is **ALPHA** software and is not yet recommended for production use. Developers should
 //! expect breaking changes and occasional instability.
 
+#![doc(
+    html_logo_url = "https://commonware.xyz/imgs/rustdoc_logo.svg",
+    html_favicon_url = "https://commonware.xyz/favicon.ico"
+)]
+
+use commonware_codec::Codec;
+use commonware_cryptography::{Committable, Digestible};
+
+pub mod aggregation;
 pub mod ordered_broadcast;
 pub mod simplex;
-pub mod threshold_simplex;
+pub mod types;
+pub mod utils;
+
+use types::{Epoch, View};
+
+/// Epochable is a trait that provides access to the epoch number.
+/// Any consensus message or object that is associated with a specific epoch should implement this.
+pub trait Epochable {
+    /// Returns the epoch associated with this object.
+    fn epoch(&self) -> Epoch;
+}
+
+/// Viewable is a trait that provides access to the view (round) number.
+/// Any consensus message or object that is associated with a specific view should implement this.
+pub trait Viewable {
+    /// Returns the view associated with this object.
+    fn view(&self) -> View;
+}
+
+/// Block is the interface for a block in the blockchain.
+///
+/// Blocks are used to track the progress of the consensus engine.
+pub trait Block: Codec + Digestible + Committable + Send + Sync + 'static {
+    /// Get the height of the block.
+    fn height(&self) -> u64;
+
+    /// Get the parent block's digest.
+    fn parent(&self) -> Self::Commitment;
+}
 
 cfg_if::cfg_if! {
     if #[cfg(not(target_arch = "wasm32"))] {
-        use commonware_utils::Array;
-        use commonware_cryptography::Digest;
+        use commonware_cryptography::{Digest, PublicKey};
         use futures::channel::{oneshot, mpsc};
         use std::future::Future;
+        use commonware_runtime::{Spawner, Metrics, Clock};
+        use rand::Rng;
+        use crate::{marshal::ingress::mailbox::AncestorStream, simplex::signing_scheme::Scheme};
+
+        pub mod application;
+        pub mod marshal;
+        mod reporter;
+        pub use reporter::*;
 
         /// Histogram buckets for measuring consensus latency.
         const LATENCY: [f64; 36] = [
@@ -34,7 +78,7 @@ cfg_if::cfg_if! {
             type Digest: Digest;
 
             /// Payload used to initialize the consensus engine.
-            fn genesis(&mut self) -> impl Future<Output = Self::Digest> + Send;
+            fn genesis(&mut self, epoch: Epoch) -> impl Future<Output = Self::Digest> + Send;
 
             /// Generate a new payload for the given context.
             ///
@@ -55,6 +99,53 @@ cfg_if::cfg_if! {
                 context: Self::Context,
                 payload: Self::Digest,
             ) -> impl Future<Output = oneshot::Receiver<bool>> + Send;
+        }
+
+        /// Application is a minimal interface for standard implementations that operate over a stream
+        /// of epoched blocks.
+        pub trait Application<E>: Clone + Send + 'static
+        where
+            E: Rng + Spawner + Metrics + Clock
+        {
+            /// The signing scheme used by the application.
+            type SigningScheme: Scheme;
+
+            /// Context is metadata provided by the consensus engine associated with a given payload.
+            ///
+            /// This often includes things like the proposer, view number, the height, or the epoch.
+            type Context: Epochable;
+
+            /// The block type produced by the application's builder.
+            type Block: Block;
+
+            /// Payload used to initialize the consensus engine in the first epoch.
+            fn genesis(&mut self) -> impl Future<Output = Self::Block> + Send;
+
+            /// Build a new block on top of the provided parent ancestry. If the build job fails,
+            /// the implementor should return [None].
+            fn propose(
+                &mut self,
+                context: (E, Self::Context),
+                ancestry: AncestorStream<Self::SigningScheme, Self::Block>,
+            ) -> impl Future<Output = Option<Self::Block>> + Send;
+        }
+
+        /// An extension of [Application] that provides the ability to implementations to verify blocks.
+        ///
+        /// Some [Application]s may not require this functionality. When employing
+        /// erasure coding, for example, verification only serves to verify the integrity of the
+        /// received shard relative to the consensus commitment, and can therefore be
+        /// hidden from the application.
+        pub trait VerifyingApplication<E>: Application<E>
+        where
+            E: Rng + Spawner + Metrics + Clock
+        {
+            /// Verify a block produced by the application's proposer, relative to its ancestry.
+            fn verify(
+                &mut self,
+                context: (E, Self::Context),
+                ancestry: AncestorStream<Self::SigningScheme, Self::Block>,
+            ) -> impl Future<Output = bool> + Send;
         }
 
         /// Relay is the interface responsible for broadcasting payloads to the network.
@@ -106,14 +197,11 @@ cfg_if::cfg_if! {
             type Index;
 
             /// Public key used to identify participants.
-            type PublicKey: Array;
-
-            /// Return the leader at a given index for the provided seed.
-            fn leader(&self, index: Self::Index) -> Option<Self::PublicKey>;
+            type PublicKey: PublicKey;
 
             /// Get the **sorted** participants for the given view. This is called when entering a new view before
             /// listening for proposals or votes. If nothing is returned, the view will not be entered.
-            fn participants(&self, index: Self::Index) -> Option<&Vec<Self::PublicKey>>;
+            fn participants(&self, index: Self::Index) -> Option<&[Self::PublicKey]>;
 
             // Indicate whether some candidate is a participant at the given view.
             fn is_participant(&self, index: Self::Index, candidate: &Self::PublicKey) -> Option<u32>;
@@ -124,7 +212,7 @@ cfg_if::cfg_if! {
         ///
         /// ## Synchronization
         ///
-        /// The same considerations for [`Supervisor`](crate::Supervisor) apply here.
+        /// The same considerations for [crate::Supervisor] apply here.
         pub trait ThresholdSupervisor: Supervisor {
             /// Identity is the type against which threshold signatures are verified.
             type Identity;
@@ -143,9 +231,6 @@ cfg_if::cfg_if! {
             /// of a polynomial).
             fn identity(&self) -> &Self::Identity;
 
-            /// Return the leader at a given index over the provided seed.
-            fn leader(&self, index: Self::Index, seed: Self::Seed) -> Option<Self::PublicKey>;
-
             /// Returns the polynomial over which partial signatures are verified at a given index.
             fn polynomial(&self, index: Self::Index) -> Option<&Self::Polynomial>;
 
@@ -162,7 +247,7 @@ cfg_if::cfg_if! {
         /// Monitor is used to implement mechanisms that share the same set of active participants as consensus and/or
         /// perform some activity that requires some synchronization with the progress of consensus.
         ///
-        /// Monitor can be implemented using [`Reporter`](crate::Reporter) to avoid introducing complexity
+        /// Monitor can be implemented using [crate::Reporter] to avoid introducing complexity
         /// into any particular consensus implementation.
         pub trait Monitor: Clone + Send + 'static {
             /// Index is the type used to indicate the in-progress consensus decision.

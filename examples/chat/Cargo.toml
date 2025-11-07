@@ -1,31 +1,31 @@
 [package]
 name = "commonware-chat"
-edition = "2021"
+edition.workspace = true
 publish = true
-version = "0.0.53"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+license.workspace = true
 description = "Send encrypted messages to a group of friends using commonware-cryptography and commonware-p2p."
 readme = "README.md"
-homepage = "https://commonware.xyz"
+homepage.workspace = true
 repository = "https://github.com/commonwarexyz/monorepo/tree/main/examples/chat"
 documentation = "https://docs.rs/commonware-chat"
 
 [dependencies]
-commonware-cryptography = { workspace = true }
-commonware-macros = { workspace = true }
-commonware-p2p = { workspace = true }
-commonware-runtime = { workspace = true }
-commonware-utils = { workspace = true }
-tracing = { workspace = true }
-futures = { workspace = true }
-clap = { workspace = true }
-prometheus-client = { workspace = true }
-governor = { workspace = true }
+chrono.workspace = true
+clap.workspace = true
+commonware-cryptography.workspace = true
+commonware-macros.workspace = true
+commonware-p2p.workspace = true
+commonware-runtime.workspace = true
+commonware-utils.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+governor.workspace = true
+prometheus-client.workspace = true
+ratatui.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "json"] }
-chrono = { workspace = true }
-ratatui = { workspace = true }
-crossterm = { workspace = true }
-serde_json = { workspace = true }
 
 [[bin]]
 name = "commonware-chat"

@@ -1,0 +1,24 @@
+[package]
+name = "commonware-consensus-fuzz"
+version.workspace = true
+publish = false
+edition.workspace = true
+license.workspace = true
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { workspace = true, features = ["derive"] }
+commonware-codec.workspace = true
+commonware-consensus.workspace = true
+commonware-cryptography.workspace = true
+libfuzzer-sys.workspace = true
+rand.workspace = true
+
+[[bin]]
+name = "simplex_select_leader"
+path = "fuzz_targets/simplex_select_leader.rs"
+test = false
+doc = false
+bench = false

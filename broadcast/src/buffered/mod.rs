@@ -2,7 +2,7 @@
 //!
 //! # Overview
 //!
-//! The core of the module is the [`Engine`]. It is responsible for:
+//! The core of the module is the [Engine]. It is responsible for:
 //! - Accepting and caching messages from other participants
 //! - Broadcasting messages to all peers
 //! - Serving cached messages on-demand
@@ -13,8 +13,8 @@
 //! messages per peer. When the cache is full, the oldest message is removed to make room for the
 //! new one.
 //!
-//! The [`Mailbox`] is used to make requests to the [`Engine`]. It implements the
-//! [`Broadcaster`](crate::Broadcaster) trait. This is used to have the engine send a message to all
+//! The [Mailbox] is used to make requests to the [Engine]. It implements the
+//! [crate::Broadcaster] trait. This is used to have the engine send a message to all
 //! other peers in the network in a best-effort manner. It also has a method to request a message by
 //! digest. The engine will return the message immediately if it is in the cache, or wait for it to
 //! be received over the network if it is not.
@@ -36,13 +36,16 @@ mod tests {
     use super::{mocks::TestMessage, *};
     use crate::Broadcaster;
     use commonware_codec::RangeCfg;
-    use commonware_cryptography::{ed25519::PublicKey, Committable, Digestible, Ed25519, Signer};
-    use commonware_macros::{select, test_traced};
+    use commonware_cryptography::{
+        ed25519::{PrivateKey, PublicKey},
+        Committable, Digestible, Hasher, PrivateKeyExt as _, Sha256, Signer as _,
+    };
+    use commonware_macros::test_traced;
     use commonware_p2p::{
         simulated::{Link, Network, Oracle, Receiver, Sender},
         Recipients,
     };
-    use commonware_runtime::{deterministic, Clock, Metrics, Runner};
+    use commonware_runtime::{deterministic, Clock, Error, Metrics, Runner};
     use std::{collections::BTreeMap, time::Duration};
 
     // Number of messages to cache per sender
@@ -69,26 +72,28 @@ mod tests {
             context.with_label("network"),
             commonware_p2p::simulated::Config {
                 max_size: 1024 * 1024,
+                disconnect_on_block: true,
+                tracked_peer_sets: None,
             },
         );
         network.start();
 
         let mut schemes = (0..num_peers)
-            .map(|i| Ed25519::from_seed(i as u64))
+            .map(|i| PrivateKey::from_seed(i as u64))
             .collect::<Vec<_>>();
         schemes.sort_by_key(|s| s.public_key());
-        let peers: Vec<PublicKey> = schemes.iter().map(|c| (c.public_key())).collect();
+        let peers: Vec<PublicKey> = schemes.iter().map(|c| c.public_key()).collect();
 
         let mut registrations: Registrations = BTreeMap::new();
         for peer in peers.iter() {
-            let (sender, receiver) = oracle.register(peer.clone(), 0).await.unwrap();
+            let (sender, receiver) = oracle.control(peer.clone()).register(0).await.unwrap();
             registrations.insert(peer.clone(), (sender, receiver));
         }
 
         // Add links between all peers
         let link = Link {
-            latency: NETWORK_SPEED.as_millis() as f64,
-            jitter: 0.0,
+            latency: NETWORK_SPEED,
+            jitter: Duration::ZERO,
             success_rate,
         };
         for p1 in peers.iter() {
@@ -262,9 +267,10 @@ mod tests {
                 for peer in peers.iter() {
                     let mut mailbox = mailboxes.get(peer).unwrap().clone();
                     let receiver = mailbox.subscribe(None, commitment, None).await;
-                    let has = select! {
-                        _ = context.sleep(A_JIFFY) => {false},
-                        r = receiver => { r.is_ok() },
+                    let has = match context.timeout(A_JIFFY, receiver).await {
+                        Ok(r) => r.is_ok(),
+                        Err(Error::Timeout) => false,
+                        Err(e) => panic!("unexpected error: {e:?}"),
                     };
                     all_received &= has;
                 }
@@ -357,7 +363,7 @@ mod tests {
             let mut mailbox = mailboxes.get(&peers[0]).unwrap().clone();
             let mut messages = vec![];
             for i in 0..CACHE_SIZE + 1 {
-                messages.push(TestMessage::shared(format!("message {}", i).as_bytes()));
+                messages.push(TestMessage::shared(format!("message {i}").as_bytes()));
             }
             for message in messages.iter() {
                 let result = mailbox.broadcast(Recipients::All, message.clone()).await;
@@ -382,9 +388,10 @@ mod tests {
             let receiver = peer_mailbox
                 .subscribe(None, messages[0].commitment(), None)
                 .await;
-            select! {
-                _ = context.sleep(A_JIFFY) => {},
-                _ = receiver => { panic!("receiver should have failed")},
+            match context.timeout(A_JIFFY, receiver).await {
+                Ok(_) => panic!("receiver should have failed"),
+                Err(Error::Timeout) => {} // Expected timeout
+                Err(e) => panic!("unexpected error: {e:?}"),
             }
         });
     }
@@ -420,7 +427,7 @@ mod tests {
             // Peer A broadcasts 10 new messages to evict M1 from A's deque
             let mut new_messages_a = Vec::with_capacity(CACHE_SIZE);
             for i in 0..CACHE_SIZE {
-                new_messages_a.push(TestMessage::shared(format!("A{}", i).as_bytes()));
+                new_messages_a.push(TestMessage::shared(format!("A{i}").as_bytes()));
             }
             for msg in &new_messages_a {
                 let result = mailbox_a.broadcast(Recipients::All, msg.clone()).await;
@@ -436,7 +443,7 @@ mod tests {
             // Peer C broadcasts 10 new messages to evict M1 from C's deque
             let mut new_messages_c = Vec::with_capacity(CACHE_SIZE);
             for i in 0..CACHE_SIZE {
-                new_messages_c.push(TestMessage::shared(format!("C{}", i).as_bytes()));
+                new_messages_c.push(TestMessage::shared(format!("C{i}").as_bytes()));
             }
             for msg in &new_messages_c {
                 let result = mailbox_c.broadcast(Recipients::All, msg.clone()).await;
@@ -446,9 +453,10 @@ mod tests {
 
             // Verify B cannot get M1 (evicted from all deques)
             let receiver = mailbox_b.subscribe(None, commitment_m1, None).await;
-            select! {
-                _ = context.sleep(A_JIFFY) => {},
-                _ = receiver => { panic!("M1 should not be retrievable"); },
+            match context.timeout(A_JIFFY, receiver).await {
+                Ok(_) => panic!("M1 should not be retrievable"),
+                Err(Error::Timeout) => {} // Expected timeout
+                Err(e) => panic!("unexpected error: {e:?}"),
             }
         });
     }
@@ -596,6 +604,55 @@ mod tests {
             let got = mb2.get(Some(sender1.clone()), m3.commitment(), None).await;
             assert_eq!(got, vec![m3.clone()]);
         });
+    }
+
+    #[test_traced]
+    fn test_get_all_for_commitment_deterministic_order() {
+        let run = |seed: u64| {
+            let config = deterministic::Config::new()
+                .with_seed(seed)
+                .with_timeout(Some(Duration::from_secs(5)));
+            let runner = deterministic::Runner::new(config);
+            runner.start(|context| async move {
+                let (peers, mut registrations, _oracle) =
+                    initialize_simulation(context.clone(), 1, 1.0).await;
+                let mailboxes = spawn_peer_engines(context.clone(), &mut registrations);
+
+                let sender1 = peers[0].clone();
+                let mut mb1 = mailboxes.get(&sender1).unwrap().clone();
+
+                // Two messages share commitment but have distinct digests.
+                let m1 = TestMessage::new(b"id", b"content-1");
+                let m2 = TestMessage::new(b"id", b"content-2");
+                let m3 = TestMessage::new(b"id", b"content-3");
+                mb1.broadcast(Recipients::All, m1.clone())
+                    .await
+                    .await
+                    .unwrap();
+                mb1.broadcast(Recipients::All, m2.clone())
+                    .await
+                    .await
+                    .unwrap();
+                mb1.broadcast(Recipients::All, m3.clone())
+                    .await
+                    .await
+                    .unwrap();
+
+                let mut hasher = Sha256::default();
+                let values = mb1.get(None, m1.commitment(), None).await;
+                for value in values {
+                    hasher.update(&value.content);
+                }
+                hasher.finalize()
+            })
+        };
+
+        for seed in 0..10 {
+            let h1 = run(seed);
+            let h2 = run(seed);
+
+            assert_eq!(h1, h2, "Messages returned in different order for {seed}");
+        }
     }
 
     #[test_traced]

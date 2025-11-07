@@ -21,7 +21,7 @@ pub const PYROSCOPE_VERSION: &str = "1.12.0";
 /// Version of Grafana to download and install
 pub const GRAFANA_VERSION: &str = "11.5.2";
 
-/// YAML configuration for Grafana datasources (Prometheus, Loki, and Pyroscope)
+/// YAML configuration for Grafana datasources (Prometheus, Loki, Tempo, and Pyroscope)
 pub const DATASOURCES_YML: &str = r#"
 apiVersion: 1
 datasources:
@@ -218,7 +218,7 @@ compactor:
     compaction_cycle: 1h
 "#;
 
-/// Command to install monitoring services (Prometheus, Loki, Grafana) on the monitoring instance
+/// Command to install monitoring services (Prometheus, Loki, Grafana, Pyroscope, Tempo) on the monitoring instance
 pub fn install_monitoring_cmd(
     prometheus_version: &str,
     grafana_version: &str,
@@ -227,24 +227,18 @@ pub fn install_monitoring_cmd(
     tempo_version: &str,
 ) -> String {
     let prometheus_url = format!(
-    "https://github.com/prometheus/prometheus/releases/download/v{}/prometheus-{}.linux-arm64.tar.gz",
-    prometheus_version, prometheus_version
+    "https://github.com/prometheus/prometheus/releases/download/v{prometheus_version}/prometheus-{prometheus_version}.linux-arm64.tar.gz",
 );
-    let grafana_url = format!(
-        "https://dl.grafana.com/oss/release/grafana_{}_arm64.deb",
-        grafana_version
-    );
+    let grafana_url =
+        format!("https://dl.grafana.com/oss/release/grafana_{grafana_version}_arm64.deb");
     let loki_url = format!(
-        "https://github.com/grafana/loki/releases/download/v{}/loki-linux-arm64.zip",
-        loki_version
+        "https://github.com/grafana/loki/releases/download/v{loki_version}/loki-linux-arm64.zip",
     );
     let pyroscope_url = format!(
-      "https://github.com/grafana/pyroscope/releases/download/v{}/pyroscope_{}_linux_arm64.tar.gz",
-      pyroscope_version, pyroscope_version
-  );
+        "https://github.com/grafana/pyroscope/releases/download/v{pyroscope_version}/pyroscope_{pyroscope_version}_linux_arm64.tar.gz",
+    );
     let tempo_url = format!(
-        "https://github.com/grafana/tempo/releases/download/v{}/tempo_{}_linux_arm64.tar.gz",
-        tempo_version, tempo_version
+        "https://github.com/grafana/tempo/releases/download/v{tempo_version}/tempo_{tempo_version}_linux_arm64.tar.gz",
     );
     format!(
         r#"
@@ -253,31 +247,31 @@ sudo apt-get install -y wget curl unzip adduser libfontconfig1
 
 # Download Prometheus with retries
 for i in {{1..5}}; do
-  wget -O /home/ubuntu/prometheus.tar.gz {} && break
+  wget -O /home/ubuntu/prometheus.tar.gz {prometheus_url} && break
   sleep 10
 done
 
 # Download Grafana with retries
 for i in {{1..5}}; do
-  wget -O /home/ubuntu/grafana.deb {} && break
+  wget -O /home/ubuntu/grafana.deb {grafana_url} && break
   sleep 10
 done
 
 # Download Loki with retries
 for i in {{1..5}}; do
-  wget -O /home/ubuntu/loki.zip {} && break
+  wget -O /home/ubuntu/loki.zip {loki_url} && break
   sleep 10
 done
 
 # Download Pyroscope with retries
 for i in {{1..5}}; do
-  wget -O /home/ubuntu/pyroscope.tar.gz {} && break
+  wget -O /home/ubuntu/pyroscope.tar.gz {pyroscope_url} && break
   sleep 10
 done
 
 # Download Tempo with retries
 for i in {{1..5}}; do
-  wget -O /home/ubuntu/tempo.tar.gz {} && break
+  wget -O /home/ubuntu/tempo.tar.gz {tempo_url} && break
   sleep 10
 done
 
@@ -285,8 +279,8 @@ done
 sudo mkdir -p /opt/prometheus /opt/prometheus/data
 sudo chown -R ubuntu:ubuntu /opt/prometheus
 tar xvfz /home/ubuntu/prometheus.tar.gz -C /home/ubuntu
-sudo mv /home/ubuntu/prometheus-{}.linux-arm64 /opt/prometheus/prometheus-{}.linux-arm64
-sudo ln -s /opt/prometheus/prometheus-{}.linux-arm64/prometheus /opt/prometheus/prometheus
+sudo mv /home/ubuntu/prometheus-{prometheus_version}.linux-arm64 /opt/prometheus/prometheus-{prometheus_version}.linux-arm64
+sudo ln -s /opt/prometheus/prometheus-{prometheus_version}.linux-arm64/prometheus /opt/prometheus/prometheus
 sudo chmod +x /opt/prometheus/prometheus
 
 # Install Grafana
@@ -356,15 +350,7 @@ sudo systemctl start tempo
 sudo systemctl enable tempo
 sudo systemctl restart grafana-server
 sudo systemctl enable grafana-server
-"#,
-        prometheus_url,
-        grafana_url,
-        loki_url,
-        pyroscope_url,
-        tempo_url,
-        prometheus_version,
-        prometheus_version,
-        prometheus_version
+"#
     )
 }
 
@@ -374,7 +360,7 @@ pub fn install_binary_cmd(profiling: bool) -> String {
         r#"
 # Install base tools and binary dependencies
 sudo apt-get update -y
-sudo apt-get install -y logrotate jq wget bpfcc-tools linux-headers-$(uname -r)
+sudo apt-get install -y logrotate jq wget libjemalloc2 linux-tools-common linux-tools-generic linux-tools-$(uname -r)
 
 # Setup binary
 chmod +x /home/ubuntu/binary
@@ -387,13 +373,10 @@ sudo chown root:root /etc/logrotate.d/binary
 echo "0 * * * * /usr/sbin/logrotate /etc/logrotate.d/binary" | crontab -
 
 # Setup pyroscope agent script and timer
+sudo ln -s "$(find /usr/lib/linux-tools/*/perf | head -1)" /usr/local/bin/perf
 sudo chmod +x /home/ubuntu/pyroscope-agent.sh
 sudo mv /home/ubuntu/pyroscope-agent.service /etc/systemd/system/pyroscope-agent.service
 sudo mv /home/ubuntu/pyroscope-agent.timer /etc/systemd/system/pyroscope-agent.timer
-
-# Setup memleak agent script and timer
-sudo chmod +x /home/ubuntu/memleak-agent.sh
-sudo mv /home/ubuntu/memleak-agent.service /etc/systemd/system/memleak-agent.service
 
 # Start services
 sudo systemctl daemon-reload
@@ -404,7 +387,6 @@ sudo systemctl enable --now binary
         script.push_str(
             r#"
 sudo systemctl enable --now pyroscope-agent.timer
-sudo systemctl enable --now memleak-agent
 "#,
         );
     }
@@ -414,8 +396,7 @@ sudo systemctl enable --now memleak-agent
 /// Command to set up Promtail on binary instances
 pub fn setup_promtail_cmd(promtail_version: &str) -> String {
     let promtail_url = format!(
-        "https://github.com/grafana/loki/releases/download/v{}/promtail-linux-arm64.zip",
-        promtail_version
+        "https://github.com/grafana/loki/releases/download/v{promtail_version}/promtail-linux-arm64.zip",
     );
     format!(
         r#"
@@ -424,7 +405,7 @@ sudo apt-get install -y wget unzip
 
 # Download Promtail with retries
 for i in {{1..5}}; do
-  wget -O /home/ubuntu/promtail.zip {} && break
+  wget -O /home/ubuntu/promtail.zip {promtail_url} && break
   sleep 10
 done
 
@@ -442,8 +423,7 @@ sudo chown root:root /etc/promtail/promtail.yml
 sudo systemctl daemon-reload
 sudo systemctl start promtail
 sudo systemctl enable promtail
-"#,
-        promtail_url
+"#
     )
 }
 
@@ -462,28 +442,26 @@ server:
 positions:
   filename: /tmp/positions.yaml
 clients:
-  - url: http://{}:3100/loki/api/v1/push
+  - url: http://{monitoring_private_ip}:3100/loki/api/v1/push
 scrape_configs:
   - job_name: binary_logs
     static_configs:
       - targets:
           - localhost
         labels:
-          deployer_name: {}
-          deployer_ip: {}
-          deployer_region: {}
+          deployer_name: {instance_name}
+          deployer_ip: {ip}
+          deployer_region: {region}
           __path__: /var/log/binary.log
-      "#,
-        monitoring_private_ip, instance_name, ip, region
+"#
     )
 }
 
 /// Command to install Node Exporter on instances
 pub fn setup_node_exporter_cmd(node_exporter_version: &str) -> String {
     let node_exporter_url = format!(
-      "https://github.com/prometheus/node_exporter/releases/download/v{}/node_exporter-{}.linux-arm64.tar.gz",
-      node_exporter_version, node_exporter_version
-  );
+        "https://github.com/prometheus/node_exporter/releases/download/v{node_exporter_version}/node_exporter-{node_exporter_version}.linux-arm64.tar.gz",
+    );
     format!(
         r#"
 sudo apt-get update -y
@@ -491,15 +469,15 @@ sudo apt-get install -y wget tar
 
 # Download Node Exporter with retries
 for i in {{1..5}}; do
-  wget -O /home/ubuntu/node_exporter.tar.gz {} && break
+  wget -O /home/ubuntu/node_exporter.tar.gz {node_exporter_url} && break
   sleep 10
 done
 
 # Install Node Exporter
 sudo mkdir -p /opt/node_exporter
 tar xvfz /home/ubuntu/node_exporter.tar.gz -C /home/ubuntu
-sudo mv /home/ubuntu/node_exporter-{}.linux-arm64 /opt/node_exporter/node_exporter-{}.linux-arm64
-sudo ln -s /opt/node_exporter/node_exporter-{}.linux-arm64/node_exporter /opt/node_exporter/node_exporter
+sudo mv /home/ubuntu/node_exporter-{node_exporter_version}.linux-arm64 /opt/node_exporter/node_exporter-{node_exporter_version}.linux-arm64
+sudo ln -s /opt/node_exporter/node_exporter-{node_exporter_version}.linux-arm64/node_exporter /opt/node_exporter/node_exporter
 sudo chmod +x /opt/node_exporter/node_exporter
 sudo mv /home/ubuntu/node_exporter.service /etc/systemd/system/node_exporter.service
 
@@ -507,8 +485,7 @@ sudo mv /home/ubuntu/node_exporter.service /etc/systemd/system/node_exporter.ser
 sudo systemctl daemon-reload
 sudo systemctl start node_exporter
 sudo systemctl enable node_exporter
-"#,
-        node_exporter_url, node_exporter_version, node_exporter_version, node_exporter_version
+"#
     )
 }
 
@@ -544,29 +521,21 @@ scrape_configs:
     for (name, ip, region) in instances {
         config.push_str(&format!(
             r#"
-  - job_name: '{}_binary'
+  - job_name: '{name}_binary'
     static_configs:
-      - targets: ['{}:9090']
+      - targets: ['{ip}:9090']
         labels:
-          deployer_name: '{}'
-          deployer_ip: '{}'
-          deployer_region: '{}'
-  - job_name: '{}_system'
+          deployer_name: '{name}'
+          deployer_ip: '{ip}'
+          deployer_region: '{region}'
+  - job_name: '{name}_system'
     static_configs:
-      - targets: ['{}:9100']
+      - targets: ['{ip}:9100']
         labels:
-          deployer_name: '{}'
-          deployer_ip: '{}'
-          deployer_region: '{}'
-  - job_name: '{}_memleak'
-    static_configs:
-      - targets: ['{}:9200']
-        labels:
-          deployer_name: '{}'
-          deployer_ip: '{}'
-          deployer_region: '{}'
-"#,
-            name, ip, name, ip, region, name, ip, name, ip, region, name, ip, name, ip, region
+          deployer_name: '{name}'
+          deployer_ip: '{ip}'
+          deployer_region: '{region}'
+"#
         ));
     }
     config
@@ -592,6 +561,7 @@ Description=Deployed Binary Service
 After=network.target
 
 [Service]
+Environment="LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2"
 ExecStart=/home/ubuntu/binary --hosts=/home/ubuntu/hosts.yaml --config=/home/ubuntu/config.conf
 TimeoutStopSec=60
 Restart=always
@@ -699,319 +669,4 @@ RandomizedDelaySec=10s
 
 [Install]
 WantedBy=timers.target
-"#;
-
-/// Expose memory usage via Prometheus metrics
-pub const MEMLEAK_AGENT_SCRIPT: &str = r#"#!/bin/bash
-set -e
-
-SERVICE_NAME="binary.service"
-METRICS_PORT=9200
-METRICS_PATH="/metrics"
-FIFO_PATH="/tmp/memleak_fifo"
-METRICS_FILE="/tmp/memleak_metrics"
-MEMLEAK_REPORT_INTERVAL=60 # seconds between leak reports
-
-# Ensure we have a clean environment
-cleanup() {
-  echo "Cleaning up..."
-  # Kill the HTTP server if running
-  if [ -n "$HTTP_PID" ]; then
-    kill $HTTP_PID 2>/dev/null || true
-  fi
-  # Kill memleak if running
-  if [ -n "$MEMLEAK_PID" ]; then
-    sudo kill $MEMLEAK_PID 2>/dev/null || true
-  fi
-  # Kill parser if running
-  if [ -n "$PARSER_PID" ]; then
-    kill $PARSER_PID 2>/dev/null || true
-  fi
-  # Remove temporary files
-  rm -f "$METRICS_FILE"
-  rm -f "$FIFO_PATH"
-  exit 0
-}
-
-trap cleanup SIGINT SIGTERM EXIT
-
-# Create a named pipe for memleak output
-[ -p "$FIFO_PATH" ] || mkfifo "$FIFO_PATH"
-
-# Start a simple HTTP server to expose metrics
-start_http_server() {
-  echo "Starting HTTP server on port $METRICS_PORT..."
-  # Use netcat to create a simple HTTP server
-  while true; do
-    echo -e "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n$(cat $METRICS_FILE)" | nc -l -p $METRICS_PORT -q 1
-  done
-}
-
-# Initialize metrics file with metadata
-init_metrics() {
-  cat > "$METRICS_FILE" << EOF
-# HELP inuse_bytes Memory allocated on the heap
-# TYPE inuse_bytes gauge
-# HELP inuse_objects Number of objects allocated on the heap
-# TYPE inuse_objects gauge
-EOF
-}
-
-# Start memleak in continuous mode with output to a named pipe
-start_memleak() {
-  local pid=$1
-
-  echo "Starting continuous memleak monitoring for PID $pid..."
-
-  # Start memleak in background with continuous monitoring
-  sudo memleak-bpfcc -p $pid $MEMLEAK_REPORT_INTERVAL > "$FIFO_PATH" 2>/dev/null &
-  MEMLEAK_PID=$!
-  echo "Memleak started with PID $MEMLEAK_PID"
-}
-
-# Start the output parser
-start_parser() {
-  echo "Starting parser process to watch memleak output..."
-
-  # This function runs as a separate process to read from the FIFO
-  # and update metrics whenever a new complete report is available
-  (
-    # Variables to track parsing state
-    CURRENT_SNAPSHOT=""
-    IN_SNAPSHOT=0
-
-    # Read the FIFO line by line
-    while IFS= read -r line; do
-      # Look for timestamp marker that indicates the start of a new report
-      if [[ "$line" =~ \[([0-9]{2}:[0-9]{2}:[0-9]{2})\] ]]; then
-        # If we were already in a snapshot, this means we've finished one
-        # and are starting a new one, so process the completed snapshot
-        if [ $IN_SNAPSHOT -eq 1 ] && [ -n "$CURRENT_SNAPSHOT" ]; then
-          process_snapshot "$CURRENT_SNAPSHOT"
-        fi
-
-        # Start a new snapshot
-        CURRENT_SNAPSHOT="$line"
-        IN_SNAPSHOT=1
-      elif [ $IN_SNAPSHOT -eq 1 ]; then
-        # Add line to current snapshot
-        CURRENT_SNAPSHOT="$CURRENT_SNAPSHOT
-  $line"
-      fi
-    done < "$FIFO_PATH"
-  ) &
-  PARSER_PID=$!
-  echo "Parser started with PID $PARSER_PID"
-}
-
-process_snapshot() {
-  local snapshot="$1"
-
-  # Use awk to parse the snapshot, demangle function names, and extract metrics
-  awk '
-  BEGIN {
-    in_leak_section = 0;
-  }
-
-  # Start processing when we hit the leak section
-  /Top [0-9]+ stacks with outstanding allocations/ {
-    in_leak_section = 1;
-    next;
-  }
-
-  # Match allocation summary lines
-  /^\s*([0-9]+) bytes in ([0-9]+) allocations/ {
-    if (!in_leak_section) next;
-
-    # Capture bytes and objects
-    bytes = $1;
-    objects = $4;
-
-    # Get indentation level of the summary line
-    if (match($0, /^(\s+)/, arr)) {
-      summary_indent = length(arr[1]);
-    } else {
-      summary_indent = 0;
-    }
-
-    # Reset stack for this allocation
-    stack = "";
-    getline; # Move to the next line (should be a stack frame or something else)
-
-    # Collect stack frames with greater indentation
-    while (match($0, /^(\s+)/, arr) && length(arr[1]) > summary_indent) {
-      frame = $0;
-      sub(/^\s+/, "", frame); # Remove leading whitespace
-      gsub(/\+0x[0-9a-f]+ \[[^\]]+\]/, "", frame); # Remove offsets and addresses
-
-      # Demangle Rust names
-      gsub(/\$LT\$/, "<", frame);           # Replace $LT$ with < for generics
-      gsub(/\$GT\$/, ">", frame);           # Replace $GT$ with > for generics
-      gsub(/\$u20\$/, " ", frame);          # Replace $u20$ with space
-      gsub(/\.\./, "::", frame);            # Replace .. with :: for namespace separation
-      gsub(/\$u7b\$/, "{", frame);          # Replace $u7b$ with { for closures
-      gsub(/\$u7d\$/, "}", frame);          # Replace $u7d$ with } for closures
-      gsub(/\$C\$/, ",", frame);            # Replace $C$ with , for type parameters
-      sub(/{{vtable.shim}}/, "[vtable]", frame); # Simplify vtable shim notation
-      sub(/\.llvm\.[0-9]+/, "", frame);     # Remove .llvm. followed by numbers
-      sub(/::h[0-9a-f]{16}$/, "", frame);   # Remove trailing hash (e.g., h29386cbb7d39e082)
-      gsub(/_</, "<", frame);               # Remove underscore before < for impl/trait
-      gsub(/_{{closure}}/, "[closure]", frame); # Remove underscore before {{closure}}
-
-      # Handle C++-style mangled names (basic simplification)
-      if (frame ~ /^_ZN/) {
-        sub(/^_ZN/, "", frame);             # Remove _ZN prefix
-        gsub(/[0-9]+/, "", frame);          # Remove numbers (length prefixes)
-        gsub(/_/, "::", frame);             # Replace underscores with ::
-      }
-
-      # Remove any remaining leading underscores
-      sub(/^_/, "", frame);
-
-      # Build the stack string
-      if (stack == "") {
-        stack = frame;
-      } else {
-        stack = stack ";" frame;
-      }
-
-      if (getline <= 0) break; # Exit if no more lines
-    }
-
-    # Output metrics if we have a stack
-    if (stack != "") {
-      printf("inuse_bytes{source=\"%s\"} %d\n", stack, bytes);
-      printf("inuse_objects{source=\"%s\"} %d\n", stack, objects);
-    }
-
-    # Note: After the while loop, awk continues with the next line,
-    # which should be the next allocation summary or end of input
-  }
-  ' <<< "$snapshot" > "$METRICS_FILE.new"
-
-  # Add metadata back to the beginning of the file
-  init_metrics > "$METRICS_FILE.tmp"
-  cat "$METRICS_FILE.new" >> "$METRICS_FILE.tmp"
-  mv "$METRICS_FILE.tmp" "$METRICS_FILE"
-  rm -f "$METRICS_FILE.new"
-
-  # Log that we've processed a new snapshot
-  echo "Processed new memleak snapshot at $(date)"
-}
-
-# Function to check if memleak is still running
-check_memleak() {
-  if [ -n "$MEMLEAK_PID" ] && ! ps -p $MEMLEAK_PID > /dev/null; then
-    echo "Memleak process $MEMLEAK_PID is no longer running. Restarting..." >&2
-    MEMLEAK_PID=""
-    return 1
-  fi
-  return 0
-}
-
-# Function to check if parser is still running
-check_parser() {
-  if [ -n "$PARSER_PID" ] && ! ps -p $PARSER_PID > /dev/null; then
-    echo "Parser process $PARSER_PID is no longer running. Restarting..." >&2
-    PARSER_PID=""
-    return 1
-  fi
-  return 0
-}
-
-# Function to check if binary is still running
-check_binary() {
-  if ! ps -p $BINARY_PID > /dev/null; then
-    echo "Binary process $BINARY_PID is no longer running. Getting new PID..." >&2
-    BINARY_PID=$(systemctl show --property MainPID ${SERVICE_NAME} | cut -d= -f2)
-    if [ -z "$BINARY_PID" ] || [ "$BINARY_PID" -eq 0 ]; then
-      echo "Error: Could not get PID for ${SERVICE_NAME}. Waiting..." >&2
-      return 1
-    fi
-    echo "New binary PID: $BINARY_PID" >&2
-    # If binary changed, restart memleak
-    if [ -n "$MEMLEAK_PID" ]; then
-      sudo kill $MEMLEAK_PID 2>/dev/null || true
-      MEMLEAK_PID=""
-    fi
-    return 1
-  fi
-  return 0
-}
-
-# Main execution
-echo "Starting continuous memory leak monitoring on port $METRICS_PORT..."
-
-# Initialize metrics file
-init_metrics
-
-# Start HTTP server in background
-start_http_server &
-HTTP_PID=$!
-echo "HTTP server started with PID $HTTP_PID"
-
-# Get the PID of the binary service
-BINARY_PID=$(systemctl show --property MainPID ${SERVICE_NAME} | cut -d= -f2)
-if [ -z "$BINARY_PID" ] || [ "$BINARY_PID" -eq 0 ]; then
-  echo "Error: Could not get PID for ${SERVICE_NAME}. Waiting for service to start..." >&2
-
-  # Wait for service to start, checking every 10 seconds
-  while true; do
-    BINARY_PID=$(systemctl show --property MainPID ${SERVICE_NAME} | cut -d= -f2)
-    if [ -n "$BINARY_PID" ] && [ "$BINARY_PID" -ne 0 ]; then
-      echo "Service started with PID $BINARY_PID"
-      break
-    fi
-    sleep 10
-  done
-fi
-
-# Start the parser process
-start_parser
-
-# Start memleak with the binary PID
-start_memleak $BINARY_PID
-
-# Main monitoring loop - check status and restart processes if needed
-echo "Continuous monitoring active. Checking process health every 30 seconds..."
-while true; do
-  # Check binary status
-  check_binary || {
-    # If binary PID changed, restart memleak
-    if [ -n "$BINARY_PID" ]; then
-      start_memleak $BINARY_PID
-    fi
-  }
-
-  # Make sure memleak is running
-  check_memleak || {
-    if [ -n "$BINARY_PID" ]; then
-      start_memleak $BINARY_PID
-    fi
-  }
-
-  # Make sure parser is running
-  check_parser || start_parser
-
-  # Wait before next check
-  sleep 30
-done
-"#;
-
-/// Systemd service file content for the Memleak agent script
-pub const MEMLEAK_AGENT_SERVICE: &str = r#"
-[Unit]
-Description=Memleak Agent (BCC Script Runner)
-Wants=network-online.target
-After=network-online.target binary.service
-
-[Service]
-ExecStart=/home/ubuntu/memleak-agent.sh
-TimeoutStopSec=60
-Restart=always
-User=ubuntu
-LimitNOFILE=infinity
-
-[Install]
-WantedBy=multi-user.target
 "#;

@@ -1,15 +1,25 @@
 //! Different variants of the BLS signature scheme.
 
-use super::group::{
-    Point, DST, G1, G1_MESSAGE, G1_PROOF_OF_POSSESSION, G2, G2_MESSAGE, G2_PROOF_OF_POSSESSION,
+use super::{
+    group::{
+        Point, DST, G1, G1_MESSAGE, G1_PROOF_OF_POSSESSION, G2, G2_MESSAGE, G2_PROOF_OF_POSSESSION,
+        GT,
+    },
+    Error,
 };
-use super::Error;
 use crate::bls12381::primitives::group::{Element, Scalar};
-use blst::{Pairing as blst_pairing, BLS12_381_NEG_G1, BLS12_381_NEG_G2};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+use blst::{
+    blst_final_exp, blst_fp12, blst_miller_loop, Pairing as blst_pairing, BLS12_381_NEG_G1,
+    BLS12_381_NEG_G2,
+};
 use commonware_codec::FixedSize;
-use rand::{CryptoRng, RngCore};
-use std::fmt::Debug;
-use std::hash::Hash;
+use core::{
+    fmt::{Debug, Formatter},
+    hash::Hash,
+};
+use rand_core::CryptoRngCore;
 
 /// A specific instance of a signature scheme.
 pub trait Variant: Clone + Send + Sync + Hash + Eq + Debug + 'static {
@@ -33,12 +43,15 @@ pub trait Variant: Clone + Send + Sync + Hash + Eq + Debug + 'static {
     ) -> Result<(), Error>;
 
     /// Verify a batch of signatures from the provided public keys and pre-hashed messages.
-    fn batch_verify<R: RngCore + CryptoRng>(
+    fn batch_verify<R: CryptoRngCore>(
         rng: &mut R,
         publics: &[Self::Public],
         hms: &[Self::Signature],
         signatures: &[Self::Signature],
     ) -> Result<(), Error>;
+
+    /// Compute the pairing `e(G1, G2) -> GT`.
+    fn pairing(public: &Self::Public, signature: &Self::Signature) -> GT;
 }
 
 /// A [Variant] with a public key of type [G1] and a signature of type [G2].
@@ -114,7 +127,7 @@ impl Variant for MinPk {
     /// the batch verification succeeds.
     ///
     /// Source: <https://ethresear.ch/t/security-of-bls-batch-verification/10748>
-    fn batch_verify<R: RngCore + CryptoRng>(
+    fn batch_verify<R: CryptoRngCore>(
         rng: &mut R,
         publics: &[Self::Public],
         hms: &[Self::Signature],
@@ -130,7 +143,7 @@ impl Variant for MinPk {
         // Generate random non-zero scalars.
         let scalars: Vec<Scalar> = (0..publics.len())
             .map(|_| loop {
-                let scalar = Scalar::rand(rng);
+                let scalar = Scalar::from_rand(rng);
                 if scalar != Scalar::zero() {
                     return scalar;
                 }
@@ -165,10 +178,24 @@ impl Variant for MinPk {
         }
         Ok(())
     }
+
+    /// Compute the pairing `e(public, signature) -> GT`.
+    fn pairing(public: &Self::Public, signature: &Self::Signature) -> GT {
+        let p1_affine = public.as_blst_p1_affine();
+        let p2_affine = signature.as_blst_p2_affine();
+
+        let mut result = blst_fp12::default();
+        unsafe {
+            blst_miller_loop(&mut result, &p2_affine, &p1_affine);
+            blst_final_exp(&mut result, &result);
+        }
+
+        GT::from_blst_fp12(result)
+    }
 }
 
 impl Debug for MinPk {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MinPk").finish()
     }
 }
@@ -246,7 +273,7 @@ impl Variant for MinSig {
     /// the batch verification succeeds.
     ///
     /// Source: <https://ethresear.ch/t/security-of-bls-batch-verification/10748>
-    fn batch_verify<R: RngCore + CryptoRng>(
+    fn batch_verify<R: CryptoRngCore>(
         rng: &mut R,
         publics: &[Self::Public],
         hms: &[Self::Signature],
@@ -262,7 +289,7 @@ impl Variant for MinSig {
         // Generate random non-zero scalars.
         let scalars: Vec<Scalar> = (0..publics.len())
             .map(|_| loop {
-                let scalar = Scalar::rand(rng);
+                let scalar = Scalar::from_rand(rng);
                 if scalar != Scalar::zero() {
                     return scalar;
                 }
@@ -297,10 +324,24 @@ impl Variant for MinSig {
         }
         Ok(())
     }
+
+    /// Compute the pairing `e(signature, public) -> GT`.
+    fn pairing(public: &Self::Public, signature: &Self::Signature) -> GT {
+        let p1_affine = signature.as_blst_p1_affine();
+        let p2_affine = public.as_blst_p2_affine();
+
+        let mut result = blst_fp12::default();
+        unsafe {
+            blst_miller_loop(&mut result, &p2_affine, &p1_affine);
+            blst_final_exp(&mut result, &result);
+        }
+
+        GT::from_blst_fp12(result)
+    }
 }
 
 impl Debug for MinSig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MinSig").finish()
     }
 }

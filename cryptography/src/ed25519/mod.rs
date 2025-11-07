@@ -1,4 +1,4 @@
-//! Ed25519 implementation of the `Scheme` trait.
+//! Ed25519 implementation of the [crate::Verifier] and [crate::Signer] traits.
 //!
 //! This implementation uses the `ed25519-consensus` crate to adhere to a strict
 //! set of validation rules for Ed25519 signatures (which is necessary for
@@ -7,11 +7,11 @@
 //!
 //! # Example
 //! ```rust
-//! use commonware_cryptography::{Ed25519, Signer, Verifier};
+//! use commonware_cryptography::{ed25519, PrivateKey, PublicKey, Signature, PrivateKeyExt as _, Verifier as _, Signer as _};
 //! use rand::rngs::OsRng;
 //!
 //! // Generate a new private key
-//! let mut signer = Ed25519::new(&mut OsRng);
+//! let mut signer = ed25519::PrivateKey::from_rng(&mut OsRng);
 //!
 //! // Create a message to sign
 //! let namespace = Some(&b"demo"[..]);
@@ -21,9 +21,11 @@
 //! let signature = signer.sign(namespace, msg);
 //!
 //! // Verify the signature
-//! assert!(Ed25519::verify(namespace, msg, &signer.public_key(), &signature));
+//! assert!(signer.public_key().verify(namespace, msg, &signature));
 //! ```
 
 mod scheme;
 
-pub use scheme::{Ed25519, Ed25519Batch, PrivateKey, PublicKey, Signature};
+#[cfg(feature = "std")]
+pub use scheme::Batch;
+pub use scheme::{PrivateKey, PublicKey, Signature};

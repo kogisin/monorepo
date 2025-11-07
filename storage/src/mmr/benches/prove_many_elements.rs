@@ -1,30 +1,34 @@
-use commonware_cryptography::{sha256, Digest as _, Hasher, Sha256};
-use commonware_storage::mmr::{hasher::Standard, mem::Mmr};
+use commonware_cryptography::{sha256, Digest as _, Sha256};
+use commonware_storage::mmr::{
+    location::LocationRangeExt as _, mem::Mmr, Location, StandardHasher,
+};
 use criterion::{criterion_group, Criterion};
 use futures::executor::block_on;
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 
 const SAMPLE_SIZE: usize = 100;
 
+#[cfg(not(full_bench))]
+const N_LEAVES: [usize; 2] = [10_000, 100_000];
+#[cfg(full_bench)]
+const N_LEAVES: [usize; 5] = [10_000, 100_000, 1_000_000, 5_000_000, 10_000_000];
+
 fn bench_prove_many_elements(c: &mut Criterion) {
-    for n in [10_000, 100_000, 1_000_000, 5_000_000, 10_000_000] {
+    for n in N_LEAVES {
         // Populate MMR
         let mut mmr = Mmr::<Sha256>::new();
-        let mut positions = Vec::with_capacity(n);
         let mut elements = Vec::with_capacity(n);
         let mut sampler = StdRng::seed_from_u64(0);
-        let mut hasher = Sha256::new();
-        let mut hasher = Standard::new(&mut hasher);
+        let mut hasher = StandardHasher::new();
 
         block_on(async {
-            for i in 0..n {
+            for _ in 0..n {
                 let element = sha256::Digest::random(&mut sampler);
-                let pos = mmr.add(&mut hasher, &element).await.unwrap();
-                positions.push((i, pos));
+                mmr.add(&mut hasher, &element);
                 elements.push(element);
             }
         });
-        let root_digest = mmr.root(&mut hasher);
+        let root = mmr.root(&mut hasher);
 
         // Generate SAMPLE_SIZE random starts without replacement and create/verify range proofs
         for range in [2, 5, 10, 25, 50, 100, 250, 500, 1_000, 5_000] {
@@ -39,37 +43,32 @@ fn bench_prove_many_elements(c: &mut Criterion) {
                 |b| {
                     b.iter_batched(
                         || {
-                            let start_positions = &positions[0..n - range];
-                            let starts = start_positions
+                            let start_locs: Vec<u64> = (0u64..n as u64 - range).collect();
+                            let start_loc_samples = start_locs
                                 .choose_multiple(&mut sampler, SAMPLE_SIZE)
                                 .cloned()
                                 .collect::<Vec<_>>();
                             let mut samples = Vec::with_capacity(SAMPLE_SIZE);
                             block_on(async {
-                                for (start_index, start_pos) in starts {
-                                    let end_index = start_index + range;
-                                    let end_pos = positions[end_index].1;
-                                    samples.push(((start_index, end_index), (start_pos, end_pos)));
+                                for start_index in start_loc_samples {
+                                    let leaf_range = Location::new(start_index).unwrap()
+                                        ..Location::new(start_index + range).unwrap();
+                                    samples.push(leaf_range);
                                 }
                                 samples
                             })
                         },
                         |samples| {
-                            let mut hasher = Sha256::new();
-                            let mut hasher = Standard::new(&mut hasher);
+                            let mut hasher = StandardHasher::<Sha256>::new();
                             block_on(async {
-                                for ((start_index, end_index), (start_pos, end_pos)) in samples {
-                                    let proof = mmr.range_proof(start_pos, end_pos).await.unwrap();
-                                    assert!(proof
-                                        .verify_range_inclusion(
-                                            &mut hasher,
-                                            &elements[start_index..=end_index],
-                                            start_pos,
-                                            end_pos,
-                                            &root_digest,
-                                        )
-                                        .await
-                                        .unwrap());
+                                for range in samples {
+                                    let proof = mmr.range_proof(range.clone()).unwrap();
+                                    assert!(proof.verify_range_inclusion(
+                                        &mut hasher,
+                                        &elements[range.to_usize_range()],
+                                        range.start,
+                                        &root,
+                                    ));
                                 }
                             })
                         },

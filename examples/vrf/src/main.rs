@@ -79,13 +79,19 @@
 mod handlers;
 
 use clap::{value_parser, Arg, Command};
-use commonware_cryptography::{Ed25519, Signer};
-use commonware_p2p::authenticated::{self, Network};
+use commonware_cryptography::{
+    ed25519::{PrivateKey, PublicKey},
+    PrivateKeyExt as _, Signer as _,
+};
+use commonware_p2p::{authenticated::discovery, Manager};
 use commonware_runtime::{tokio, Metrics, Runner};
-use commonware_utils::{quorum, NZU32};
+use commonware_utils::{quorum, set::Ordered, NZU32};
 use governor::Quota;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::{str::FromStr, time::Duration};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    str::FromStr,
+    time::Duration,
+};
 use tracing::info;
 
 // Unique namespace to avoid message replay attacks.
@@ -164,7 +170,7 @@ fn main() {
         panic!("Identity not well-formed");
     }
     let key = parts[0].parse::<u64>().expect("Key not well-formed");
-    let signer = Ed25519::from_seed(key);
+    let signer = PrivateKey::from_seed(key);
     tracing::info!(key = ?signer.public_key(), "loaded signer");
 
     // Configure my port
@@ -172,7 +178,6 @@ fn main() {
     tracing::info!(port, "loaded port");
 
     // Configure allowed peers
-    let mut recipients = Vec::new();
     let participants = matches
         .get_many::<u64>("participants")
         .expect("Please provide allowed keys")
@@ -180,11 +185,14 @@ fn main() {
     if participants.len() == 0 {
         panic!("Please provide at least one participant");
     }
-    for peer in participants {
-        let verifier = Ed25519::from_seed(peer).public_key();
-        tracing::info!(key = ?verifier, "registered authorized key",);
-        recipients.push(verifier);
-    }
+    let recipients = participants
+        .into_iter()
+        .map(|peer| {
+            let verifier = PrivateKey::from_seed(peer).public_key();
+            tracing::info!(key = ?verifier, "registered authorized key",);
+            verifier
+        })
+        .collect::<Ordered<_>>();
 
     // Configure bootstrappers (if provided)
     let bootstrappers = matches.get_many::<String>("bootstrappers");
@@ -195,7 +203,7 @@ fn main() {
             let bootstrapper_key = parts[0]
                 .parse::<u64>()
                 .expect("Bootstrapper key not well-formed");
-            let verifier = Ed25519::from_seed(bootstrapper_key).public_key();
+            let verifier = PrivateKey::from_seed(bootstrapper_key).public_key();
             let bootstrapper_address =
                 SocketAddr::from_str(parts[1]).expect("Bootstrapper address not well-formed");
             bootstrapper_identities.push((verifier, bootstrapper_address));
@@ -204,7 +212,7 @@ fn main() {
 
     // Configure network
     const MAX_MESSAGE_SIZE: usize = 1024 * 1024; // 1 MB
-    let p2p_cfg = authenticated::Config::aggressive(
+    let p2p_cfg = discovery::Config::local(
         signer.clone(),
         APPLICATION_NAMESPACE,
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
@@ -215,13 +223,14 @@ fn main() {
 
     // Start context
     executor.start(|context| async move {
-        let (mut network, mut oracle) = Network::new(context.with_label("network"), p2p_cfg);
+        let (mut network, mut oracle) =
+            discovery::Network::new(context.with_label("network"), p2p_cfg);
 
         // Provide authorized peers
         //
         // In a real-world scenario, this would be updated as new peer sets are created (like when
         // the composition of a validator set changes).
-        oracle.register(0, recipients).await;
+        oracle.update(0, recipients).await;
 
         // Parse contributors
         let mut contributors = Vec::new();
@@ -233,7 +242,7 @@ fn main() {
             panic!("Please provide at least one contributor");
         }
         for peer in participants {
-            let verifier = Ed25519::from_seed(peer).public_key();
+            let verifier = PrivateKey::from_seed(peer).public_key();
             tracing::info!(key = ?verifier, "registered contributor",);
             contributors.push(verifier);
         }
@@ -244,7 +253,6 @@ fn main() {
 
         // Check if I am the arbiter
         const DEFAULT_MESSAGE_BACKLOG: usize = 256;
-        const COMPRESSION_LEVEL: Option<i32> = Some(3);
         const DKG_FREQUENCY: Duration = Duration::from_secs(10);
         const DKG_PHASE_TIMEOUT: Duration = Duration::from_secs(1);
         if let Some(arbiter) = matches.get_one::<u64>("arbiter") {
@@ -256,15 +264,14 @@ fn main() {
                 handlers::DKG_CHANNEL,
                 Quota::per_second(NZU32!(10)),
                 DEFAULT_MESSAGE_BACKLOG,
-                COMPRESSION_LEVEL,
             );
-            let arbiter = Ed25519::from_seed(*arbiter).public_key();
+            let arbiter = PrivateKey::from_seed(*arbiter).public_key();
             let (contributor, requests) = handlers::Contributor::new(
                 context.with_label("contributor"),
                 signer,
                 DKG_PHASE_TIMEOUT,
                 arbiter,
-                contributors.clone(),
+                contributors.clone().into_iter().collect(),
                 corrupt,
                 lazy,
                 forger,
@@ -276,7 +283,6 @@ fn main() {
                 handlers::VRF_CHANNEL,
                 Quota::per_second(NZU32!(10)),
                 DEFAULT_MESSAGE_BACKLOG,
-                None,
             );
             let signer = handlers::Vrf::new(
                 context.with_label("signer"),
@@ -291,13 +297,12 @@ fn main() {
                 handlers::DKG_CHANNEL,
                 Quota::per_second(NZU32!(10)),
                 DEFAULT_MESSAGE_BACKLOG,
-                COMPRESSION_LEVEL,
             );
-            let arbiter: handlers::Arbiter<_, Ed25519> = handlers::Arbiter::new(
+            let arbiter: handlers::Arbiter<_, PublicKey> = handlers::Arbiter::new(
                 context.with_label("arbiter"),
                 DKG_FREQUENCY,
                 DKG_PHASE_TIMEOUT,
-                contributors,
+                contributors.into_iter().collect(),
             );
             arbiter.start(arbiter_sender, arbiter_receiver);
         }

@@ -2,10 +2,10 @@ pub(crate) mod audited;
 pub(crate) mod deterministic;
 pub(crate) mod metered;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "iouring-network")))]
 pub(crate) mod tokio;
 
-#[cfg(feature = "iouring-network")]
+#[cfg(all(not(target_arch = "wasm32"), feature = "iouring-network"))]
 pub(crate) mod iouring;
 
 #[cfg(test)]
@@ -97,7 +97,6 @@ mod tests {
             for _ in 0..3 {
                 let (_, mut sink, mut stream) = listener.accept().await.expect("Failed to accept");
 
-                // runtime.spawn(async move {
                 let read = stream
                     .recv(vec![0; CLIENT_SEND_DATA.len()])
                     .await

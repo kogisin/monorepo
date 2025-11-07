@@ -1,8 +1,10 @@
+use crate::Scheme;
 use commonware_consensus::{
-    threshold_simplex::types::{Activity, Context, View},
+    simplex::types::{Activity, Context},
+    types::{Epoch, Round},
     Automaton as Au, Relay as Re, Reporter,
 };
-use commonware_cryptography::{bls12381::primitives::variant::MinSig, Digest};
+use commonware_cryptography::{ed25519::PublicKey, Digest};
 use futures::{
     channel::{mpsc, oneshot},
     SinkExt,
@@ -11,10 +13,11 @@ use futures::{
 #[allow(clippy::large_enum_variant)]
 pub enum Message<D: Digest> {
     Genesis {
+        epoch: Epoch,
         response: oneshot::Sender<D>,
     },
     Propose {
-        index: View,
+        round: Round,
         response: oneshot::Sender<D>,
     },
     Verify {
@@ -22,7 +25,7 @@ pub enum Message<D: Digest> {
         response: oneshot::Sender<bool>,
     },
     Report {
-        activity: Activity<MinSig, D>,
+        activity: Activity<Scheme, D>,
     },
 }
 
@@ -40,24 +43,27 @@ impl<D: Digest> Mailbox<D> {
 
 impl<D: Digest> Au for Mailbox<D> {
     type Digest = D;
-    type Context = Context<Self::Digest>;
+    type Context = Context<Self::Digest, PublicKey>;
 
-    async fn genesis(&mut self) -> Self::Digest {
+    async fn genesis(&mut self, epoch: Epoch) -> Self::Digest {
         let (response, receiver) = oneshot::channel();
         self.sender
-            .send(Message::Genesis { response })
+            .send(Message::Genesis { epoch, response })
             .await
             .expect("Failed to send genesis");
         receiver.await.expect("Failed to receive genesis")
     }
 
-    async fn propose(&mut self, context: Context<Self::Digest>) -> oneshot::Receiver<Self::Digest> {
+    async fn propose(
+        &mut self,
+        context: Context<Self::Digest, PublicKey>,
+    ) -> oneshot::Receiver<Self::Digest> {
         // If we linked payloads to their parent, we would include
         // the parent in the `Context` in the payload.
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(Message::Propose {
-                index: context.view,
+                round: context.round,
                 response,
             })
             .await
@@ -67,7 +73,7 @@ impl<D: Digest> Au for Mailbox<D> {
 
     async fn verify(
         &mut self,
-        _: Context<Self::Digest>,
+        _: Context<Self::Digest, PublicKey>,
         payload: Self::Digest,
     ) -> oneshot::Receiver<bool> {
         // If we linked payloads to their parent, we would verify
@@ -93,7 +99,7 @@ impl<D: Digest> Re for Mailbox<D> {
 }
 
 impl<D: Digest> Reporter for Mailbox<D> {
-    type Activity = Activity<MinSig, D>;
+    type Activity = Activity<Scheme, D>;
 
     async fn report(&mut self, activity: Self::Activity) {
         self.sender

@@ -1,7 +1,7 @@
 //! Implementations of Codec for byte types.
 //!
 //! For portability and consistency between architectures,
-//! the length of the [`Bytes`] must fit within a [`u32`].
+//! the length of the [Bytes] must fit within a [u32].
 
 use crate::{util::at_least, EncodeSize, Error, RangeCfg, Read, Write};
 use bytes::{Buf, BufMut, Bytes};
@@ -22,7 +22,7 @@ impl EncodeSize for Bytes {
 }
 
 impl Read for Bytes {
-    type Cfg = RangeCfg;
+    type Cfg = RangeCfg<usize>;
 
     #[inline]
     fn read_cfg(buf: &mut impl Buf, range: &Self::Cfg) -> Result<Self, Error> {
@@ -36,6 +36,8 @@ impl Read for Bytes {
 mod tests {
     use super::*;
     use crate::{Decode, Encode};
+    #[cfg(not(feature = "std"))]
+    use alloc::vec;
     use bytes::Bytes;
 
     #[test]

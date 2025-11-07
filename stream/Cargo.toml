@@ -1,37 +1,32 @@
 [package]
 name = "commonware-stream"
-edition = "2021"
+edition.workspace = true
 publish = true
-version = "0.0.53"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+license.workspace = true
 description = "Exchange messages over arbitrary transport."
 readme = "README.md"
-homepage = "https://commonware.xyz"
+homepage.workspace = true
 repository = "https://github.com/commonwarexyz/monorepo/tree/main/stream"
 documentation = "https://docs.rs/commonware-stream"
 
 [dependencies]
-commonware-codec = { workspace = true }
-commonware-cryptography = { workspace = true }
-commonware-macros = { workspace = true }
-commonware-runtime = { workspace = true }
-commonware-utils = { workspace = true }
-thiserror = { workspace = true }
-bytes = { workspace = true }
-futures = { workspace = true }
-rand = { workspace = true }
-zeroize = { workspace = true }
-chacha20poly1305 = "0.10.1"
-hkdf = "0.12.4"
+bytes.workspace = true
+chacha20poly1305 = { workspace = true, default-features = false, features = ["std", "getrandom"] }
+commonware-codec.workspace = true
+commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-macros.workspace = true
+commonware-runtime.workspace = true
+commonware-utils.workspace = true
+futures.workspace = true
+rand.workspace = true
+rand_core.workspace = true
+thiserror.workspace = true
 x25519-dalek = "2.0.1"
+zeroize.workspace = true
 
 [dev-dependencies]
-criterion = { workspace = true }
+criterion.workspace = true
 
 [lib]
 bench = false
-
-[[bench]]
-name="public_key"
-harness = false
-path = "src/public_key/benches/bench.rs"

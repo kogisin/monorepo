@@ -11,9 +11,6 @@ pub async fn send_frame<S: Sink>(
 ) -> Result<(), Error> {
     // Validate frame size
     let n = buf.len();
-    if n == 0 {
-        return Err(Error::SendZeroSize);
-    }
     if n > max_message_size {
         return Err(Error::SendTooLarge(n));
     }
@@ -39,9 +36,6 @@ pub async fn recv_frame<T: Stream>(
     let len = u32::from_be_bytes(len_buf.as_ref()[..4].try_into().unwrap()) as usize;
     if len > max_message_size {
         return Err(Error::RecvTooLarge(len));
-    }
-    if len == 0 {
-        return Err(Error::StreamClosed);
     }
 
     // Read the rest of the message
@@ -138,18 +132,6 @@ mod tests {
     }
 
     #[test]
-    fn test_send_zero_size() {
-        let (mut sink, _) = mocks::Channel::init();
-
-        let executor = deterministic::Runner::default();
-        executor.start(|_| async move {
-            let buf = [];
-            let result = send_frame(&mut sink, &buf, MAX_MESSAGE_SIZE).await;
-            assert!(matches!(&result, Err(Error::SendZeroSize)));
-        });
-    }
-
-    #[test]
     fn test_read_frame() {
         let (mut sink, mut stream) = mocks::Channel::init();
 
@@ -187,18 +169,23 @@ mod tests {
     }
 
     #[test]
-    fn test_read_zero_size() {
+    fn test_recv_frame_short_length_prefix() {
         let (mut sink, mut stream) = mocks::Channel::init();
 
         let executor = deterministic::Runner::default();
         executor.start(|_| async move {
-            // Manually insert a frame that gives zero as the size
-            let mut buf = BytesMut::with_capacity(4);
-            buf.put_u32(0);
-            sink.send(buf).await.unwrap();
+            // Manually insert a frame with a short length prefix
+            let mut buf = BytesMut::with_capacity(3);
+            buf.put_u8(0x00);
+            buf.put_u8(0x00);
+            buf.put_u8(0x00);
 
+            sink.send(buf).await.unwrap();
+            drop(sink); // Close the sink to simulate a closed stream
+
+            // Expect an error rather than a panic
             let result = recv_frame(&mut stream, MAX_MESSAGE_SIZE).await;
-            assert!(matches!(&result, Err(Error::StreamClosed)));
+            assert!(matches!(&result, Err(Error::RecvFailed(_))));
         });
     }
 }

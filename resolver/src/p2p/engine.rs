@@ -2,24 +2,25 @@ use super::{
     config::Config,
     fetcher::Fetcher,
     ingress::{Mailbox, Message},
-    metrics,
+    metrics, wire, Producer,
 };
-use super::{wire, Coordinator, Producer};
 use crate::Consumer;
 use bytes::Bytes;
+use commonware_cryptography::PublicKey;
 use commonware_macros::select;
 use commonware_p2p::{
     utils::codec::{wrap, WrappedSender},
-    Receiver, Recipients, Sender,
+    Manager, Receiver, Recipients, Sender,
 };
 use commonware_runtime::{
+    spawn_cell,
     telemetry::metrics::{
         histogram,
         status::{CounterExt, Status},
     },
-    Clock, Handle, Metrics, Spawner,
+    Clock, ContextCell, Handle, Metrics, Spawner,
 };
-use commonware_utils::{futures::Pool as FuturesPool, Array};
+use commonware_utils::{futures::Pool as FuturesPool, Span};
 use futures::{
     channel::{mpsc, oneshot},
     future::{self, Either},
@@ -31,7 +32,7 @@ use std::{collections::HashMap, marker::PhantomData};
 use tracing::{debug, error, trace, warn};
 
 /// Represents a pending serve operation.
-struct Serve<E: Clock, P: Array> {
+struct Serve<E: Clock, P: PublicKey> {
     timer: histogram::Timer<E>,
     peer: P,
     id: u64,
@@ -41,16 +42,16 @@ struct Serve<E: Clock, P: Array> {
 /// Manages incoming and outgoing P2P requests, coordinating fetch and serve operations.
 pub struct Engine<
     E: Clock + GClock + Spawner + Rng + Metrics,
-    P: Array,
-    D: Coordinator<PublicKey = P>,
-    Key: Array,
+    P: PublicKey,
+    D: Manager<PublicKey = P>,
+    Key: Span,
     Con: Consumer<Key = Key, Value = Bytes, Failure = ()>,
     Pro: Producer<Key = Key>,
     NetS: Sender<PublicKey = P>,
     NetR: Receiver<PublicKey = P>,
 > {
     /// Context used to spawn tasks, manage time, etc.
-    context: E,
+    context: ContextCell<E>,
 
     /// Consumes data that is fetched from the network
     consumer: Con,
@@ -59,7 +60,7 @@ pub struct Engine<
     producer: Pro,
 
     /// Manages the list of peers that can be used to fetch data
-    coordinator: D,
+    manager: D,
 
     /// Used to detect changes in the peer set
     last_peer_set_id: Option<u64>,
@@ -92,9 +93,9 @@ pub struct Engine<
 
 impl<
         E: Clock + GClock + Spawner + Rng + Metrics,
-        P: Array,
-        D: Coordinator<PublicKey = P>,
-        Key: Array,
+        P: PublicKey,
+        D: Manager<PublicKey = P>,
+        Key: Span,
         Con: Consumer<Key = Key, Value = Bytes, Failure = ()>,
         Pro: Producer<Key = Key>,
         NetS: Sender<PublicKey = P>,
@@ -106,6 +107,8 @@ impl<
     /// Returns the actor and a mailbox to send messages to it.
     pub fn new(context: E, cfg: Config<P, D, Key, Con, Pro>) -> (Self, Mailbox<Key>) {
         let (sender, receiver) = mpsc::channel(cfg.mailbox_size);
+
+        // TODO(#1833): Metrics should use the post-start context
         let metrics = metrics::Metrics::init(context.clone());
         let fetcher = Fetcher::new(
             context.with_label("fetcher"),
@@ -115,10 +118,10 @@ impl<
         );
         (
             Self {
-                context,
+                context: ContextCell::new(context),
                 consumer: cfg.consumer,
                 producer: cfg.producer,
-                coordinator: cfg.coordinator,
+                manager: cfg.manager,
                 last_peer_set_id: None,
                 mailbox: receiver,
                 fetcher,
@@ -139,19 +142,16 @@ impl<
     /// - Fetching data from other peers and notifying the `Consumer`
     /// - Serving data to other peers by requesting it from the `Producer`
     pub fn start(mut self, network: (NetS, NetR)) -> Handle<()> {
-        self.context.spawn_ref()(self.run(network))
+        spawn_cell!(self.context, self.run(network).await)
     }
 
     /// Inner run loop called by `start`.
     async fn run(mut self, network: (NetS, NetR)) {
         let mut shutdown = self.context.stopped();
+        let peer_set_subscription = &mut self.manager.subscribe().await;
 
         // Wrap channel
         let (mut sender, mut receiver) = wrap((), network.0, network.1);
-
-        // Set initial peer set.
-        self.last_peer_set_id = Some(self.coordinator.peer_set_id());
-        self.fetcher.reconcile(self.coordinator.peers());
 
         loop {
             // Update metrics
@@ -165,13 +165,6 @@ impl<
                 .peers_blocked
                 .set(self.fetcher.len_blocked() as i64);
             self.metrics.serve_processing.set(self.serves.len() as i64);
-
-            // Update peer list if-and-only-if it might have changed.
-            let peer_set_id = self.coordinator.peer_set_id();
-            if self.last_peer_set_id != Some(peer_set_id) {
-                self.last_peer_set_id = Some(peer_set_id);
-                self.fetcher.reconcile(self.coordinator.peers());
-            }
 
             // Get retry timeout (if any)
             let deadline_pending = match self.fetcher.get_pending_deadline() {
@@ -191,6 +184,21 @@ impl<
                     debug!("shutdown");
                     self.serves.cancel_all();
                     return;
+                },
+
+                // Handle peer set updates
+                peer_set_update = peer_set_subscription.next() => {
+                    let Some((id, _, all)) = peer_set_update else {
+                        debug!("peer set subscription closed");
+                        return;
+                    };
+
+                    // Instead of directing our requests to exclusively the latest set (which may still be syncing, we
+                    // reconcile with all tracked peers).
+                    if self.last_peer_set_id < Some(id) {
+                        self.last_peer_set_id = Some(id);
+                        self.fetcher.reconcile(all.as_ref());
+                    }
                 },
 
                 // Handle mailbox messages
@@ -221,6 +229,28 @@ impl<
                                 guard.set(Status::Success);
                                 self.fetch_timers.remove(&key).unwrap().cancel(); // must exist, don't record metric
                                 self.consumer.failed(key.clone(), ()).await;
+                            }
+                        }
+                        Message::Retain { predicate } => {
+                            trace!("mailbox: retain");
+                            let before = self.fetcher.len();
+                            self.fetcher.retain(predicate);
+                            let after = self.fetcher.len();
+                            if before == after {
+                                self.metrics.cancel.inc(Status::Dropped);
+                            } else {
+                                self.metrics.cancel.inc_by(Status::Success, before.checked_sub(after).unwrap() as u64);
+                            }
+                        }
+                        Message::Clear => {
+                            trace!("mailbox: clear");
+                            let before = self.fetcher.len();
+                            self.fetcher.clear();
+                            let after = self.fetcher.len();
+                            if before == after {
+                                self.metrics.cancel.inc(Status::Dropped);
+                            } else {
+                                self.metrics.cancel.inc_by(Status::Success, before.checked_sub(after).unwrap() as u64);
                             }
                         }
                     }

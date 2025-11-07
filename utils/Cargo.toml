@@ -1,30 +1,56 @@
 [package]
 name = "commonware-utils"
-edition = "2021"
+edition.workspace = true
 publish = true
-version = "0.0.53"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+license.workspace = true
 description = "Leverage common functionality across multiple primitives."
 readme = "README.md"
-homepage = "https://commonware.xyz"
+homepage.workspace = true
 repository = "https://github.com/commonwarexyz/monorepo/tree/main/utils"
 documentation = "https://docs.rs/commonware-utils"
 
 [dependencies]
-commonware-codec = { workspace = true }
-bytes = { workspace = true }
-futures = { workspace = true }
-rand = { workspace = true }
-thiserror = { workspace = true }
+bytes.workspace = true
+cfg-if.workspace = true
+commonware-codec = { workspace = true, default-features = false }
+futures = { workspace = true, optional = true }
+num-bigint = { workspace = true, optional = true }
+num-integer = { workspace = true, optional = true }
+num-rational = { workspace = true, optional = true }
+num-traits = { workspace = true, optional = true }
+rand.workspace = true
+thiserror.workspace = true
 
-# Enable "js" feature when WASM is target
 [target.'cfg(target_arch = "wasm32")'.dependencies.getrandom]
+# Enable "js" feature when WASM is target
 version = "0.2.15"
 features = ["js"]
 
 [dev-dependencies]
-num-bigint = "0.4.6"
+criterion.workspace = true
+num-bigint = { version = "0.4.6", default-features = false }
+
+[features]
+default = ["std"]
+std = [
+    "rand/std",
+    "rand/std_rng",
+    "thiserror/std",
+    "bytes/std",
+    "commonware-codec/std",
+    "futures",
+    "num-bigint",
+    "num-rational",
+    "num-integer",
+    "num-traits",
+]
 
 [lib]
 bench = false
 crate-type = ["rlib", "cdylib"]
+
+[[bench]]
+name = "utils"
+harness = false
+path = "src/benches/bench.rs"

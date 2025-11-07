@@ -1,11 +1,17 @@
+//! Mock application used by `simplex` tests to produce and verify payloads,
+//! simulating proposal/verification latency and broadcasting via a mock relay.
+
 use super::relay::Relay;
-use crate::{simplex::types::Context, Automaton as Au, Relay as Re};
-use bytes::{Buf, BufMut, Bytes};
-use commonware_codec::{FixedSize, ReadExt};
-use commonware_cryptography::{Digest, Hasher};
+use crate::{
+    simplex::types::Context,
+    types::{Epoch, Round},
+    Automaton as Au, Relay as Re,
+};
+use bytes::Bytes;
+use commonware_codec::{DecodeExt, Encode};
+use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_macros::select;
-use commonware_runtime::{Clock, Handle, Spawner};
-use commonware_utils::Array;
+use commonware_runtime::{spawn_cell, Clock, ContextCell, Handle, Spawner};
 use futures::{
     channel::{mpsc, oneshot},
     SinkExt, StreamExt,
@@ -18,16 +24,17 @@ use std::{
     time::Duration,
 };
 
-pub enum Message<D: Digest> {
+pub enum Message<D: Digest, P: PublicKey> {
     Genesis {
+        epoch: Epoch,
         response: oneshot::Sender<D>,
     },
     Propose {
-        context: Context<D>,
+        context: Context<D, P>,
         response: oneshot::Sender<D>,
     },
     Verify {
-        context: Context<D>,
+        context: Context<D, P>,
         payload: D,
         response: oneshot::Sender<bool>,
     },
@@ -37,30 +44,30 @@ pub enum Message<D: Digest> {
 }
 
 #[derive(Clone)]
-pub struct Mailbox<D: Digest> {
-    sender: mpsc::Sender<Message<D>>,
+pub struct Mailbox<D: Digest, P: PublicKey> {
+    sender: mpsc::Sender<Message<D, P>>,
 }
 
-impl<D: Digest> Mailbox<D> {
-    pub(super) fn new(sender: mpsc::Sender<Message<D>>) -> Self {
+impl<D: Digest, P: PublicKey> Mailbox<D, P> {
+    pub(super) fn new(sender: mpsc::Sender<Message<D, P>>) -> Self {
         Self { sender }
     }
 }
 
-impl<D: Digest> Au for Mailbox<D> {
+impl<D: Digest, P: PublicKey> Au for Mailbox<D, P> {
     type Digest = D;
-    type Context = Context<D>;
+    type Context = Context<D, P>;
 
-    async fn genesis(&mut self) -> Self::Digest {
+    async fn genesis(&mut self, epoch: Epoch) -> Self::Digest {
         let (response, receiver) = oneshot::channel();
         self.sender
-            .send(Message::Genesis { response })
+            .send(Message::Genesis { epoch, response })
             .await
             .expect("Failed to send genesis");
         receiver.await.expect("Failed to receive genesis")
     }
 
-    async fn propose(&mut self, context: Context<Self::Digest>) -> oneshot::Receiver<Self::Digest> {
+    async fn propose(&mut self, context: Self::Context) -> oneshot::Receiver<Self::Digest> {
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(Message::Propose { context, response })
@@ -71,7 +78,7 @@ impl<D: Digest> Au for Mailbox<D> {
 
     async fn verify(
         &mut self,
-        context: Context<Self::Digest>,
+        context: Self::Context,
         payload: Self::Digest,
     ) -> oneshot::Receiver<bool> {
         let (response, receiver) = oneshot::channel();
@@ -87,7 +94,7 @@ impl<D: Digest> Au for Mailbox<D> {
     }
 }
 
-impl<D: Digest> Re for Mailbox<D> {
+impl<D: Digest, P: PublicKey> Re for Mailbox<D, P> {
     type Digest = D;
 
     async fn broadcast(&mut self, payload: Self::Digest) {
@@ -102,7 +109,7 @@ const GENESIS_BYTES: &[u8] = b"genesis";
 
 type Latency = (f64, f64);
 
-pub struct Config<H: Hasher, P: Array> {
+pub struct Config<H: Hasher, P: PublicKey> {
     pub hasher: H,
 
     pub relay: Arc<Relay<H::Digest, P>>,
@@ -111,21 +118,21 @@ pub struct Config<H: Hasher, P: Array> {
     ///
     /// It is common to use multiple instances of an application in a single simulation, this
     /// helps to identify the source of both progress and errors.
-    pub participant: P,
+    pub me: P,
 
     pub propose_latency: Latency,
     pub verify_latency: Latency,
 }
 
-pub struct Application<E: Clock + RngCore + Spawner, H: Hasher, P: Array> {
-    context: E,
+pub struct Application<E: Clock + RngCore + Spawner, H: Hasher, P: PublicKey> {
+    context: ContextCell<E>,
     hasher: H,
-    participant: P,
+    me: P,
 
     relay: Arc<Relay<H::Digest, P>>,
     broadcast: mpsc::UnboundedReceiver<(H::Digest, Bytes)>,
 
-    mailbox: mpsc::Receiver<Message<H::Digest>>,
+    mailbox: mpsc::Receiver<Message<H::Digest, P>>,
 
     propose_latency: Normal<f64>,
     verify_latency: Normal<f64>,
@@ -135,10 +142,10 @@ pub struct Application<E: Clock + RngCore + Spawner, H: Hasher, P: Array> {
     verified: HashSet<H::Digest>,
 }
 
-impl<E: Clock + RngCore + Spawner, H: Hasher, P: Array> Application<E, H, P> {
-    pub fn new(context: E, cfg: Config<H, P>) -> (Self, Mailbox<H::Digest>) {
+impl<E: Clock + RngCore + Spawner, H: Hasher, P: PublicKey> Application<E, H, P> {
+    pub fn new(context: E, cfg: Config<H, P>) -> (Self, Mailbox<H::Digest, P>) {
         // Register self on relay
-        let broadcast = cfg.relay.register(cfg.participant.clone());
+        let broadcast = cfg.relay.register(cfg.me.clone());
 
         // Generate samplers
         let propose_latency = Normal::new(cfg.propose_latency.0, cfg.propose_latency.1).unwrap();
@@ -148,9 +155,9 @@ impl<E: Clock + RngCore + Spawner, H: Hasher, P: Array> Application<E, H, P> {
         let (sender, receiver) = mpsc::channel(1024);
         (
             Self {
-                context,
+                context: ContextCell::new(context),
                 hasher: cfg.hasher,
-                participant: cfg.participant,
+                me: cfg.me,
 
                 relay: cfg.relay,
                 broadcast,
@@ -169,12 +176,12 @@ impl<E: Clock + RngCore + Spawner, H: Hasher, P: Array> Application<E, H, P> {
     }
 
     fn panic(&self, msg: &str) -> ! {
-        panic!("[{:?}] {}", self.participant, msg);
+        panic!("[{:?}] {}", self.me, msg);
     }
 
-    fn genesis(&mut self) -> H::Digest {
-        let payload = Bytes::from(GENESIS_BYTES);
-        self.hasher.update(&payload);
+    fn genesis(&mut self, epoch: Epoch) -> H::Digest {
+        self.hasher
+            .update(&(Bytes::from(GENESIS_BYTES), epoch).encode());
         let digest = self.hasher.finalize();
         self.verified.insert(digest);
         digest
@@ -182,7 +189,7 @@ impl<E: Clock + RngCore + Spawner, H: Hasher, P: Array> Application<E, H, P> {
 
     /// When proposing a block, we do not care if the parent is verified (or even in our possession).
     /// Backfilling verification dependencies is considered out-of-scope for consensus.
-    async fn propose(&mut self, context: Context<H::Digest>) -> H::Digest {
+    async fn propose(&mut self, context: Context<H::Digest, P>) -> H::Digest {
         // Simulate the propose latency
         let duration = self.propose_latency.sample(&mut self.context);
         self.context
@@ -190,11 +197,8 @@ impl<E: Clock + RngCore + Spawner, H: Hasher, P: Array> Application<E, H, P> {
             .await;
 
         // Generate the payload
-        let payload_len = u64::SIZE + H::Digest::SIZE + u64::SIZE;
-        let mut payload = Vec::with_capacity(payload_len);
-        payload.put_u64(context.view);
-        payload.extend_from_slice(&context.parent.1);
-        payload.put_u64(self.context.gen::<u64>()); // Ensures we always have a unique payload
+        let rand = self.context.gen::<u64>();
+        let payload = (context.round, context.parent.1, rand).encode();
         self.hasher.update(&payload);
         let digest = self.hasher.finalize();
 
@@ -208,7 +212,7 @@ impl<E: Clock + RngCore + Spawner, H: Hasher, P: Array> Application<E, H, P> {
 
     async fn verify(
         &mut self,
-        context: Context<H::Digest>,
+        context: Context<H::Digest, P>,
         payload: H::Digest,
         mut contents: Bytes,
     ) -> bool {
@@ -219,23 +223,18 @@ impl<E: Clock + RngCore + Spawner, H: Hasher, P: Array> Application<E, H, P> {
             .await;
 
         // Verify contents
-        if contents.len() != 48 {
-            self.panic("invalid payload length");
-        }
-        let parsed_view = contents.get_u64();
-        if parsed_view != context.view {
+        let (parsed_round, parent, _) =
+            <(Round, H::Digest, u64)>::decode(&mut contents).expect("invalid payload");
+        if parsed_round != context.round {
             self.panic(&format!(
-                "invalid view (in payload): {} != {}",
-                parsed_view, context.view
+                "invalid round (in payload): {} != {}",
+                parsed_round, context.round
             ));
         }
-        let Ok(parent) = H::Digest::read(&mut contents) else {
-            self.panic("invalid parent");
-        };
         if parent != context.parent.1 {
             self.panic(&format!(
                 "invalid parent (in payload): {:?} != {:?}",
-                parent, &context.parent.1
+                parent, context.parent.1
             ));
         }
         // We don't care about the random number
@@ -245,13 +244,11 @@ impl<E: Clock + RngCore + Spawner, H: Hasher, P: Array> Application<E, H, P> {
 
     async fn broadcast(&mut self, payload: H::Digest) {
         let contents = self.pending.remove(&payload).expect("missing payload");
-        self.relay
-            .broadcast(&self.participant, (payload, contents))
-            .await;
+        self.relay.broadcast(&self.me, (payload, contents)).await;
     }
 
     pub fn start(mut self) -> Handle<()> {
-        self.context.spawn_ref()(self.run())
+        spawn_cell!(self.context, self.run().await)
     }
 
     async fn run(mut self) {
@@ -259,7 +256,7 @@ impl<E: Clock + RngCore + Spawner, H: Hasher, P: Array> Application<E, H, P> {
         #[allow(clippy::type_complexity)]
         let mut waiters: HashMap<
             H::Digest,
-            Vec<(Context<H::Digest>, oneshot::Sender<bool>)>,
+            Vec<(Context<H::Digest, P>, oneshot::Sender<bool>)>,
         > = HashMap::new();
         let mut seen: HashMap<H::Digest, Bytes> = HashMap::new();
 
@@ -272,8 +269,8 @@ impl<E: Clock + RngCore + Spawner, H: Hasher, P: Array> Application<E, H, P> {
                         None => break,
                     };
                     match message {
-                        Message::Genesis { response } => {
-                            let digest = self.genesis();
+                        Message::Genesis { epoch, response } => {
+                            let digest = self.genesis(epoch);
                             let _ = response.send(digest);
                         }
                         Message::Propose { context, response } => {

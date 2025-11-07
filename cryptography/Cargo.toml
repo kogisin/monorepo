@@ -1,42 +1,64 @@
 [package]
 name = "commonware-cryptography"
-edition = "2021"
+edition.workspace = true
 publish = true
-version = "0.0.53"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+license.workspace = true
 description = "Generate keys, sign arbitrary messages, and deterministically verify signatures."
 readme = "README.md"
-homepage = "https://commonware.xyz"
+homepage.workspace = true
 repository = "https://github.com/commonwarexyz/monorepo/tree/main/cryptography"
 documentation = "https://docs.rs/commonware-cryptography"
 
-[dependencies]
-commonware-codec = { workspace = true }
-commonware-utils = { workspace = true }
-bytes = { workspace = true }
-thiserror = { workspace = true }
-rand = { workspace = true }
-sha2 = { workspace = true }
-rayon = { workspace = true }
-zeroize = { workspace = true, features = ["zeroize_derive"] }
-ed25519-consensus = "2.1.0"
-blst = { version = "0.3.13", features = ["no-threads"] }
-p256 = { version = "0.13.2", features = ["ecdsa"] }
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(full_bench)'] }
 
-# Enable "js" feature when WASM is target
+[dependencies]
+blake3 = { workspace = true, features = ["zeroize"] }
+blst = { workspace = true, features = ["no-threads"] }
+bytes.workspace = true
+cfg-if.workspace = true
+chacha20poly1305 = { workspace = true, default-features = false, features = ["alloc"] }
+commonware-codec.workspace = true
+commonware-utils.workspace = true
+ed25519-consensus = { version = "2.1.0", default-features = false }
+p256 = { workspace = true, features = ["ecdsa"] }
+rand.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+rayon = { workspace = true, optional = true }
+sha2.workspace = true
+thiserror.workspace = true
+x25519-dalek = { workspace = true, features = ["zeroize"] }
+zeroize = { workspace = true, features = ["zeroize_derive"] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies.getrandom]
+# Enable "js" feature when WASM is target
 version = "0.2.15"
 features = ["js"]
 
 [dev-dependencies]
-criterion = { workspace = true }
+criterion.workspace = true
 
 [lib]
 bench = false
 crate-type = ["rlib", "cdylib"]
 
 [features]
-portable = ["blst/portable"]
+parallel = ["blake3/rayon", "rayon"]
+default = ["std"]
+std = [
+    "commonware-codec/std",
+    "commonware-utils/std",
+    "rand/std",
+    "rand/std_rng",
+    "thiserror/std",
+    "rayon",
+    "ed25519-consensus/std",
+    "p256/std",
+    "chacha20poly1305/std",
+    "chacha20poly1305/getrandom",
+]
 
 [[bench]]
 name = "bls12381"
@@ -57,3 +79,18 @@ path = "src/secp256r1/benches/bench.rs"
 name = "sha256"
 harness = false
 path = "src/sha256/benches/bench.rs"
+
+[[bench]]
+name = "blake3"
+harness = false
+path = "src/blake3/benches/bench.rs"
+
+[[bench]]
+name = "lthash"
+harness = false
+path = "src/lthash/benches/bench.rs"
+
+[[bench]]
+name = "handshake"
+harness = false
+path = "src/handshake/benches/bench.rs"

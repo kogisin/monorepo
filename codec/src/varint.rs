@@ -29,10 +29,10 @@
 //! assert_eq!(decoded, -3);
 //! ```
 
-use crate::{EncodeSize, Error, FixedSize, Read, Write};
+use crate::{EncodeSize, Error, FixedSize, Read, ReadExt, Write};
 use bytes::{Buf, BufMut};
+use core::{fmt::Debug, mem::size_of};
 use sealed::{SPrim, UPrim};
-use std::fmt::Debug;
 
 // ---------- Constants ----------
 
@@ -54,7 +54,7 @@ const CONTINUATION_BIT_MASK: u8 = 0x80;
 #[doc(hidden)]
 mod sealed {
     use super::*;
-    use std::ops::{BitOrAssign, Shl, ShrAssign};
+    use core::ops::{BitOrAssign, Shl, ShrAssign};
 
     /// A trait for unsigned integer primitives that can be varint encoded.
     pub trait UPrim:
@@ -107,17 +107,20 @@ mod sealed {
         /// This type must be the same size as the signed integer type.
         type UnsignedEquivalent: UPrim;
 
-        /// Compile-time assertion to ensure that the size of the signed integer is equal to the size of
-        /// the unsigned integer.
-        #[doc(hidden)]
-        const _COMMIT_OP_ASSERT: () =
-            assert!(std::mem::size_of::<Self>() == std::mem::size_of::<Self::UnsignedEquivalent>());
-
         /// Converts the signed integer to an unsigned integer using ZigZag encoding.
         fn as_zigzag(&self) -> Self::UnsignedEquivalent;
 
         /// Converts a (ZigZag'ed) unsigned integer back to a signed integer.
         fn un_zigzag(value: Self::UnsignedEquivalent) -> Self;
+    }
+
+    /// Asserts that two types are the same size at compile time.
+    #[inline(always)]
+    const fn assert_equal_size<T: Sized, U: Sized>() {
+        assert!(
+            size_of::<T>() == size_of::<U>(),
+            "Unsigned integer must be the same size as the signed integer"
+        );
     }
 
     // Implements the `SPrim` trait for all signed integer types.
@@ -128,11 +131,21 @@ mod sealed {
 
                 #[inline]
                 fn as_zigzag(&self) -> $utype {
-                    let shr = std::mem::size_of::<$utype>() * 8 - 1;
+                    // TODO: Re-evaluate assertion placement after `generic_const_exprs` is stable.
+                    const {
+                        assert_equal_size::<$type, $utype>();
+                    }
+
+                    let shr = size_of::<$utype>() * 8 - 1;
                     ((self << 1) ^ (self >> shr)) as $utype
                 }
                 #[inline]
                 fn un_zigzag(value: $utype) -> Self {
+                    // TODO: Re-evaluate assertion placement after `generic_const_exprs` is stable.
+                    const {
+                        assert_equal_size::<$type, $utype>();
+                    }
+
                     ((value >> 1) as $type) ^ (-((value & 1) as $type))
                 }
             }
@@ -257,10 +270,7 @@ fn read<T: UPrim>(buf: &mut impl Buf) -> Result<T, Error> {
     // Loop over all the bytes.
     loop {
         // Read the next byte.
-        if !buf.has_remaining() {
-            return Err(Error::EndOfBuffer);
-        }
-        let byte = buf.get_u8();
+        let byte = u8::read(buf)?;
 
         // If this is not the first byte, but the byte is completely zero, we have an invalid
         // varint. This is because this byte has no data bits and no continuation, so there was no
@@ -299,7 +309,7 @@ fn read<T: UPrim>(buf: &mut impl Buf) -> Result<T, Error> {
 
 /// Calculates the number of bytes needed to encode an unsigned integer as a varint.
 fn size<T: UPrim>(value: T) -> usize {
-    let total_bits = std::mem::size_of::<T>() * 8;
+    let total_bits = size_of::<T>() * 8;
     let leading_zeros = value.leading_zeros() as usize;
     let data_bits = total_bits - leading_zeros;
     usize::max(1, data_bits.div_ceil(DATA_BITS_PER_BYTE))
@@ -324,6 +334,8 @@ fn size_signed<S: SPrim>(value: S) -> usize {
 mod tests {
     use super::*;
     use crate::{error::Error, DecodeExt, Encode};
+    #[cfg(not(feature = "std"))]
+    use alloc::vec::Vec;
     use bytes::Bytes;
 
     #[test]
@@ -530,8 +542,7 @@ mod tests {
             assert_eq!(
                 buf.len(),
                 calculated_size,
-                "Size mismatch for u16 value {}",
-                value
+                "Size mismatch for u16 value {value}",
             );
 
             // Also verify UInt wrapper
@@ -539,8 +550,7 @@ mod tests {
             assert_eq!(
                 uint.encode_size(),
                 buf.len(),
-                "UInt encode_size mismatch for value {}",
-                value
+                "UInt encode_size mismatch for value {value}",
             );
         }
     }
@@ -558,8 +568,7 @@ mod tests {
             assert_eq!(
                 buf.len(),
                 calculated_size,
-                "Size mismatch for i16 value {}",
-                value
+                "Size mismatch for i16 value {value}",
             );
 
             // Also verify SInt wrapper
@@ -567,18 +576,16 @@ mod tests {
             assert_eq!(
                 sint.encode_size(),
                 buf.len(),
-                "SInt encode_size mismatch for value {}",
-                value
+                "SInt encode_size mismatch for value {value}",
             );
 
             // Verify we can decode it back correctly
             let mut slice = &buf[..];
             let decoded: i16 = read_signed(&mut slice).unwrap();
-            assert_eq!(decoded, value, "Decode mismatch for value {}", value);
+            assert_eq!(decoded, value, "Decode mismatch for value {value}");
             assert!(
                 slice.is_empty(),
-                "Buffer not fully consumed for value {}",
-                value
+                "Buffer not fully consumed for value {value}",
             );
         }
     }
@@ -586,7 +593,7 @@ mod tests {
     #[test]
     fn test_exact_bit_boundaries() {
         // Test values with exactly N bits set
-        fn test_exact_bits<T: UPrim + TryFrom<u128> + std::fmt::Display>() {
+        fn test_exact_bits<T: UPrim + TryFrom<u128> + core::fmt::Display>() {
             for bits in 1..=128 {
                 // Create a value with exactly 'bits' bits
                 // e.g., bits=3 -> 0b111 = 7
@@ -604,8 +611,7 @@ mod tests {
                 let calculated_size = size(value);
                 assert_eq!(
                     calculated_size, expected_size,
-                    "Size calculation wrong for {} with {} bits",
-                    val, bits
+                    "Size calculation wrong for {val} with {bits} bits",
                 );
 
                 // Compare encoded size
@@ -614,9 +620,7 @@ mod tests {
                 assert_eq!(
                     buf.len(),
                     expected_size,
-                    "Encoded size wrong for {} with {} bits",
-                    val,
-                    bits
+                    "Encoded size wrong for {val} with {bits} bits",
                 );
             }
         }
@@ -630,7 +634,7 @@ mod tests {
     #[test]
     fn test_single_bit_boundaries() {
         // Test values with only a single bit set at different positions
-        fn test_single_bits<T: UPrim + TryFrom<u128> + std::fmt::Display>() {
+        fn test_single_bits<T: UPrim + TryFrom<u128> + core::fmt::Display>() {
             for bit_pos in 0..128 {
                 // Create a value with only a single bit set at the given position
                 let val = 1u128 << bit_pos;
@@ -643,8 +647,7 @@ mod tests {
                 let calculated_size = size(value);
                 assert_eq!(
                     calculated_size, expected_size,
-                    "Size wrong for 1<<{} = {}",
-                    bit_pos, val
+                    "Size wrong for 1<<{bit_pos} = {val}",
                 );
 
                 // Compare encoded size
@@ -653,9 +656,7 @@ mod tests {
                 assert_eq!(
                     buf.len(),
                     expected_size,
-                    "Encoded size wrong for 1<<{} = {}",
-                    bit_pos,
-                    val
+                    "Encoded size wrong for 1<<{bit_pos} = {val}",
                 );
             }
         }

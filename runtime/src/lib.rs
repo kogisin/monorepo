@@ -17,11 +17,17 @@
 //! `commonware-runtime` is **ALPHA** software and is not yet recommended for production use. Developers should
 //! expect breaking changes and occasional instability.
 
+#![doc(
+    html_logo_url = "https://commonware.xyz/imgs/rustdoc_logo.svg",
+    html_favicon_url = "https://commonware.xyz/favicon.ico"
+)]
+
+use commonware_macros::select;
 use commonware_utils::StableBuf;
 use prometheus_client::registry::Metric;
-use std::io::Error as IoError;
 use std::{
     future::Future,
+    io::Error as IoError,
     net::SocketAddr,
     time::{Duration, SystemTime},
 };
@@ -39,6 +45,7 @@ cfg_if::cfg_if! {
     }
 }
 mod network;
+mod process;
 mod storage;
 pub mod telemetry;
 mod utils;
@@ -80,16 +87,16 @@ pub enum Error {
     BlobOpenFailed(String, String, IoError),
     #[error("blob missing: {0}/{1}")]
     BlobMissing(String, String),
-    #[error("blob truncate failed: {0}/{1} error: {2}")]
-    BlobTruncateFailed(String, String, IoError),
+    #[error("blob resize failed: {0}/{1} error: {2}")]
+    BlobResizeFailed(String, String, IoError),
     #[error("blob sync failed: {0}/{1} error: {2}")]
     BlobSyncFailed(String, String, IoError),
-    #[error("blob close failed: {0}/{1} error: {2}")]
-    BlobCloseFailed(String, String, IoError),
     #[error("blob insufficient length")]
     BlobInsufficientLength,
     #[error("offset overflow")]
     OffsetOverflow,
+    #[error("io error: {0}")]
+    Io(#[from] IoError),
 }
 
 /// Interface that any task scheduler must implement to start
@@ -103,6 +110,10 @@ pub trait Runner {
     type Context;
 
     /// Start running a root task.
+    ///
+    /// When this function returns, all spawned tasks will be canceled. If clean
+    /// shutdown cannot be implemented via `Drop`, consider using [Spawner::stop] and
+    /// [Spawner::stopped] to coordinate clean shutdown.
     fn start<F, Fut>(self, f: F) -> Fut::Output
     where
         F: FnOnce(Self::Context) -> Fut,
@@ -111,84 +122,98 @@ pub trait Runner {
 
 /// Interface that any task scheduler must implement to spawn tasks.
 pub trait Spawner: Clone + Send + Sync + 'static {
-    /// Enqueue a task to be executed.
+    /// Return a [`Spawner`] that schedules tasks onto the runtime's shared executor.
     ///
-    /// Unlike a future, a spawned task will start executing immediately (even if the caller
-    /// does not await the handle).
+    /// Set `blocking` to `true` when the task may hold the thread for a short, blocking operation.
+    /// Runtimes can use this hint to move the work to a blocking-friendly pool so asynchronous
+    /// tasks on a work-stealing executor are not starved. For long-lived, blocking work, use
+    /// [`Spawner::dedicated`] instead.
     ///
-    /// Spawned tasks consume the context used to create them. This ensures that context cannot
-    /// be shared between tasks and that a task's context always comes from somewhere.
+    /// The shared executor with `blocking == false` is the default spawn mode.
+    fn shared(self, blocking: bool) -> Self;
+
+    /// Return a [`Spawner`] that runs tasks on a dedicated thread when the runtime supports it.
+    ///
+    /// Reserve this for long-lived or prioritized tasks that should not compete for resources in the
+    /// shared executor.
+    ///
+    /// This is not the default behavior. See [`Spawner::shared`] for more information.
+    fn dedicated(self) -> Self;
+
+    /// Return a [`Spawner`] that instruments the next spawned task with the label of the spawning context.
+    fn instrumented(self) -> Self;
+
+    /// Spawn a task with the current context.
+    ///
+    /// Unlike directly awaiting a future, the task starts running immediately even if the caller
+    /// never awaits the returned [`Handle`].
+    ///
+    /// # Mandatory Supervision
+    ///
+    /// All tasks are supervised. When a parent task finishes or is aborted, all its descendants are aborted.
+    ///
+    /// Spawn consumes the current task and provides a new child context to the spawned task. Likewise, cloning
+    /// a context (either via [`Clone::clone`] or [`Metrics::with_label`]) returns a child context.
+    ///
+    /// ```txt
+    /// ctx_a
+    ///   |
+    ///   +-- clone() ---> ctx_c
+    ///   |                  |
+    ///   |                  +-- spawn() ---> Task C (ctx_d)
+    ///   |
+    ///   +-- spawn() ---> Task A (ctx_b)
+    ///                              |
+    ///                              +-- spawn() ---> Task B (ctx_e)
+    ///
+    /// Task A finishes or aborts --> Task B and Task C are aborted
+    /// ```
+    ///
+    /// # Spawn Configuration
+    ///
+    /// When a context is cloned (either via [`Clone::clone`] or [`Metrics::with_label`]) or provided via
+    /// [`Spawner::spawn`], any configuration made via [`Spawner::dedicated`] or [`Spawner::shared`] is reset.
+    ///
+    /// Child tasks should assume they start from a clean configuration without needing to inspect how their
+    /// parent was configured.
     fn spawn<F, Fut, T>(self, f: F) -> Handle<T>
     where
         F: FnOnce(Self) -> Fut + Send + 'static,
         Fut: Future<Output = T> + Send + 'static,
         T: Send + 'static;
 
-    /// Enqueue a task to be executed (without consuming the context).
-    ///
-    /// The semantics are the same as [Spawner::spawn].
-    ///
-    /// # Warning
-    ///
-    /// If this function is used to spawn multiple tasks from the same context, the runtime will panic
-    /// to prevent accidental misuse.
-    fn spawn_ref<F, T>(&mut self) -> impl FnOnce(F) -> Handle<T> + 'static
-    where
-        F: Future<Output = T> + Send + 'static,
-        T: Send + 'static;
-
-    /// Enqueue a blocking task to be executed.
-    ///
-    /// This method is designed for synchronous, potentially long-running operations. Tasks can either
-    /// be executed in a shared thread (tasks that are expected to finish on their own) or a dedicated
-    /// thread (tasks that are expected to run indefinitely).
-    ///
-    /// The task starts executing immediately, and the returned handle can be awaited to retrieve the
-    /// result.
-    ///
-    /// # Motivation
-    ///
-    /// Most runtimes allocate a limited number of threads for executing async tasks, running whatever
-    /// isn't waiting. If blocking tasks are spawned this way, they can dramatically reduce the efficiency
-    /// of said runtimes.
-    ///
-    /// # Warning
-    ///
-    /// Blocking tasks cannot be aborted.
-    fn spawn_blocking<F, T>(self, dedicated: bool, f: F) -> Handle<T>
-    where
-        F: FnOnce(Self) -> T + Send + 'static,
-        T: Send + 'static;
-
-    /// Enqueue a blocking task to be executed (without consuming the context).
-    ///
-    /// The semantics are the same as [Spawner::spawn_blocking].
-    ///
-    /// # Warning
-    ///
-    /// If this function is used to spawn multiple tasks from the same context,
-    /// the runtime will panic to prevent accidental misuse.
-    fn spawn_blocking_ref<F, T>(
-        &mut self,
-        dedicated: bool,
-    ) -> impl FnOnce(F) -> Handle<T> + 'static
-    where
-        F: FnOnce() -> T + Send + 'static,
-        T: Send + 'static;
-
-    /// Signals the runtime to stop execution and that all outstanding tasks
-    /// should perform any required cleanup and exit. This method is idempotent and
-    /// can be called multiple times.
+    /// Signals the runtime to stop execution and waits for all outstanding tasks
+    /// to perform any required cleanup and exit.
     ///
     /// This method does not actually kill any tasks but rather signals to them, using
-    /// the `Signal` returned by `stopped`, that they should exit.
-    fn stop(&self, value: i32);
+    /// the [signal::Signal] returned by [Spawner::stopped], that they should exit.
+    /// It then waits for all [signal::Signal] references to be dropped before returning.
+    ///
+    /// ## Multiple Stop Calls
+    ///
+    /// This method is idempotent and safe to call multiple times concurrently (on
+    /// different instances of the same context since it consumes `self`). The first
+    /// call initiates shutdown with the provided `value`, and all subsequent calls
+    /// will wait for the same completion regardless of their `value` parameter, i.e.
+    /// the original `value` from the first call is preserved.
+    ///
+    /// ## Timeout
+    ///
+    /// If a timeout is provided, the method will return an error if all [signal::Signal]
+    /// references have not been dropped within the specified duration.
+    fn stop(
+        self,
+        value: i32,
+        timeout: Option<Duration>,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
 
-    /// Returns an instance of a `Signal` that resolves when `stop` is called by
+    /// Returns an instance of a [signal::Signal] that resolves when [Spawner::stop] is called by
     /// any task.
     ///
-    /// If `stop` has already been called, the returned `Signal` will resolve immediately.
-    fn stopped(&self) -> Signal;
+    /// If [Spawner::stop] has already been called, the [signal::Signal] returned will resolve
+    /// immediately. The [signal::Signal] returned will always resolve to the value of the
+    /// first [Spawner::stop] call.
+    fn stopped(&self) -> signal::Signal;
 }
 
 /// Interface to register and encode metrics.
@@ -244,6 +269,104 @@ pub trait Clock: Clone + Send + Sync + 'static {
 
     /// Sleep until the given deadline.
     fn sleep_until(&self, deadline: SystemTime) -> impl Future<Output = ()> + Send + 'static;
+
+    /// Await a future with a timeout, returning `Error::Timeout` if it expires.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use commonware_runtime::{deterministic, Error, Runner, Clock};
+    ///
+    /// let executor = deterministic::Runner::default();
+    /// executor.start(|context| async move {
+    ///     match context
+    ///         .timeout(Duration::from_millis(100), async { 42 })
+    ///         .await
+    ///     {
+    ///         Ok(value) => assert_eq!(value, 42),
+    ///         Err(Error::Timeout) => panic!("should not timeout"),
+    ///         Err(e) => panic!("unexpected error: {:?}", e),
+    ///     }
+    /// });
+    /// ```
+    fn timeout<F, T>(
+        &self,
+        duration: Duration,
+        future: F,
+    ) -> impl Future<Output = Result<T, Error>> + Send + '_
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        async move {
+            select! {
+                result = future => {
+                    Ok(result)
+                },
+                _ = self.sleep(duration) => {
+                    Err(Error::Timeout)
+                },
+            }
+        }
+    }
+}
+
+cfg_if::cfg_if! {
+    if #[cfg(feature = "external")] {
+        /// Interface that runtimes can implement to constrain the execution latency of a future.
+        pub trait Pacer: Clock + Clone + Send + Sync + 'static {
+            /// Defer completion of a future until a specified `latency` has elapsed. If the future is
+            /// not yet ready at the desired time of completion, the runtime will block until the future
+            /// is ready.
+            ///
+            /// In [crate::deterministic], this is used to ensure interactions with external systems can
+            /// be interacted with deterministically. In [crate::tokio], this is a no-op (allows
+            /// multiple runtimes to be tested with no code changes).
+            ///
+            /// # Setting Latency
+            ///
+            /// `pace` is not meant to be a time penalty applied to awaited futures and should be set to
+            /// the expected resolution latency of the future. To better explore the possible behavior of an
+            /// application, users can set latency to a randomly chosen value in the range of
+            /// `[expected latency / 2, expected latency * 2]`.
+            ///
+            /// # Warning
+            ///
+            /// Because `pace` blocks if the future is not ready, it is important that the future's completion
+            /// doesn't require anything in the current thread to complete (or else it will deadlock).
+            fn pace<'a, F, T>(
+                &'a self,
+                latency: Duration,
+                future: F,
+            ) -> impl Future<Output = T> + Send + 'a
+            where
+                F: Future<Output = T> + Send + 'a,
+                T: Send + 'a;
+        }
+
+        /// Extension trait that makes it more ergonomic to use [Pacer].
+        ///
+        /// This inverts the call-site of [`Pacer::pace`] by letting the future itself request how the
+        /// runtime should delay completion relative to the clock.
+        pub trait FutureExt: Future + Send + Sized {
+            /// Delay completion of the future until a specified `latency` on `pacer`.
+            fn pace<'a, E>(
+                self,
+                pacer: &'a E,
+                latency: Duration,
+            ) -> impl Future<Output = Self::Output> + Send + 'a
+            where
+                E: Pacer + 'a,
+                Self: Send + 'a,
+                Self::Output: Send + 'a,
+            {
+                pacer.pace(latency, self)
+            }
+        }
+
+        impl<F> FutureExt for F where F: Future + Send {}
+    }
 }
 
 /// Syntactic sugar for the type of [Sink] used by a given [Network] N.
@@ -332,6 +455,8 @@ pub trait Storage: Clone + Send + Sync + 'static {
     ///
     /// Multiple instances of the same blob can be opened concurrently, however,
     /// writing to the same blob concurrently may lead to undefined behavior.
+    ///
+    /// An Ok result indicates the blob is durably created (or already exists).
     fn open(
         &self,
         partition: &str,
@@ -341,6 +466,8 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// Remove a blob from a given partition.
     ///
     /// If no `name` is provided, the entire partition is removed.
+    ///
+    /// An Ok result indicates the blob is durably removed.
     fn remove(
         &self,
         partition: &str,
@@ -361,6 +488,10 @@ pub trait Storage: Clone + Send + Sync + 'static {
 /// opening a new file descriptor. If multiple blobs are opened with the same
 /// name, they are not expected to coordinate access to underlying storage
 /// and writing to both is undefined behavior.
+///
+/// When a blob is dropped, any unsynced changes may be discarded. Implementations
+/// may attempt to sync during drop but errors will go unhandled. Call `sync`
+/// before dropping to ensure all changes are durably persisted.
 #[allow(clippy::len_without_is_empty)]
 pub trait Blob: Clone + Send + Sync + 'static {
     /// Read from the blob at the given offset.
@@ -380,28 +511,38 @@ pub trait Blob: Clone + Send + Sync + 'static {
         offset: u64,
     ) -> impl Future<Output = Result<(), Error>> + Send;
 
-    /// Truncate the blob to the given length.
-    fn truncate(&self, len: u64) -> impl Future<Output = Result<(), Error>> + Send;
+    /// Resize the blob to the given length.
+    ///
+    /// If the length is greater than the current length, the blob is extended with zeros.
+    /// If the length is less than the current length, the blob is resized.
+    fn resize(&self, len: u64) -> impl Future<Output = Result<(), Error>> + Send;
 
     /// Ensure all pending data is durably persisted.
     fn sync(&self) -> impl Future<Output = Result<(), Error>> + Send;
-
-    /// Close the blob.
-    fn close(self) -> impl Future<Output = Result<(), Error>> + Send;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::traces::collector::TraceStorage;
     use bytes::Bytes;
-    use commonware_macros::select;
-    use futures::channel::oneshot;
-    use futures::{channel::mpsc, future::ready, join, SinkExt, StreamExt};
+    use commonware_macros::{select, test_collect_traces};
+    use futures::{
+        channel::{mpsc, oneshot},
+        future::{pending, ready},
+        join, pin_mut, FutureExt, SinkExt, StreamExt,
+    };
     use prometheus_client::metrics::counter::Counter;
-    use std::collections::HashMap;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-    use std::str::FromStr;
-    use std::sync::Mutex;
+    use std::{
+        collections::HashMap,
+        pin::Pin,
+        str::FromStr,
+        sync::{
+            atomic::{AtomicU32, Ordering},
+            Arc, Mutex,
+        },
+        task::{Context as TContext, Poll, Waker},
+    };
     use tracing::{error, Level};
     use utils::reschedule;
 
@@ -431,7 +572,7 @@ mod tests {
 
     fn test_clock_sleep_until<R: Runner>(runner: R)
     where
-        R::Context: Spawner + Clock,
+        R::Context: Spawner + Clock + Metrics,
     {
         runner.start(|context| async move {
             // Trigger sleep
@@ -441,6 +582,34 @@ mod tests {
             // Ensure slept duration has elapsed
             let elapsed = now.elapsed().unwrap();
             assert!(elapsed >= Duration::from_millis(100));
+        });
+    }
+
+    fn test_clock_timeout<R: Runner>(runner: R)
+    where
+        R::Context: Spawner + Clock,
+    {
+        runner.start(|context| async move {
+            // Future completes before timeout
+            let result = context
+                .timeout(Duration::from_millis(100), async { "success" })
+                .await;
+            assert_eq!(result.unwrap(), "success");
+
+            // Future exceeds timeout duration
+            let result = context
+                .timeout(Duration::from_millis(50), pending::<()>())
+                .await;
+            assert!(matches!(result, Err(Error::Timeout)));
+
+            // Future completes within timeout
+            let result = context
+                .timeout(
+                    Duration::from_millis(100),
+                    context.sleep(Duration::from_millis(50)),
+                )
+                .await;
+            assert!(result.is_ok());
         });
     }
 
@@ -457,11 +626,41 @@ mod tests {
         });
     }
 
-    fn test_spawn_abort<R: Runner>(runner: R)
+    fn test_spawn_after_abort<R>(runner: R)
+    where
+        R: Runner,
+        R::Context: Spawner + Clone,
+    {
+        runner.start(|context| async move {
+            // Create a child context
+            let child = context.clone();
+
+            // Spawn parent and abort
+            let parent_handle = context.spawn(move |_| async move {
+                pending::<()>().await;
+            });
+            parent_handle.abort();
+
+            // Spawn child and ensure it aborts
+            let child_handle = child.spawn(move |_| async move {
+                pending::<()>().await;
+            });
+            assert!(matches!(child_handle.await, Err(Error::Closed)));
+        });
+    }
+
+    fn test_spawn_abort<R: Runner>(runner: R, dedicated: bool, blocking: bool)
     where
         R::Context: Spawner,
     {
         runner.start(|context| async move {
+            let context = if dedicated {
+                assert!(!blocking);
+                context.dedicated()
+            } else {
+                context.shared(blocking)
+            };
+
             let handle = context.spawn(|_| async move {
                 loop {
                     reschedule().await;
@@ -473,28 +672,83 @@ mod tests {
     }
 
     fn test_panic_aborts_root<R: Runner>(runner: R) {
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            runner.start(|_| async move {
-                panic!("blah");
-            });
-        }));
+        let result: Result<(), Error> = runner.start(|_| async move {
+            panic!("blah");
+        });
         result.unwrap_err();
     }
 
     fn test_panic_aborts_spawn<R: Runner>(runner: R)
     where
-        R::Context: Spawner,
+        R::Context: Spawner + Clock,
     {
-        let result = runner.start(|context| async move {
-            let result = context.spawn(|_| async move {
+        runner.start(|context| async move {
+            context.clone().spawn(|_| async move {
                 panic!("blah");
             });
-            assert!(matches!(result.await, Err(Error::Exited)));
-            Result::<(), Error>::Ok(())
-        });
 
-        // Ensure panic was caught
-        result.unwrap();
+            // Loop until panic
+            loop {
+                context.sleep(Duration::from_millis(100)).await;
+            }
+        });
+    }
+
+    fn test_panic_aborts_spawn_caught<R: Runner>(runner: R)
+    where
+        R::Context: Spawner + Clock,
+    {
+        let result: Result<(), Error> = runner.start(|context| async move {
+            let result = context.clone().spawn(|_| async move {
+                panic!("blah");
+            });
+            result.await
+        });
+        assert!(matches!(result, Err(Error::Exited)));
+    }
+
+    fn test_multiple_panics<R: Runner>(runner: R)
+    where
+        R::Context: Spawner + Clock,
+    {
+        runner.start(|context| async move {
+            context.clone().spawn(|_| async move {
+                panic!("boom 1");
+            });
+            context.clone().spawn(|_| async move {
+                panic!("boom 2");
+            });
+            context.clone().spawn(|_| async move {
+                panic!("boom 3");
+            });
+
+            // Loop until panic
+            loop {
+                context.sleep(Duration::from_millis(100)).await;
+            }
+        });
+    }
+
+    fn test_multiple_panics_caught<R: Runner>(runner: R)
+    where
+        R::Context: Spawner + Clock,
+    {
+        let (res1, res2, res3) = runner.start(|context| async move {
+            let handle1 = context.clone().spawn(|_| async move {
+                panic!("boom 1");
+            });
+            let handle2 = context.clone().spawn(|_| async move {
+                panic!("boom 2");
+            });
+            let handle3 = context.clone().spawn(|_| async move {
+                panic!("boom 3");
+            });
+
+            join!(handle1, handle2, handle3)
+        });
+        assert!(matches!(res1, Err(Error::Exited)));
+        assert!(matches!(res2, Err(Error::Exited)));
+        assert!(matches!(res3, Err(Error::Exited)));
     }
 
     fn test_select<R: Runner>(runner: R) {
@@ -535,7 +789,7 @@ mod tests {
             for _ in 0..2 {
                 select! {
                     v = receiver.next() => {
-                        panic!("unexpected value: {:?}", v);
+                        panic!("unexpected value: {v:?}");
                     },
                     _ = context.sleep(Duration::from_millis(100)) => {
                         continue;
@@ -553,7 +807,7 @@ mod tests {
                     // Skip reading from channel even though populated
                 },
                 v = receiver.next() => {
-                    panic!("unexpected value: {:?}", v);
+                    panic!("unexpected value: {v:?}");
                 },
             };
 
@@ -601,8 +855,8 @@ mod tests {
                 .expect("Failed to read from blob");
             assert_eq!(read.as_ref(), data);
 
-            // Close the blob
-            blob.close().await.expect("Failed to close blob");
+            // Sync the blob
+            blob.sync().await.expect("Failed to sync blob");
 
             // Scan blobs in the partition
             let blobs = context
@@ -625,8 +879,8 @@ mod tests {
                 .expect("Failed to read data");
             assert_eq!(read.as_ref(), b"Storage");
 
-            // Close the blob
-            blob.close().await.expect("Failed to close blob");
+            // Sync the blob
+            blob.sync().await.expect("Failed to sync blob");
 
             // Remove the blob
             context
@@ -685,26 +939,88 @@ mod tests {
             assert_eq!(&read.as_ref()[..5], data1);
             assert_eq!(&read.as_ref()[5..], data2);
 
+            // Read past end of blob
+            let result = blob.read_at(vec![0u8; 10], 10).await;
+            assert!(result.is_err());
+
             // Rewrite data without affecting length
             let data3 = b"Store";
             blob.write_at(Vec::from(data3), 5)
                 .await
                 .expect("Failed to write data3");
 
-            // Truncate the blob
-            blob.truncate(5).await.expect("Failed to truncate blob");
+            // Read data back
             let read = blob
-                .read_at(vec![0; 5], 0)
+                .read_at(vec![0u8; 10], 0)
                 .await
                 .expect("Failed to read data");
             assert_eq!(&read.as_ref()[..5], data1);
+            assert_eq!(&read.as_ref()[5..], data3);
 
-            // Full read after truncation
-            let result = blob.read_at(vec![0u8; 10], 0).await;
+            // Read past end of blob
+            let result = blob.read_at(vec![0u8; 10], 10).await;
             assert!(result.is_err());
+        });
+    }
 
-            // Close the blob
-            blob.close().await.expect("Failed to close blob");
+    fn test_blob_resize<R: Runner>(runner: R)
+    where
+        R::Context: Storage,
+    {
+        runner.start(|context| async move {
+            let partition = "test_partition_resize";
+            let name = b"test_blob_resize";
+
+            // Open and write to a new blob
+            let (blob, _) = context
+                .open(partition, name)
+                .await
+                .expect("Failed to open blob");
+
+            let data = b"some data";
+            blob.write_at(data.to_vec(), 0)
+                .await
+                .expect("Failed to write");
+            blob.sync().await.expect("Failed to sync after write");
+
+            // Re-open and check length
+            let (blob, len) = context.open(partition, name).await.unwrap();
+            assert_eq!(len, data.len() as u64);
+
+            // Resize to extend the file
+            let new_len = (data.len() as u64) * 2;
+            blob.resize(new_len)
+                .await
+                .expect("Failed to resize to extend");
+            blob.sync().await.expect("Failed to sync after resize");
+
+            // Re-open and check length again
+            let (blob, len) = context.open(partition, name).await.unwrap();
+            assert_eq!(len, new_len);
+
+            // Read original data
+            let read_buf = blob.read_at(vec![0; data.len()], 0).await.unwrap();
+            assert_eq!(read_buf.as_ref(), data);
+
+            // Read extended part (should be zeros)
+            let extended_part = blob
+                .read_at(vec![0; data.len()], data.len() as u64)
+                .await
+                .unwrap();
+            assert_eq!(extended_part.as_ref(), vec![0; data.len()].as_slice());
+
+            // Truncate the blob
+            blob.resize(data.len() as u64).await.unwrap();
+            blob.sync().await.unwrap();
+
+            // Reopen to check truncation
+            let (blob, size) = context.open(partition, name).await.unwrap();
+            assert_eq!(size, data.len() as u64);
+
+            // Read truncated data
+            let read_buf = blob.read_at(vec![0; data.len()], 0).await.unwrap();
+            assert_eq!(read_buf.as_ref(), data);
+            blob.sync().await.unwrap();
         });
     }
 
@@ -733,8 +1049,8 @@ mod tests {
                     .await
                     .expect("Failed to write data2");
 
-                // Close the blob
-                blob.close().await.expect("Failed to close blob");
+                // Sync the blob
+                blob.sync().await.expect("Failed to sync blob");
             }
 
             for (additional, partition) in partitions.iter().enumerate() {
@@ -752,9 +1068,6 @@ mod tests {
                     .expect("Failed to read data");
                 assert_eq!(&read.as_ref()[..5], b"Hello");
                 assert_eq!(&read.as_ref()[5 + additional..], b"World");
-
-                // Close the blob
-                blob.close().await.expect("Failed to close blob");
             }
         });
     }
@@ -846,8 +1159,8 @@ mod tests {
                 .expect("Failed to read from blob");
             assert_eq!(read.as_ref(), data);
 
-            // Close the blob
-            blob.close().await.expect("Failed to close blob");
+            // Drop the blob
+            drop(blob);
 
             // Ensure no blobs still open
             let buffer = context.encode();
@@ -865,35 +1178,24 @@ mod tests {
             let before = context
                 .with_label("before")
                 .spawn(move |context| async move {
-                    let sig = context.stopped().await;
-                    assert_eq!(sig.unwrap(), kill);
+                    let mut signal = context.stopped();
+                    let value = (&mut signal).await.unwrap();
+                    assert_eq!(value, kill);
+                    drop(signal);
                 });
+
+            // Signal the tasks and wait for them to stop
+            let result = context.clone().stop(kill, None).await;
+            assert!(result.is_ok());
 
             // Spawn a task after stop is called
             let after = context
                 .with_label("after")
                 .spawn(move |context| async move {
-                    // Wait for stop signal
-                    let mut signal = context.stopped();
-                    loop {
-                        select! {
-                            sig = &mut signal => {
-                                // Stopper resolved
-                                assert_eq!(sig.unwrap(), kill);
-                                break;
-                            },
-                            _ = context.sleep(Duration::from_millis(10)) => {
-                                // Continue waiting
-                            },
-                        }
-                    }
+                    // A call to `stopped()` after `stop()` resolves immediately
+                    let value = context.stopped().await.unwrap();
+                    assert_eq!(value, kill);
                 });
-
-            // Sleep for a bit before stopping
-            context.sleep(Duration::from_millis(50)).await;
-
-            // Signal the task
-            context.stop(kill);
 
             // Ensure both tasks complete
             let result = join!(before, after);
@@ -902,44 +1204,503 @@ mod tests {
         });
     }
 
-    fn test_spawn_ref<R: Runner>(runner: R)
+    fn test_shutdown_multiple_signals<R: Runner>(runner: R)
     where
-        R::Context: Spawner,
+        R::Context: Spawner + Metrics + Clock,
     {
-        runner.start(|mut context| async move {
-            let handle = context.spawn_ref();
-            let result = handle(async move { 42 }).await;
-            assert!(matches!(result, Ok(42)));
+        let kill = 42;
+        runner.start(|context| async move {
+            let (started_tx, mut started_rx) = mpsc::channel(3);
+            let counter = Arc::new(AtomicU32::new(0));
+
+            // Spawn 3 tasks that do cleanup work after receiving stop signal
+            // and increment a shared counter
+            let task = |cleanup_duration: Duration| {
+                let context = context.clone();
+                let counter = counter.clone();
+                let mut started_tx = started_tx.clone();
+                context.spawn(move |context| async move {
+                    // Wait for signal to be acquired
+                    let mut signal = context.stopped();
+                    started_tx.send(()).await.unwrap();
+
+                    // Increment once killed
+                    let value = (&mut signal).await.unwrap();
+                    assert_eq!(value, kill);
+                    context.sleep(cleanup_duration).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+
+                    // Wait to drop signal until work has been done
+                    drop(signal);
+                })
+            };
+
+            let task1 = task(Duration::from_millis(10));
+            let task2 = task(Duration::from_millis(20));
+            let task3 = task(Duration::from_millis(30));
+
+            // Give tasks time to start
+            for _ in 0..3 {
+                started_rx.next().await.unwrap();
+            }
+
+            // Stop and verify all cleanup completed
+            context.stop(kill, None).await.unwrap();
+            assert_eq!(counter.load(Ordering::SeqCst), 3);
+
+            // Ensure all tasks completed
+            let result = join!(task1, task2, task3);
+            assert!(result.0.is_ok());
+            assert!(result.1.is_ok());
+            assert!(result.2.is_ok());
         });
     }
 
-    fn test_spawn_ref_duplicate<R: Runner>(runner: R)
+    fn test_shutdown_timeout<R: Runner>(runner: R)
     where
-        R::Context: Spawner,
+        R::Context: Spawner + Metrics + Clock,
     {
-        runner.start(|mut context| async move {
-            let handle = context.spawn_ref();
-            let result = handle(async move { 42 }).await;
-            assert!(matches!(result, Ok(42)));
+        let kill = 42;
+        runner.start(|context| async move {
+            // Setup startup coordinator
+            let (started_tx, started_rx) = oneshot::channel();
 
-            // Ensure context is consumed
-            let handle = context.spawn_ref();
-            let result = handle(async move { 42 }).await;
-            assert!(matches!(result, Ok(42)));
+            // Spawn a task that never completes its cleanup
+            context.clone().spawn(move |context| async move {
+                let signal = context.stopped();
+                started_tx.send(()).unwrap();
+                pending::<()>().await;
+                signal.await.unwrap();
+            });
+
+            // Try to stop with a timeout
+            started_rx.await.unwrap();
+            let result = context.stop(kill, Some(Duration::from_millis(100))).await;
+
+            // Assert that we got a timeout error
+            assert!(matches!(result, Err(Error::Timeout)));
         });
     }
 
-    fn test_spawn_duplicate<R: Runner>(runner: R)
+    fn test_shutdown_multiple_stop_calls<R: Runner>(runner: R)
+    where
+        R::Context: Spawner + Metrics + Clock,
+    {
+        let kill1 = 42;
+        let kill2 = 43;
+
+        runner.start(|context| async move {
+            let (started_tx, started_rx) = oneshot::channel();
+            let counter = Arc::new(AtomicU32::new(0));
+
+            // Spawn a task that delays completion to test timing
+            let task = context.with_label("blocking_task").spawn({
+                let counter = counter.clone();
+                move |context| async move {
+                    // Wait for signal to be acquired
+                    let mut signal = context.stopped();
+                    started_tx.send(()).unwrap();
+
+                    // Wait for signal to be resolved
+                    let value = (&mut signal).await.unwrap();
+                    assert_eq!(value, kill1);
+                    context.sleep(Duration::from_millis(50)).await;
+
+                    // Increment counter
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    drop(signal);
+                }
+            });
+
+            // Give task time to start
+            started_rx.await.unwrap();
+
+            // Issue two separate stop calls
+            // The second stop call uses a different stop value that should be ignored
+            let stop_task1 = context.clone().stop(kill1, None);
+            pin_mut!(stop_task1);
+            let stop_task2 = context.clone().stop(kill2, None);
+            pin_mut!(stop_task2);
+
+            // Both of them should be awaiting completion
+            assert!(stop_task1.as_mut().now_or_never().is_none());
+            assert!(stop_task2.as_mut().now_or_never().is_none());
+
+            // Wait for both stop calls to complete
+            assert!(stop_task1.await.is_ok());
+            assert!(stop_task2.await.is_ok());
+
+            // Verify first stop value wins
+            let sig = context.stopped().await;
+            assert_eq!(sig.unwrap(), kill1);
+
+            // Wait for blocking task to complete
+            let result = task.await;
+            assert!(result.is_ok());
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+            // Post-completion stop should return immediately
+            assert!(context.stop(kill2, None).now_or_never().unwrap().is_ok());
+        });
+    }
+
+    fn test_unfulfilled_shutdown<R: Runner>(runner: R)
+    where
+        R::Context: Spawner + Metrics,
+    {
+        runner.start(|context| async move {
+            // Spawn a task that waits for signal
+            context
+                .with_label("before")
+                .spawn(move |context| async move {
+                    let mut signal = context.stopped();
+                    let value = (&mut signal).await.unwrap();
+
+                    // We should never reach this point
+                    assert_eq!(value, 42);
+                    drop(signal);
+                });
+
+            // Ensure waker is registered
+            reschedule().await;
+        });
+    }
+
+    fn test_spawn_dedicated<R: Runner>(runner: R)
     where
         R::Context: Spawner,
     {
-        runner.start(|mut context| async move {
-            let handle = context.spawn_ref();
-            let result = handle(async move { 42 }).await;
-            assert!(matches!(result, Ok(42)));
+        runner.start(|context| async move {
+            let handle = context.dedicated().spawn(|_| async move { 42 });
+            assert!(matches!(handle.await, Ok(42)));
+        });
+    }
 
-            // Ensure context is consumed
-            context.spawn(|_| async move { 42 });
+    fn test_spawn<R: Runner>(runner: R)
+    where
+        R::Context: Spawner + Clock,
+    {
+        runner.start(|context| async move {
+            let child_handle = Arc::new(Mutex::new(None));
+            let child_handle2 = child_handle.clone();
+
+            let (parent_initialized_tx, parent_initialized_rx) = oneshot::channel();
+            let (parent_complete_tx, parent_complete_rx) = oneshot::channel();
+            let parent_handle = context.spawn(move |context| async move {
+                // Spawn child that completes immediately
+                let handle = context.spawn(|_| async {});
+
+                // Store child handle so we can test it later
+                *child_handle2.lock().unwrap() = Some(handle);
+
+                parent_initialized_tx.send(()).unwrap();
+
+                // Parent task completes
+                parent_complete_rx.await.unwrap();
+            });
+
+            // Wait for parent task to spawn the children
+            parent_initialized_rx.await.unwrap();
+
+            // Child task completes successfully
+            let child_handle = child_handle.lock().unwrap().take().unwrap();
+            assert!(child_handle.await.is_ok());
+
+            // Complete the parent task
+            parent_complete_tx.send(()).unwrap();
+
+            // Wait for parent task to complete successfully
+            assert!(parent_handle.await.is_ok());
+        });
+    }
+
+    fn test_spawn_abort_on_parent_abort<R: Runner>(runner: R)
+    where
+        R::Context: Spawner + Clock,
+    {
+        runner.start(|context| async move {
+            let child_handle = Arc::new(Mutex::new(None));
+            let child_handle2 = child_handle.clone();
+
+            let (parent_initialized_tx, parent_initialized_rx) = oneshot::channel();
+            let parent_handle = context.spawn(move |context| async move {
+                // Spawn child task that hangs forever, should be aborted when parent aborts
+                let handle = context.spawn(|_| pending::<()>());
+
+                // Store child task handle so we can test it later
+                *child_handle2.lock().unwrap() = Some(handle);
+
+                parent_initialized_tx.send(()).unwrap();
+
+                // Parent task runs until aborted
+                pending::<()>().await
+            });
+
+            // Wait for parent task to spawn the children
+            parent_initialized_rx.await.unwrap();
+
+            // Abort parent task
+            parent_handle.abort();
+            assert!(matches!(parent_handle.await, Err(Error::Closed)));
+
+            // Child task should also resolve with error since its parent aborted
+            let child_handle = child_handle.lock().unwrap().take().unwrap();
+            assert!(matches!(child_handle.await, Err(Error::Closed)));
+        });
+    }
+
+    fn test_spawn_abort_on_parent_completion<R: Runner>(runner: R)
+    where
+        R::Context: Spawner + Clock,
+    {
+        runner.start(|context| async move {
+            let child_handle = Arc::new(Mutex::new(None));
+            let child_handle2 = child_handle.clone();
+
+            let (parent_complete_tx, parent_complete_rx) = oneshot::channel();
+            let parent_handle = context.spawn(move |context| async move {
+                // Spawn child task that hangs forever, should be aborted when parent completes
+                let handle = context.spawn(|_| pending::<()>());
+
+                // Store child task handle so we can test it later
+                *child_handle2.lock().unwrap() = Some(handle);
+
+                // Parent task completes
+                parent_complete_rx.await.unwrap();
+            });
+
+            // Fire parent completion
+            parent_complete_tx.send(()).unwrap();
+
+            // Wait for parent task to complete
+            assert!(parent_handle.await.is_ok());
+
+            // Child task should resolve with error since its parent has completed
+            let child_handle = child_handle.lock().unwrap().take().unwrap();
+            assert!(matches!(child_handle.await, Err(Error::Closed)));
+        });
+    }
+
+    fn test_spawn_cascading_abort<R: Runner>(runner: R)
+    where
+        R::Context: Spawner + Clock,
+    {
+        runner.start(|context| async move {
+            // We create the following tree of tasks. All tasks will run
+            // indefinitely (until aborted).
+            //
+            //          root
+            //     /     |     \
+            //    /      |      \
+            //   c0      c1      c2
+            //  /  \    /  \    /  \
+            // g0  g1  g2  g3  g4  g5
+            let c0 = context.clone();
+            let g0 = c0.clone();
+            let g1 = c0.clone();
+            let c1 = context.clone();
+            let g2 = c1.clone();
+            let g3 = c1.clone();
+            let c2 = context.clone();
+            let g4 = c2.clone();
+            let g5 = c2.clone();
+
+            // Spawn tasks
+            let handles = Arc::new(Mutex::new(Vec::new()));
+            let (mut initialized_tx, mut initialized_rx) = mpsc::channel(9);
+            let root_task = context.spawn({
+                let handles = handles.clone();
+                move |_| async move {
+                    for (context, grandchildren) in [(c0, [g0, g1]), (c1, [g2, g3]), (c2, [g4, g5])]
+                    {
+                        let handle = context.spawn({
+                            let handles = handles.clone();
+                            let mut initialized_tx = initialized_tx.clone();
+                            move |_| async move {
+                                for grandchild in grandchildren {
+                                    let handle = grandchild.spawn(|_| async {
+                                        pending::<()>().await;
+                                    });
+                                    handles.lock().unwrap().push(handle);
+                                    initialized_tx.send(()).await.unwrap();
+                                }
+
+                                pending::<()>().await;
+                            }
+                        });
+                        handles.lock().unwrap().push(handle);
+                        initialized_tx.send(()).await.unwrap();
+                    }
+
+                    pending::<()>().await;
+                }
+            });
+
+            // Wait for tasks to initialize
+            for _ in 0..9 {
+                initialized_rx.next().await.unwrap();
+            }
+
+            // Verify we have all 9 handles (3 children + 6 grandchildren)
+            assert_eq!(handles.lock().unwrap().len(), 9);
+
+            // Abort root task
+            root_task.abort();
+            assert!(matches!(root_task.await, Err(Error::Closed)));
+
+            // All handles should resolve with error due to cascading abort
+            let handles = handles.lock().unwrap().drain(..).collect::<Vec<_>>();
+            for handle in handles {
+                assert!(matches!(handle.await, Err(Error::Closed)));
+            }
+        });
+    }
+
+    fn test_child_survives_sibling_completion<R: Runner>(runner: R)
+    where
+        R::Context: Spawner + Clock,
+    {
+        runner.start(|context| async move {
+            let (child_started_tx, child_started_rx) = oneshot::channel();
+            let (child_complete_tx, child_complete_rx) = oneshot::channel();
+            let (child_handle_tx, child_handle_rx) = oneshot::channel();
+            let (sibling_started_tx, sibling_started_rx) = oneshot::channel();
+            let (sibling_complete_tx, sibling_complete_rx) = oneshot::channel();
+            let (sibling_handle_tx, sibling_handle_rx) = oneshot::channel();
+            let (parent_complete_tx, parent_complete_rx) = oneshot::channel();
+
+            let parent = context.spawn(move |context| async move {
+                // Spawn a child task
+                let child_handle = context.clone().spawn(|_| async move {
+                    child_started_tx.send(()).unwrap();
+                    // Wait for signal to complete
+                    child_complete_rx.await.unwrap();
+                });
+                assert!(
+                    child_handle_tx.send(child_handle).is_ok(),
+                    "child handle receiver dropped"
+                );
+
+                // Spawn an independent sibling task
+                let sibling_handle = context.clone().spawn(move |_| async move {
+                    sibling_started_tx.send(()).unwrap();
+                    // Wait for signal to complete
+                    sibling_complete_rx.await.unwrap();
+                });
+                assert!(
+                    sibling_handle_tx.send(sibling_handle).is_ok(),
+                    "sibling handle receiver dropped"
+                );
+
+                // Wait for signal to complete
+                parent_complete_rx.await.unwrap();
+            });
+
+            // Wait for both to start
+            child_started_rx.await.unwrap();
+            sibling_started_rx.await.unwrap();
+
+            // Kill the sibling
+            sibling_complete_tx.send(()).unwrap();
+            assert!(sibling_handle_rx.await.is_ok());
+
+            // The child task should still be alive
+            child_complete_tx.send(()).unwrap();
+            assert!(child_handle_rx.await.is_ok());
+
+            // As well as the parent
+            parent_complete_tx.send(()).unwrap();
+            assert!(parent.await.is_ok());
+        });
+    }
+
+    fn test_spawn_clone_chain<R: Runner>(runner: R)
+    where
+        R::Context: Spawner + Clock,
+    {
+        runner.start(|context| async move {
+            let (parent_started_tx, parent_started_rx) = oneshot::channel();
+            let (child_started_tx, child_started_rx) = oneshot::channel();
+            let (grandchild_started_tx, grandchild_started_rx) = oneshot::channel();
+            let (child_handle_tx, child_handle_rx) = oneshot::channel();
+            let (grandchild_handle_tx, grandchild_handle_rx) = oneshot::channel();
+
+            let parent = context.clone().spawn({
+                move |context| async move {
+                    let child = context.clone().spawn({
+                        move |context| async move {
+                            let grandchild = context.clone().spawn({
+                                move |_| async move {
+                                    grandchild_started_tx.send(()).unwrap();
+                                    pending::<()>().await;
+                                }
+                            });
+                            assert!(
+                                grandchild_handle_tx.send(grandchild).is_ok(),
+                                "grandchild handle receiver dropped"
+                            );
+                            child_started_tx.send(()).unwrap();
+                            pending::<()>().await;
+                        }
+                    });
+                    assert!(
+                        child_handle_tx.send(child).is_ok(),
+                        "child handle receiver dropped"
+                    );
+                    parent_started_tx.send(()).unwrap();
+                    pending::<()>().await;
+                }
+            });
+
+            parent_started_rx.await.unwrap();
+            child_started_rx.await.unwrap();
+            grandchild_started_rx.await.unwrap();
+
+            let child_handle = child_handle_rx.await.unwrap();
+            let grandchild_handle = grandchild_handle_rx.await.unwrap();
+
+            parent.abort();
+            assert!(parent.await.is_err());
+
+            assert!(child_handle.await.is_err());
+            assert!(grandchild_handle.await.is_err());
+        });
+    }
+
+    fn test_spawn_sparse_clone_chain<R: Runner>(runner: R)
+    where
+        R::Context: Spawner + Clock,
+    {
+        runner.start(|context| async move {
+            let (leaf_started_tx, leaf_started_rx) = oneshot::channel();
+            let (leaf_handle_tx, leaf_handle_rx) = oneshot::channel();
+
+            let parent = context.clone().spawn({
+                move |context| async move {
+                    let clone1 = context.clone();
+                    let clone2 = clone1.clone();
+                    let clone3 = clone2.clone();
+
+                    let leaf = clone3.clone().spawn({
+                        move |_| async move {
+                            leaf_started_tx.send(()).unwrap();
+                            pending::<()>().await;
+                        }
+                    });
+
+                    leaf_handle_tx
+                        .send(leaf)
+                        .unwrap_or_else(|_| panic!("leaf handle receiver dropped"));
+                    pending::<()>().await;
+                }
+            });
+
+            leaf_started_rx.await.unwrap();
+            let leaf_handle = leaf_handle_rx.await.unwrap();
+
+            parent.abort();
+            assert!(parent.await.is_err());
+            assert!(leaf_handle.await.is_err());
         });
     }
 
@@ -948,75 +1709,176 @@ mod tests {
         R::Context: Spawner,
     {
         runner.start(|context| async move {
-            let handle = context.spawn_blocking(dedicated, |_| 42);
+            let context = if dedicated {
+                context.dedicated()
+            } else {
+                context.shared(true)
+            };
+
+            let handle = context.spawn(|_| async move { 42 });
             let result = handle.await;
             assert!(matches!(result, Ok(42)));
         });
     }
 
-    fn test_spawn_blocking_ref<R: Runner>(runner: R, dedicated: bool)
+    fn test_spawn_blocking_panic<R: Runner>(runner: R, dedicated: bool)
     where
-        R::Context: Spawner,
-    {
-        runner.start(|mut context| async move {
-            let spawn = context.spawn_blocking_ref(dedicated);
-            let handle = spawn(|| 42);
-            let result = handle.await;
-            assert!(matches!(result, Ok(42)));
-        });
-    }
-
-    fn test_spawn_blocking_ref_duplicate<R: Runner>(runner: R, dedicated: bool)
-    where
-        R::Context: Spawner,
-    {
-        runner.start(|mut context| async move {
-            let spawn = context.spawn_blocking_ref(dedicated);
-            let result = spawn(|| 42).await;
-            assert!(matches!(result, Ok(42)));
-
-            // Ensure context is consumed
-            context.spawn_blocking(dedicated, |_| 42);
-        });
-    }
-
-    fn test_spawn_blocking_abort<R: Runner>(runner: R, dedicated: bool)
-    where
-        R::Context: Spawner,
+        R::Context: Spawner + Clock,
     {
         runner.start(|context| async move {
-            // Create task
-            let (sender, mut receiver) = oneshot::channel();
-            let handle = context.spawn_blocking(dedicated, move |_| {
-                // Wait for abort to be called
-                loop {
-                    if receiver.try_recv().is_ok() {
-                        break;
-                    }
-                }
+            let context = if dedicated {
+                context.dedicated()
+            } else {
+                context.shared(true)
+            };
 
-                // Perform a long-running operation
-                let mut count = 0;
-                loop {
-                    count += 1;
-                    if count >= 100_000_000 {
-                        break;
-                    }
-                }
-                count
+            context.clone().spawn(|_| async move {
+                panic!("blocking task panicked");
             });
 
-            // Abort the task
-            //
-            // If there was an `.await` prior to sending a message over the oneshot, this test
-            // could deadlock (depending on the runtime implementation) because the blocking task
-            // would never yield (preventing send from being called).
-            handle.abort();
-            sender.send(()).unwrap();
-
-            // Wait for the task to complete
-            assert!(matches!(handle.await, Ok(100_000_000)));
+            // Loop until panic
+            loop {
+                context.sleep(Duration::from_millis(100)).await;
+            }
         });
+    }
+
+    fn test_spawn_blocking_panic_caught<R: Runner>(runner: R, dedicated: bool)
+    where
+        R::Context: Spawner + Clock,
+    {
+        let result: Result<(), Error> = runner.start(|context| async move {
+            let context = if dedicated {
+                context.dedicated()
+            } else {
+                context.shared(true)
+            };
+
+            let handle = context.clone().spawn(|_| async move {
+                panic!("blocking task panicked");
+            });
+            handle.await
+        });
+        assert!(matches!(result, Err(Error::Exited)));
+    }
+
+    fn test_circular_reference_prevents_cleanup<R: Runner>(runner: R) {
+        runner.start(|_| async move {
+            // Setup tracked resource
+            let dropper = Arc::new(());
+            let executor = deterministic::Runner::default();
+            executor.start({
+                let dropper = dropper.clone();
+                move |context| async move {
+                    // Create tasks with circular dependencies through channels
+                    let (mut setup_tx, mut setup_rx) = mpsc::unbounded::<()>();
+                    let (mut tx1, mut rx1) = mpsc::unbounded::<()>();
+                    let (mut tx2, mut rx2) = mpsc::unbounded::<()>();
+
+                    // Task 1 holds tx2 and waits on rx1
+                    context.with_label("task1").spawn({
+                        let mut setup_tx = setup_tx.clone();
+                        let dropper = dropper.clone();
+                        move |_| async move {
+                            // Setup deadlock and mark ready
+                            tx2.send(()).await.unwrap();
+                            rx1.next().await.unwrap();
+                            setup_tx.send(()).await.unwrap();
+
+                            // Wait forever
+                            while rx1.next().await.is_some() {}
+                            drop(tx2);
+                            drop(dropper);
+                        }
+                    });
+
+                    // Task 2 holds tx1 and waits on rx2
+                    context.with_label("task2").spawn(move |_| async move {
+                        // Setup deadlock and mark ready
+                        tx1.send(()).await.unwrap();
+                        rx2.next().await.unwrap();
+                        setup_tx.send(()).await.unwrap();
+
+                        // Wait forever
+                        while rx2.next().await.is_some() {}
+                        drop(tx1);
+                        drop(dropper);
+                    });
+
+                    // Wait for tasks to start
+                    setup_rx.next().await.unwrap();
+                    setup_rx.next().await.unwrap();
+                }
+            });
+
+            // After runtime drop, both tasks should be cleaned up
+            Arc::try_unwrap(dropper).expect("references remaining");
+        });
+    }
+
+    fn test_late_waker<R: Runner>(runner: R)
+    where
+        R::Context: Metrics + Spawner,
+    {
+        // A future that captures its waker and sends it to the caller, then
+        // stays pending forever.
+        struct CaptureWaker {
+            tx: Option<oneshot::Sender<Waker>>,
+            sent: bool,
+        }
+        impl Future for CaptureWaker {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut TContext<'_>) -> Poll<Self::Output> {
+                if !self.sent {
+                    if let Some(tx) = self.tx.take() {
+                        // Send a clone of the current task's waker to the root
+                        let _ = tx.send(cx.waker().clone());
+                    }
+                    self.sent = true;
+                }
+                Poll::Pending
+            }
+        }
+
+        // A guard that wakes the captured waker on drop.
+        struct WakeOnDrop(Option<Waker>);
+        impl Drop for WakeOnDrop {
+            fn drop(&mut self) {
+                if let Some(w) = self.0.take() {
+                    w.wake_by_ref();
+                }
+            }
+        }
+
+        // Run the executor to completion
+        let holder = runner.start(|context| async move {
+            // Wire a oneshot to receive the task waker.
+            let (tx, rx) = oneshot::channel::<Waker>();
+
+            // Spawn a task that registers its waker and then stays pending.
+            context
+                .with_label("capture-waker")
+                .spawn(move |_| async move {
+                    CaptureWaker {
+                        tx: Some(tx),
+                        sent: false,
+                    }
+                    .await;
+                });
+
+            // Ensure the spawned task runs and registers its waker.
+            utils::reschedule().await;
+
+            // Receive the waker from the spawned task.
+            let waker = rx.await.expect("waker not received");
+
+            // Return a guard that will wake after the runtime has dropped.
+            WakeOnDrop(Some(waker))
+        });
+
+        // Dropping the guard after the runtime has torn down will trigger a wake on
+        // a task whose executor has been dropped.
+        drop(holder);
     }
 
     fn test_metrics<R: Runner>(runner: R)
@@ -1081,20 +1943,41 @@ mod tests {
     }
 
     #[test]
+    fn test_deterministic_clock_timeout() {
+        let executor = deterministic::Runner::default();
+        test_clock_timeout(executor);
+    }
+
+    #[test]
     fn test_deterministic_root_finishes() {
         let executor = deterministic::Runner::default();
         test_root_finishes(executor);
     }
 
     #[test]
-    fn test_deterministic_spawn_abort() {
+    fn test_deterministic_spawn_after_abort() {
         let executor = deterministic::Runner::default();
-        test_spawn_abort(executor);
+        test_spawn_after_abort(executor);
     }
 
     #[test]
+    fn test_deterministic_spawn_abort() {
+        let executor = deterministic::Runner::default();
+        test_spawn_abort(executor, false, false);
+    }
+
+    #[test]
+    #[should_panic(expected = "blah")]
     fn test_deterministic_panic_aborts_root() {
         let runner = deterministic::Runner::default();
+        test_panic_aborts_root(runner);
+    }
+
+    #[test]
+    #[should_panic(expected = "blah")]
+    fn test_deterministic_panic_aborts_root_caught() {
+        let cfg = deterministic::Config::default().with_catch_panics(true);
+        let runner = deterministic::Runner::new(cfg);
         test_panic_aborts_root(runner);
     }
 
@@ -1103,6 +1986,27 @@ mod tests {
     fn test_deterministic_panic_aborts_spawn() {
         let executor = deterministic::Runner::default();
         test_panic_aborts_spawn(executor);
+    }
+
+    #[test]
+    fn test_deterministic_panic_aborts_spawn_caught() {
+        let cfg = deterministic::Config::default().with_catch_panics(true);
+        let executor = deterministic::Runner::new(cfg);
+        test_panic_aborts_spawn_caught(executor);
+    }
+
+    #[test]
+    #[should_panic(expected = "boom")]
+    fn test_deterministic_multiple_panics() {
+        let executor = deterministic::Runner::default();
+        test_multiple_panics(executor);
+    }
+
+    #[test]
+    fn test_deterministic_multiple_panics_caught() {
+        let cfg = deterministic::Config::default().with_catch_panics(true);
+        let executor = deterministic::Runner::new(cfg);
+        test_multiple_panics_caught(executor);
     }
 
     #[test]
@@ -1127,6 +2031,12 @@ mod tests {
     fn test_deterministic_blob_read_write() {
         let executor = deterministic::Runner::default();
         test_blob_read_write(executor);
+    }
+
+    #[test]
+    fn test_deterministic_blob_resize() {
+        let executor = deterministic::Runner::default();
+        test_blob_resize(executor);
     }
 
     #[test]
@@ -1155,23 +2065,75 @@ mod tests {
     }
 
     #[test]
-    fn test_deterministic_spawn_ref() {
+    fn test_deterministic_shutdown_multiple_signals() {
         let executor = deterministic::Runner::default();
-        test_spawn_ref(executor);
+        test_shutdown_multiple_signals(executor);
     }
 
     #[test]
-    #[should_panic]
-    fn test_deterministic_spawn_ref_duplicate() {
+    fn test_deterministic_shutdown_timeout() {
         let executor = deterministic::Runner::default();
-        test_spawn_ref_duplicate(executor);
+        test_shutdown_timeout(executor);
     }
 
     #[test]
-    #[should_panic]
-    fn test_deterministic_spawn_duplicate() {
+    fn test_deterministic_shutdown_multiple_stop_calls() {
         let executor = deterministic::Runner::default();
-        test_spawn_duplicate(executor);
+        test_shutdown_multiple_stop_calls(executor);
+    }
+
+    #[test]
+    fn test_deterministic_unfulfilled_shutdown() {
+        let executor = deterministic::Runner::default();
+        test_unfulfilled_shutdown(executor);
+    }
+
+    #[test]
+    fn test_deterministic_spawn_dedicated() {
+        let executor = deterministic::Runner::default();
+        test_spawn_dedicated(executor);
+    }
+
+    #[test]
+    fn test_deterministic_spawn() {
+        let runner = deterministic::Runner::default();
+        test_spawn(runner);
+    }
+
+    #[test]
+    fn test_deterministic_spawn_abort_on_parent_abort() {
+        let runner = deterministic::Runner::default();
+        test_spawn_abort_on_parent_abort(runner);
+    }
+
+    #[test]
+    fn test_deterministic_spawn_abort_on_parent_completion() {
+        let runner = deterministic::Runner::default();
+        test_spawn_abort_on_parent_completion(runner);
+    }
+
+    #[test]
+    fn test_deterministic_spawn_cascading_abort() {
+        let runner = deterministic::Runner::default();
+        test_spawn_cascading_abort(runner);
+    }
+
+    #[test]
+    fn test_deterministic_child_survives_sibling_completion() {
+        let runner = deterministic::Runner::default();
+        test_child_survives_sibling_completion(runner);
+    }
+
+    #[test]
+    fn test_deterministic_spawn_clone_chain() {
+        let runner = deterministic::Runner::default();
+        test_spawn_clone_chain(runner);
+    }
+
+    #[test]
+    fn test_deterministic_spawn_sparse_clone_chain() {
+        let runner = deterministic::Runner::default();
+        test_spawn_sparse_clone_chain(runner);
     }
 
     #[test]
@@ -1187,38 +2149,37 @@ mod tests {
     fn test_deterministic_spawn_blocking_panic() {
         for dedicated in [false, true] {
             let executor = deterministic::Runner::default();
-            executor.start(|context| async move {
-                let handle = context.spawn_blocking(dedicated, |_| {
-                    panic!("blocking task panicked");
-                });
-                handle.await.unwrap();
-            });
+            test_spawn_blocking_panic(executor, dedicated);
+        }
+    }
+
+    #[test]
+    fn test_deterministic_spawn_blocking_panic_caught() {
+        for dedicated in [false, true] {
+            let cfg = deterministic::Config::default().with_catch_panics(true);
+            let executor = deterministic::Runner::new(cfg);
+            test_spawn_blocking_panic_caught(executor, dedicated);
         }
     }
 
     #[test]
     fn test_deterministic_spawn_blocking_abort() {
-        for dedicated in [false, true] {
+        for (dedicated, blocking) in [(false, true), (true, false)] {
             let executor = deterministic::Runner::default();
-            test_spawn_blocking_abort(executor, dedicated);
+            test_spawn_abort(executor, dedicated, blocking);
         }
     }
 
     #[test]
-    fn test_deterministic_spawn_blocking_ref() {
-        for dedicated in [false, true] {
-            let executor = deterministic::Runner::default();
-            test_spawn_blocking_ref(executor, dedicated);
-        }
+    fn test_deterministic_circular_reference_prevents_cleanup() {
+        let executor = deterministic::Runner::default();
+        test_circular_reference_prevents_cleanup(executor);
     }
 
     #[test]
-    #[should_panic]
-    fn test_deterministic_spawn_blocking_ref_duplicate() {
-        for dedicated in [false, true] {
-            let executor = deterministic::Runner::default();
-            test_spawn_blocking_ref_duplicate(executor, dedicated);
-        }
+    fn test_deterministic_late_waker() {
+        let executor = deterministic::Runner::default();
+        test_late_waker(executor);
     }
 
     #[test]
@@ -1253,27 +2214,70 @@ mod tests {
     }
 
     #[test]
+    fn test_tokio_clock_timeout() {
+        let executor = tokio::Runner::default();
+        test_clock_timeout(executor);
+    }
+
+    #[test]
     fn test_tokio_root_finishes() {
         let executor = tokio::Runner::default();
         test_root_finishes(executor);
     }
 
     #[test]
-    fn test_tokio_spawn_abort() {
+    fn test_tokio_spawn_after_abort() {
         let executor = tokio::Runner::default();
-        test_spawn_abort(executor);
+        test_spawn_after_abort(executor);
     }
 
     #[test]
+    fn test_tokio_spawn_abort() {
+        let executor = tokio::Runner::default();
+        test_spawn_abort(executor, false, false);
+    }
+
+    #[test]
+    #[should_panic(expected = "blah")]
     fn test_tokio_panic_aborts_root() {
         let executor = tokio::Runner::default();
         test_panic_aborts_root(executor);
     }
 
     #[test]
+    #[should_panic(expected = "blah")]
+    fn test_tokio_panic_aborts_root_caught() {
+        let cfg = tokio::Config::default().with_catch_panics(true);
+        let executor = tokio::Runner::new(cfg);
+        test_panic_aborts_root(executor);
+    }
+
+    #[test]
+    #[should_panic(expected = "blah")]
     fn test_tokio_panic_aborts_spawn() {
         let executor = tokio::Runner::default();
         test_panic_aborts_spawn(executor);
+    }
+
+    #[test]
+    fn test_tokio_panic_aborts_spawn_caught() {
+        let cfg = tokio::Config::default().with_catch_panics(true);
+        let executor = tokio::Runner::new(cfg);
+        test_panic_aborts_spawn_caught(executor);
+    }
+
+    #[test]
+    #[should_panic(expected = "boom")]
+    fn test_tokio_multiple_panics() {
+        let executor = tokio::Runner::default();
+        test_multiple_panics(executor);
+    }
+
+    #[test]
+    fn test_tokio_multiple_panics_caught() {
+        let cfg = tokio::Config::default().with_catch_panics(true);
+        let executor = tokio::Runner::new(cfg);
+        test_multiple_panics_caught(executor);
     }
 
     #[test]
@@ -1298,6 +2302,12 @@ mod tests {
     fn test_tokio_blob_read_write() {
         let executor = tokio::Runner::default();
         test_blob_read_write(executor);
+    }
+
+    #[test]
+    fn test_tokio_blob_resize() {
+        let executor = tokio::Runner::default();
+        test_blob_resize(executor);
     }
 
     #[test]
@@ -1326,23 +2336,75 @@ mod tests {
     }
 
     #[test]
-    fn test_tokio_spawn_ref() {
+    fn test_tokio_shutdown_multiple_signals() {
         let executor = tokio::Runner::default();
-        test_spawn_ref(executor);
+        test_shutdown_multiple_signals(executor);
     }
 
     #[test]
-    #[should_panic]
-    fn test_tokio_spawn_ref_duplicate() {
+    fn test_tokio_shutdown_timeout() {
         let executor = tokio::Runner::default();
-        test_spawn_ref_duplicate(executor);
+        test_shutdown_timeout(executor);
     }
 
     #[test]
-    #[should_panic]
-    fn test_tokio_spawn_duplicate() {
+    fn test_tokio_shutdown_multiple_stop_calls() {
         let executor = tokio::Runner::default();
-        test_spawn_duplicate(executor);
+        test_shutdown_multiple_stop_calls(executor);
+    }
+
+    #[test]
+    fn test_tokio_unfulfilled_shutdown() {
+        let executor = tokio::Runner::default();
+        test_unfulfilled_shutdown(executor);
+    }
+
+    #[test]
+    fn test_tokio_spawn_dedicated() {
+        let executor = tokio::Runner::default();
+        test_spawn_dedicated(executor);
+    }
+
+    #[test]
+    fn test_tokio_spawn() {
+        let runner = tokio::Runner::default();
+        test_spawn(runner);
+    }
+
+    #[test]
+    fn test_tokio_spawn_abort_on_parent_abort() {
+        let runner = tokio::Runner::default();
+        test_spawn_abort_on_parent_abort(runner);
+    }
+
+    #[test]
+    fn test_tokio_spawn_abort_on_parent_completion() {
+        let runner = tokio::Runner::default();
+        test_spawn_abort_on_parent_completion(runner);
+    }
+
+    #[test]
+    fn test_tokio_spawn_cascading_abort() {
+        let runner = tokio::Runner::default();
+        test_spawn_cascading_abort(runner);
+    }
+
+    #[test]
+    fn test_tokio_child_survives_sibling_completion() {
+        let runner = tokio::Runner::default();
+        test_child_survives_sibling_completion(runner);
+    }
+
+    #[test]
+    fn test_tokio_spawn_clone_chain() {
+        let runner = tokio::Runner::default();
+        test_spawn_clone_chain(runner);
+    }
+
+    #[test]
+    fn test_tokio_spawn_sparse_clone_chain() {
+        let runner = tokio::Runner::default();
+        test_spawn_sparse_clone_chain(runner);
     }
 
     #[test]
@@ -1354,42 +2416,41 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "blocking task panicked")]
     fn test_tokio_spawn_blocking_panic() {
         for dedicated in [false, true] {
             let executor = tokio::Runner::default();
-            executor.start(|context| async move {
-                let handle = context.spawn_blocking(dedicated, |_| {
-                    panic!("blocking task panicked");
-                });
-                let result = handle.await;
-                assert!(matches!(result, Err(Error::Exited)));
-            });
+            test_spawn_blocking_panic(executor, dedicated);
+        }
+    }
+
+    #[test]
+    fn test_tokio_spawn_blocking_panic_caught() {
+        for dedicated in [false, true] {
+            let cfg = tokio::Config::default().with_catch_panics(true);
+            let executor = tokio::Runner::new(cfg);
+            test_spawn_blocking_panic_caught(executor, dedicated);
         }
     }
 
     #[test]
     fn test_tokio_spawn_blocking_abort() {
-        for dedicated in [false, true] {
+        for (dedicated, blocking) in [(false, true), (true, false)] {
             let executor = tokio::Runner::default();
-            test_spawn_blocking_abort(executor, dedicated);
+            test_spawn_abort(executor, dedicated, blocking);
         }
     }
 
     #[test]
-    fn test_tokio_spawn_blocking_ref() {
-        for dedicated in [false, true] {
-            let executor = tokio::Runner::default();
-            test_spawn_blocking_ref(executor, dedicated);
-        }
+    fn test_tokio_circular_reference_prevents_cleanup() {
+        let executor = tokio::Runner::default();
+        test_circular_reference_prevents_cleanup(executor);
     }
 
     #[test]
-    #[should_panic]
-    fn test_tokio_spawn_blocking_ref_duplicate() {
-        for dedicated in [false, true] {
-            let executor = tokio::Runner::default();
-            test_spawn_blocking_ref_duplicate(executor, dedicated);
-        }
+    fn test_tokio_late_waker() {
+        let executor = tokio::Runner::default();
+        test_late_waker(executor);
     }
 
     #[test]
@@ -1403,6 +2464,37 @@ mod tests {
     fn test_tokio_metrics_label() {
         let executor = tokio::Runner::default();
         test_metrics_label(executor);
+    }
+
+    #[test]
+    fn test_tokio_process_rss_metric() {
+        let executor = tokio::Runner::default();
+        executor.start(|context| async move {
+            loop {
+                // Wait for RSS metric to be available
+                let metrics = context.encode();
+                if !metrics.contains("runtime_process_rss") {
+                    context.sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+
+                // Verify the RSS value is eventually populated (greater than 0)
+                for line in metrics.lines() {
+                    if line.starts_with("runtime_process_rss")
+                        && !line.starts_with("runtime_process_rss{")
+                    {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            let rss_value: i64 =
+                                parts[1].parse().expect("Failed to parse RSS value");
+                            if rss_value > 0 {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     #[test]
@@ -1466,7 +2558,7 @@ mod tests {
                 content_length: usize,
             ) -> Result<String, Error> {
                 let read = stream.recv(vec![0; content_length]).await?;
-                String::from_utf8(read.as_ref().to_vec()).map_err(|_| Error::ReadFailed)
+                String::from_utf8(read.into()).map_err(|_| Error::ReadFailed)
             }
 
             // Simulate a client connecting to the server
@@ -1486,8 +2578,7 @@ mod tests {
 
                     // Send a GET request to the server
                     let request = format!(
-                        "GET /metrics HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                        address
+                        "GET /metrics HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
                     );
                     sink.send(Bytes::from(request).to_vec()).await.unwrap();
 
@@ -1497,7 +2588,7 @@ mod tests {
 
                     // Read and parse headers
                     let headers = read_headers(&mut stream).await.unwrap();
-                    println!("Headers: {:?}", headers);
+                    println!("Headers: {headers:?}");
                     let content_length = headers
                         .get("content-length")
                         .unwrap()
@@ -1512,5 +2603,60 @@ mod tests {
             // Wait for the client task to complete
             client_handle.await.unwrap();
         });
+    }
+
+    #[test_collect_traces]
+    fn test_deterministic_instrument_tasks(traces: TraceStorage) {
+        let executor = deterministic::Runner::new(deterministic::Config::default());
+        executor.start(|context| async move {
+            context
+                .with_label("test")
+                .instrumented()
+                .spawn(|context| async move {
+                    tracing::info!(field = "test field", "test log");
+
+                    context
+                        .with_label("inner")
+                        .instrumented()
+                        .spawn(|_| async move {
+                            tracing::info!("inner log");
+                        })
+                        .await
+                        .unwrap();
+                })
+                .await
+                .unwrap();
+        });
+
+        let info_traces = traces.get_by_level(Level::INFO);
+        assert_eq!(info_traces.len(), 2);
+
+        // Outer log (single span)
+        info_traces
+            .expect_event_at_index(0, |event| {
+                event.metadata.expect_content_exact("test log")?;
+                event.metadata.expect_field_count(1)?;
+                event.metadata.expect_field_exact("field", "test field")?;
+                event.expect_span_count(1)?;
+                event.expect_span_at_index(0, |span| {
+                    span.expect_content_exact("task")?;
+                    span.expect_field_count(1)?;
+                    span.expect_field_exact("name", "test")
+                })
+            })
+            .unwrap();
+
+        info_traces
+            .expect_event_at_index(1, |event| {
+                event.metadata.expect_content_exact("inner log")?;
+                event.metadata.expect_field_count(0)?;
+                event.expect_span_count(1)?;
+                event.expect_span_at_index(0, |span| {
+                    span.expect_content_exact("task")?;
+                    span.expect_field_count(1)?;
+                    span.expect_field_exact("name", "test_inner")
+                })
+            })
+            .unwrap();
     }
 }

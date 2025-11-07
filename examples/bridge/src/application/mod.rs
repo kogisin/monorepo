@@ -8,20 +8,20 @@ use commonware_cryptography::{
         poly::Public,
         variant::{MinSig, Variant},
     },
+    ed25519::PublicKey,
     Hasher,
 };
-use commonware_utils::Array;
 
 mod actor;
 pub use actor::Application;
 use commonware_runtime::{Sink, Stream};
-use commonware_stream::public_key::Connection;
+use commonware_stream::{Receiver, Sender};
+use commonware_utils::set::Ordered;
 mod ingress;
-mod supervisor;
 
 /// Configuration for the application.
-pub struct Config<H: Hasher, Si: Sink, St: Stream, P: Array> {
-    pub indexer: Connection<Si, St>,
+pub struct Config<H: Hasher, Si: Sink, St: Stream> {
+    pub indexer: (Sender<Si>, Receiver<St>),
 
     /// Hashing scheme to use.
     pub hasher: H,
@@ -31,7 +31,7 @@ pub struct Config<H: Hasher, Si: Sink, St: Stream, P: Array> {
     pub other_public: <MinSig as Variant>::Public,
 
     /// Participants active in consensus.
-    pub participants: Vec<P>,
+    pub participants: Ordered<PublicKey>,
 
     pub share: group::Share,
 

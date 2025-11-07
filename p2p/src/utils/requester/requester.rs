@@ -1,11 +1,12 @@
 //! Requester for sending rate-limited requests to peers.
 
 use super::{Config, PeerLabel};
+use commonware_cryptography::PublicKey;
 use commonware_runtime::{
     telemetry::metrics::status::{CounterExt, Status},
     Clock, Metrics,
 };
-use commonware_utils::{Array, PrioritySet};
+use commonware_utils::PrioritySet;
 use either::Either;
 use governor::{
     clock::Clock as GClock, middleware::NoOpMiddleware, state::keyed::HashMapStateStore,
@@ -30,9 +31,9 @@ pub type ID = u64;
 /// of the most performant peers (based on our latency observations). To encourage
 /// exploration, set the value of `initial` to less than the expected latency of
 /// performant peers and/or periodically set `shuffle` in `request`.
-pub struct Requester<E: Clock + GClock + Rng + Metrics, P: Array> {
+pub struct Requester<E: Clock + GClock + Rng + Metrics, P: PublicKey> {
     context: E,
-    public_key: P,
+    me: Option<P>,
     metrics: super::Metrics,
     initial: Duration,
     timeout: Duration,
@@ -60,7 +61,7 @@ pub struct Requester<E: Clock + GClock + Rng + Metrics, P: Array> {
 /// this struct in case we want to `resolve` or `timeout` the request. This approach
 /// makes it impossible to forget to remove a handled request if it doesn't warrant
 /// updating the performance of the participant.
-pub struct Request<P: Array> {
+pub struct Request<P: PublicKey> {
     /// Unique identifier for the request.
     pub id: ID,
 
@@ -71,14 +72,16 @@ pub struct Request<P: Array> {
     start: SystemTime,
 }
 
-impl<E: Clock + GClock + Rng + Metrics, P: Array> Requester<E, P> {
+impl<E: Clock + GClock + Rng + Metrics, P: PublicKey> Requester<E, P> {
     /// Create a new requester.
     pub fn new(context: E, config: Config<P>) -> Self {
         let rate_limiter = RateLimiter::hashmap_with_clock(config.rate_limit, &context);
+
+        // TODO(#1833): Metrics should use embedded context
         let metrics = super::Metrics::init(context.clone());
         Self {
             context,
-            public_key: config.public_key,
+            me: config.me,
             metrics,
             initial: config.initial,
             timeout: config.timeout,
@@ -127,7 +130,7 @@ impl<E: Clock + GClock + Rng + Metrics, P: Array> Requester<E, P> {
         // Look for a participant that can handle request
         for (participant, _) in participant_iter {
             // Check if me
-            if *participant == self.public_key {
+            if Some(participant) == self.me.as_ref() {
                 continue;
             }
 
@@ -256,9 +259,8 @@ impl<E: Clock + GClock + Rng + Metrics, P: Array> Requester<E, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_cryptography::{Ed25519, Signer};
-    use commonware_runtime::deterministic;
-    use commonware_runtime::Runner;
+    use commonware_cryptography::{ed25519::PrivateKey, PrivateKeyExt as _, Signer as _};
+    use commonware_runtime::{deterministic, Runner};
     use commonware_utils::NZU32;
     use governor::Quota;
     use std::time::Duration;
@@ -269,11 +271,11 @@ mod tests {
         let executor = deterministic::Runner::seeded(0);
         executor.start(|context| async move {
             // Create requester
-            let scheme = Ed25519::from_seed(0);
+            let scheme = PrivateKey::from_seed(0);
             let me = scheme.public_key();
             let timeout = Duration::from_secs(5);
             let config = Config {
-                public_key: scheme.public_key(),
+                me: Some(scheme.public_key()),
                 rate_limit: Quota::per_second(NZU32!(1)),
                 initial: Duration::from_millis(100),
                 timeout,
@@ -291,7 +293,7 @@ mod tests {
             assert!(requester.handle(&me, 0).is_none());
 
             // Initialize requester
-            let other = Ed25519::from_seed(1).public_key();
+            let other = PrivateKey::from_seed(1).public_key();
             requester.reconcile(&[me.clone(), other.clone()]);
 
             // Get request
@@ -377,11 +379,11 @@ mod tests {
         let executor = deterministic::Runner::seeded(0);
         executor.start(|context| async move {
             // Create requester
-            let scheme = Ed25519::from_seed(0);
+            let scheme = PrivateKey::from_seed(0);
             let me = scheme.public_key();
             let timeout = Duration::from_secs(5);
             let config = Config {
-                public_key: scheme.public_key(),
+                me: Some(scheme.public_key()),
                 rate_limit: Quota::per_second(NZU32!(1)),
                 initial: Duration::from_millis(100),
                 timeout,
@@ -395,14 +397,14 @@ mod tests {
             assert_eq!(requester.next(), None);
 
             // Initialize requester
-            let other1 = Ed25519::from_seed(1).public_key();
-            let other2 = Ed25519::from_seed(2).public_key();
+            let other1 = PrivateKey::from_seed(1).public_key();
+            let other2 = PrivateKey::from_seed(2).public_key();
             requester.reconcile(&[me.clone(), other1.clone(), other2.clone()]);
 
             // Get request
             let (participant, id) = requester.request(false).expect("failed to get participant");
             assert_eq!(id, 0);
-            if participant == other2 {
+            if participant == other1 {
                 let request = requester
                     .handle(&participant, id)
                     .expect("failed to get request");
@@ -414,7 +416,7 @@ mod tests {
             // Get request
             let (participant, id) = requester.request(false).expect("failed to get participant");
             assert_eq!(id, 1);
-            if participant == other1 {
+            if participant == other2 {
                 context.sleep(Duration::from_millis(10)).await;
                 let request = requester
                     .handle(&participant, id)
@@ -432,14 +434,14 @@ mod tests {
 
             // Get request
             let (participant, id) = requester.request(false).expect("failed to get participant");
-            assert_eq!(participant, other1);
+            assert_eq!(participant, other2);
             assert_eq!(id, 2);
 
             // Cancel request
             assert!(requester.cancel(id).is_some());
 
             // Add another participant
-            let other3 = Ed25519::from_seed(3).public_key();
+            let other3 = PrivateKey::from_seed(3).public_key();
             requester.reconcile(&[me, other1, other2.clone(), other3.clone()]);
 
             // Get request (new should be prioritized because lower default time)

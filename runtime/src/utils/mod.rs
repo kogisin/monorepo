@@ -5,19 +5,43 @@ use crate::Runner;
 use crate::{Metrics, Spawner};
 #[cfg(test)]
 use futures::stream::{FuturesUnordered, StreamExt};
-use futures::{channel::oneshot, future::Shared, FutureExt};
-use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
+use futures::task::ArcWake;
+use rayon::{ThreadPool as RThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 use std::{
     any::Any,
     future::Future,
     pin::Pin,
+    sync::{Arc, Condvar, Mutex},
     task::{Context, Poll},
 };
 
 pub mod buffer;
+pub mod signal;
 
 mod handle;
 pub use handle::Handle;
+pub(crate) use handle::{Aborter, MetricHandle, Panicked, Panicker};
+
+mod cell;
+pub use cell::Cell as ContextCell;
+
+pub(crate) mod supervision;
+
+/// The execution mode of a task.
+#[derive(Copy, Clone, Debug)]
+pub enum Execution {
+    /// Task runs on a dedicated thread.
+    Dedicated,
+    /// Task runs on the shared executor. `true` marks short blocking work that should
+    /// use the runtime's blocking-friendly pool.
+    Shared(bool),
+}
+
+impl Default for Execution {
+    fn default() -> Self {
+        Self::Shared(false)
+    }
+}
 
 /// Yield control back to the runtime.
 pub async fn reschedule() {
@@ -48,104 +72,14 @@ fn extract_panic_message(err: &(dyn Any + Send)) -> String {
     } else if let Some(s) = err.downcast_ref::<String>() {
         s.clone()
     } else {
-        format!("{:?}", err)
+        format!("{err:?}")
     }
 }
 
-/// A one-time broadcast that can be awaited by many tasks. It is often used for
-/// coordinating shutdown across many tasks.
-///
-/// To minimize the overhead of tracking outstanding signals (which only return once),
-/// it is recommended to wait on a reference to it (i.e. `&mut signal`) instead of
-/// cloning it multiple times in a given task (i.e. in each iteration of a loop).
-pub type Signal = Shared<oneshot::Receiver<i32>>;
+/// A clone-able wrapper around a [rayon]-compatible thread pool.
+pub type ThreadPool = Arc<RThreadPool>;
 
-/// Coordinates a one-time signal across many tasks.
-///
-/// # Example
-///
-/// ## Basic Usage
-///
-/// ```rust
-/// use commonware_runtime::{Spawner, Runner, Signaler, deterministic};
-///
-/// let executor = deterministic::Runner::default();
-/// executor.start(|context| async move {
-///     // Setup signaler and get future
-///     let (mut signaler, signal) = Signaler::new();
-///
-///     // Signal shutdown
-///     signaler.signal(2);
-///
-///     // Wait for shutdown in task
-///     let sig = signal.await.unwrap();
-///     println!("Received signal: {}", sig);
-/// });
-/// ```
-///
-/// ## Advanced Usage
-///
-/// While `Futures::Shared` is efficient, there is still meaningful overhead
-/// to cloning it (i.e. in each iteration of a loop). To avoid
-/// a performance regression from introducing `Signaler`, it is recommended
-/// to wait on a reference to `Signal` (i.e. `&mut signal`).
-///
-/// ```rust
-/// use commonware_macros::select;
-/// use commonware_runtime::{Clock, Spawner, Runner, Signaler, deterministic, Metrics};
-/// use futures::channel::oneshot;
-/// use std::time::Duration;
-///
-/// let executor = deterministic::Runner::default();
-/// executor.start(|context| async move {
-///     // Setup signaler and get future
-///     let (mut signaler, mut signal) = Signaler::new();
-///
-///     // Loop on the signal until resolved
-///     let (tx, rx) = oneshot::channel();
-///     context.with_label("waiter").spawn(|context| async move {
-///         loop {
-///             // Wait for signal or sleep
-///             select! {
-///                  sig = &mut signal => {
-///                      println!("Received signal: {}", sig.unwrap());
-///                      break;
-///                  },
-///                  _ = context.sleep(Duration::from_secs(1)) => {},
-///             };
-///         }
-///         let _ = tx.send(());
-///     });
-///
-///     // Send signal
-///     signaler.signal(9);
-///
-///     // Wait for task
-///     rx.await.expect("shutdown signaled");
-/// });
-/// ```
-pub struct Signaler {
-    tx: Option<oneshot::Sender<i32>>,
-}
-
-impl Signaler {
-    /// Create a new `Signaler`.
-    ///
-    /// Returns a `Signaler` and a `Signal` that will resolve when `signal` is called.
-    pub fn new() -> (Self, Signal) {
-        let (tx, rx) = oneshot::channel();
-        (Self { tx: Some(tx) }, rx.shared())
-    }
-
-    /// Resolve the `Signal` for all waiters (if not already resolved).
-    pub fn signal(&mut self, value: i32) {
-        if let Some(stop_tx) = self.tx.take() {
-            let _ = stop_tx.send(value);
-        }
-    }
-}
-
-/// Creates a [rayon]-compatible thread pool with [Spawner::spawn_blocking].
+/// Creates a clone-able [rayon]-compatible thread pool with [Spawner::spawn].
 ///
 /// # Arguments
 /// - `context`: The runtime context implementing the [Spawner] trait.
@@ -157,17 +91,20 @@ pub fn create_pool<S: Spawner + Metrics>(
     context: S,
     concurrency: usize,
 ) -> Result<ThreadPool, ThreadPoolBuildError> {
-    ThreadPoolBuilder::new()
+    let pool = ThreadPoolBuilder::new()
         .num_threads(concurrency)
         .spawn_handler(move |thread| {
             // Tasks spawned in a thread pool are expected to run longer than any single
             // task and thus should be provisioned as a dedicated thread.
             context
                 .with_label("rayon-thread")
-                .spawn_blocking(true, move |_| thread.run());
+                .dedicated()
+                .spawn(move |_| async move { thread.run() });
             Ok(())
         })
-        .build()
+        .build()?;
+
+    Ok(Arc::new(pool))
 }
 
 /// Async reader–writer lock.
@@ -177,7 +114,7 @@ pub fn create_pool<S: Spawner + Metrics>(
 ///
 /// Usage:
 /// ```rust
-/// use commonware_runtime::{Spawner, Runner, Signaler, deterministic, RwLock};
+/// use commonware_runtime::{Spawner, Runner, deterministic, RwLock};
 ///
 /// let executor = deterministic::Runner::default();
 /// executor.start(|context| async move {
@@ -247,6 +184,46 @@ impl<T> RwLock<T> {
     }
 }
 
+/// Synchronization primitive that enables a thread to block until a waker delivers a signal.
+pub struct Blocker {
+    /// Tracks whether a wake-up signal has been delivered (even if wait has not started yet).
+    state: Mutex<bool>,
+    /// Condvar used to park and resume the thread when the signal flips to true.
+    cv: Condvar,
+}
+
+impl Blocker {
+    /// Create a new [Blocker].
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(false),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// Block the current thread until a waker delivers a signal.
+    pub fn wait(&self) {
+        // Use a loop to tolerate spurious wake-ups and only proceed once a real signal arrives.
+        let mut signaled = self.state.lock().unwrap();
+        while !*signaled {
+            signaled = self.cv.wait(signaled).unwrap();
+        }
+
+        // Reset the flag so subsequent waits park again until the next wake signal.
+        *signaled = false;
+    }
+}
+
+impl ArcWake for Blocker {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        let mut signaled = arc_self.state.lock().unwrap();
+        *signaled = true;
+
+        // Notify a single waiter so the blocked thread re-checks the flag.
+        arc_self.cv.notify_one();
+    }
+}
+
 #[cfg(test)]
 async fn task(i: usize) -> usize {
     for _ in 0..5 {
@@ -279,7 +256,9 @@ mod tests {
     use super::*;
     use crate::{deterministic, tokio, Metrics};
     use commonware_macros::test_traced;
+    use futures::task::waker;
     use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[test_traced]
     fn test_create_pool() {
@@ -318,5 +297,73 @@ mod tests {
             // Check the value
             assert_eq!(*w, 101);
         });
+    }
+
+    #[test]
+    fn test_blocker_waits_until_wake() {
+        let blocker = Blocker::new();
+        let started = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
+
+        let thread_blocker = blocker.clone();
+        let thread_started = started.clone();
+        let thread_completed = completed.clone();
+        let handle = std::thread::spawn(move || {
+            thread_started.store(true, Ordering::SeqCst);
+            thread_blocker.wait();
+            thread_completed.store(true, Ordering::SeqCst);
+        });
+
+        while !started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+
+        assert!(!completed.load(Ordering::SeqCst));
+        waker(blocker.clone()).wake();
+        handle.join().unwrap();
+        assert!(completed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_blocker_handles_pre_wake() {
+        let blocker = Blocker::new();
+        waker(blocker.clone()).wake();
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let thread_blocker = blocker.clone();
+        let thread_completed = completed.clone();
+        std::thread::spawn(move || {
+            thread_blocker.wait();
+            thread_completed.store(true, Ordering::SeqCst);
+        })
+        .join()
+        .unwrap();
+
+        assert!(completed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_blocker_reusable_across_signals() {
+        let blocker = Blocker::new();
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        let thread_blocker = blocker.clone();
+        let thread_completed = completed.clone();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                thread_blocker.wait();
+                thread_completed.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        for expected in 1..=2 {
+            waker(blocker.clone()).wake();
+            while completed.load(Ordering::SeqCst) < expected {
+                std::thread::yield_now();
+            }
+        }
+
+        handle.join().unwrap();
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
     }
 }

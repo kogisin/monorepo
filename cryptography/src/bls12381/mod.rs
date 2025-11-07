@@ -6,7 +6,12 @@
 //!
 //! - `portable`: Enables `portable` feature on `blst` (<https://github.com/supranational/blst?tab=readme-ov-file#platform-and-language-compatibility>).
 
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
+#[cfg(feature = "std")]
 pub mod dkg;
 pub mod primitives;
 mod scheme;
-pub use scheme::{Bls12381, Bls12381Batch, PrivateKey, PublicKey, Signature};
+pub mod tle;
+pub use scheme::{Batch, PrivateKey, PublicKey, Signature};

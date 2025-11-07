@@ -1,21 +1,27 @@
+#[cfg(not(feature = "iouring-network"))]
+use crate::network::tokio::{Config as TokioNetworkConfig, Network as TokioNetwork};
 #[cfg(feature = "iouring-storage")]
 use crate::storage::iouring::{Config as IoUringConfig, Storage as IoUringStorage};
-
-#[cfg(feature = "iouring-network")]
-use crate::network::iouring::Network as IoUringNetwork;
-
-#[cfg(not(feature = "iouring-network"))]
-use crate::network::tokio::Network as TokioNetwork;
-
 #[cfg(not(feature = "iouring-storage"))]
 use crate::storage::tokio::{Config as TokioStorageConfig, Storage as TokioStorage};
-
-use crate::network::metered::Network as MeteredNetwork;
-use crate::network::tokio::Config as TokioNetworkConfig;
-use crate::storage::metered::Storage as MeteredStorage;
-use crate::telemetry::metrics::task::Label;
-use crate::{utils::Signaler, Clock, Error, Handle, Signal, METRICS_PREFIX};
-use crate::{SinkOf, StreamOf};
+#[cfg(feature = "external")]
+use crate::Pacer;
+#[cfg(feature = "iouring-network")]
+use crate::{
+    iouring,
+    network::iouring::{Config as IoUringNetworkConfig, Network as IoUringNetwork},
+};
+use crate::{
+    network::metered::Network as MeteredNetwork,
+    process::metered::Metrics as MeteredProcess,
+    signal::Signal,
+    storage::metered::Storage as MeteredStorage,
+    telemetry::metrics::task::Label,
+    utils::{signal::Stopper, supervision::Tree, Panicker},
+    Clock, Error, Execution, Handle, SinkOf, StreamOf, METRICS_PREFIX,
+};
+use commonware_macros::select;
+use futures::{future::BoxFuture, FutureExt};
 use governor::clock::{Clock as GClock, ReasonablyRealtime};
 use prometheus_client::{
     encoding::text::encode,
@@ -29,9 +35,16 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
+    thread,
     time::{Duration, SystemTime},
 };
 use tokio::runtime::{Builder, Runtime};
+use tracing::{info_span, Instrument};
+
+#[cfg(feature = "iouring-network")]
+const IOURING_NETWORK_SIZE: u32 = 1024;
+#[cfg(feature = "iouring-network")]
+const IOURING_NETWORK_FORCE_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 struct Metrics {
@@ -56,6 +69,25 @@ impl Metrics {
             metrics.tasks_running.clone(),
         );
         metrics
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NetworkConfig {
+    /// If Some, explicitly sets TCP_NODELAY on the socket.
+    /// Otherwise uses system default.
+    tcp_nodelay: Option<bool>,
+
+    /// Read/write timeout for network operations.
+    read_write_timeout: Duration,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            tcp_nodelay: None,
+            read_write_timeout: Duration::from_secs(60),
+        }
     }
 }
 
@@ -89,21 +121,22 @@ pub struct Config {
     /// Tokio sets the default value to 2MB.
     maximum_buffer_size: usize,
 
-    network_cfg: TokioNetworkConfig,
+    /// Network configuration.
+    network_cfg: NetworkConfig,
 }
 
 impl Config {
     /// Returns a new [Config] with default values.
     pub fn new() -> Self {
         let rng = OsRng.next_u64();
-        let storage_directory = env::temp_dir().join(format!("commonware_tokio_runtime_{}", rng));
+        let storage_directory = env::temp_dir().join(format!("commonware_tokio_runtime_{rng}"));
         Self {
             worker_threads: 2,
             max_blocking_threads: 512,
-            catch_panics: true,
+            catch_panics: false,
             storage_directory,
             maximum_buffer_size: 2 * 1024 * 1024, // 2 MB
-            network_cfg: TokioNetworkConfig::default(),
+            network_cfg: NetworkConfig::default(),
         }
     }
 
@@ -124,18 +157,13 @@ impl Config {
         self
     }
     /// See [Config]
-    pub fn with_read_timeout(mut self, d: Duration) -> Self {
-        self.network_cfg = self.network_cfg.with_read_timeout(d);
-        self
-    }
-    /// See [Config]
-    pub fn with_write_timeout(mut self, d: Duration) -> Self {
-        self.network_cfg = self.network_cfg.with_write_timeout(d);
+    pub fn with_read_write_timeout(mut self, d: Duration) -> Self {
+        self.network_cfg.read_write_timeout = d;
         self
     }
     /// See [Config]
     pub fn with_tcp_nodelay(mut self, n: Option<bool>) -> Self {
-        self.network_cfg = self.network_cfg.with_tcp_nodelay(n);
+        self.network_cfg.tcp_nodelay = n;
         self
     }
     /// See [Config]
@@ -163,16 +191,12 @@ impl Config {
         self.catch_panics
     }
     /// See [Config]
-    pub fn read_timeout(&self) -> Duration {
-        self.network_cfg.read_timeout()
-    }
-    /// See [Config]
-    pub fn write_timeout(&self) -> Duration {
-        self.network_cfg.write_timeout()
+    pub fn read_write_timeout(&self) -> Duration {
+        self.network_cfg.read_write_timeout
     }
     /// See [Config]
     pub fn tcp_nodelay(&self) -> Option<bool> {
-        self.network_cfg.tcp_nodelay()
+        self.network_cfg.tcp_nodelay
     }
     /// See [Config]
     pub fn storage_directory(&self) -> &PathBuf {
@@ -192,12 +216,11 @@ impl Default for Config {
 
 /// Runtime based on [Tokio](https://tokio.rs).
 pub struct Executor {
-    cfg: Config,
     registry: Mutex<Registry>,
     metrics: Arc<Metrics>,
     runtime: Runtime,
-    signaler: Mutex<Signaler>,
-    signal: Signal,
+    shutdown: Mutex<Stopper>,
+    panicker: Panicker,
 }
 
 /// Implementation of [crate::Runner] for the `tokio` runtime.
@@ -238,15 +261,25 @@ impl crate::Runner for Runner {
             .enable_all()
             .build()
             .expect("failed to create Tokio runtime");
-        let (signaler, signal) = Signaler::new();
 
+        // Initialize panicker
+        let (panicker, panicked) = Panicker::new(self.cfg.catch_panics);
+
+        // Collect process metrics.
+        //
+        // We prefer to collect process metrics outside of `Context` because
+        // we are using `runtime_registry` rather than the one provided by `Context`.
+        let process = MeteredProcess::init(runtime_registry);
+        runtime.spawn(process.collect(tokio::time::sleep));
+
+        // Initialize storage
         cfg_if::cfg_if! {
             if #[cfg(feature = "iouring-storage")] {
                 let iouring_registry = runtime_registry.sub_registry_with_prefix("iouring_storage");
                 let storage = MeteredStorage::new(
                     IoUringStorage::start(IoUringConfig {
                         storage_directory: self.cfg.storage_directory.clone(),
-                        ring_config: Default::default(),
+                        iouring_config: Default::default(),
                     }, iouring_registry),
                     runtime_registry,
                 );
@@ -261,16 +294,31 @@ impl crate::Runner for Runner {
             }
         }
 
+        // Initialize network
         cfg_if::cfg_if! {
             if #[cfg(feature = "iouring-network")] {
                 let iouring_registry = runtime_registry.sub_registry_with_prefix("iouring_network");
+                let config = IoUringNetworkConfig {
+                    tcp_nodelay: self.cfg.network_cfg.tcp_nodelay,
+                    iouring_config: iouring::Config {
+                        // TODO (#1045): make `IOURING_NETWORK_SIZE` configurable
+                        size: IOURING_NETWORK_SIZE,
+                        op_timeout: Some(self.cfg.network_cfg.read_write_timeout),
+                        force_poll: IOURING_NETWORK_FORCE_POLL,
+                        shutdown_timeout: Some(self.cfg.network_cfg.read_write_timeout),
+                        ..Default::default()
+                    },
+                };
                 let network = MeteredNetwork::new(
-                    IoUringNetwork::start(crate::iouring::Config::default(),iouring_registry).unwrap(),
-                    runtime_registry,
-                );
-            } else {
+                    IoUringNetwork::start(config, iouring_registry).unwrap(),
+                runtime_registry,
+            );
+        } else {
+            let config = TokioNetworkConfig::default().with_read_timeout(self.cfg.network_cfg.read_write_timeout)
+                .with_write_timeout(self.cfg.network_cfg.read_write_timeout)
+                .with_tcp_nodelay(self.cfg.network_cfg.tcp_nodelay);
                 let network = MeteredNetwork::new(
-                    TokioNetwork::from(self.cfg.network_cfg.clone()),
+                    TokioNetwork::from(config),
                     runtime_registry,
                 );
             }
@@ -278,12 +326,11 @@ impl crate::Runner for Runner {
 
         // Initialize executor
         let executor = Arc::new(Executor {
-            cfg: self.cfg,
             registry: Mutex::new(registry),
             metrics,
             runtime,
-            signaler: Mutex::new(signaler),
-            signal,
+            shutdown: Mutex::new(Stopper::default()),
+            panicker,
         });
 
         // Get metrics
@@ -295,11 +342,13 @@ impl crate::Runner for Runner {
         let context = Context {
             storage,
             name: label.name(),
-            spawned: false,
             executor: executor.clone(),
             network,
+            tree: Tree::root(),
+            execution: Execution::default(),
+            instrumented: false,
         };
-        let output = executor.runtime.block_on(f(context));
+        let output = executor.runtime.block_on(panicked.interrupt(f(context)));
         gauge.dec();
 
         output
@@ -327,128 +376,142 @@ cfg_if::cfg_if! {
 /// runtime.
 pub struct Context {
     name: String,
-    spawned: bool,
     executor: Arc<Executor>,
     storage: Storage,
     network: Network,
+    tree: Arc<Tree>,
+    execution: Execution,
+    instrumented: bool,
 }
 
 impl Clone for Context {
     fn clone(&self) -> Self {
+        let (child, _) = Tree::child(&self.tree);
         Self {
             name: self.name.clone(),
-            spawned: false,
             executor: self.executor.clone(),
             storage: self.storage.clone(),
             network: self.network.clone(),
+
+            tree: child,
+            execution: Execution::default(),
+            instrumented: false,
         }
     }
 }
 
+impl Context {
+    /// Access the [Metrics] of the runtime.
+    fn metrics(&self) -> &Metrics {
+        &self.executor.metrics
+    }
+}
+
 impl crate::Spawner for Context {
-    fn spawn<F, Fut, T>(self, f: F) -> Handle<T>
+    fn dedicated(mut self) -> Self {
+        self.execution = Execution::Dedicated;
+        self
+    }
+
+    fn shared(mut self, blocking: bool) -> Self {
+        self.execution = Execution::Shared(blocking);
+        self
+    }
+
+    fn instrumented(mut self) -> Self {
+        self.instrumented = true;
+        self
+    }
+
+    fn spawn<F, Fut, T>(mut self, f: F) -> Handle<T>
     where
         F: FnOnce(Self) -> Fut + Send + 'static,
         Fut: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        // Ensure a context only spawns one task
-        assert!(!self.spawned, "already spawned");
-
         // Get metrics
-        let (_, gauge) = spawn_metrics!(self, future);
+        let (label, metric) = spawn_metrics!(self);
 
-        // Set up the task
-        let catch_panics = self.executor.cfg.catch_panics;
-        let executor = self.executor.clone();
-        let future = f(self);
-        let (f, handle) = Handle::init_future(future, gauge, catch_panics);
+        // Track supervision before resetting configuration
+        let parent = Arc::clone(&self.tree);
+        let past = self.execution;
+        let is_instrumented = self.instrumented;
+        self.execution = Execution::default();
+        self.instrumented = false;
+        let (child, aborted) = Tree::child(&parent);
+        if aborted {
+            return Handle::closed(metric);
+        }
+        self.tree = child;
 
         // Spawn the task
-        executor.runtime.spawn(f);
-        handle
-    }
-
-    fn spawn_ref<F, T>(&mut self) -> impl FnOnce(F) -> Handle<T> + 'static
-    where
-        F: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        // Ensure a context only spawns one task
-        assert!(!self.spawned, "already spawned");
-        self.spawned = true;
-
-        // Get metrics
-        let (_, gauge) = spawn_metrics!(self, future);
-
-        // Set up the task
         let executor = self.executor.clone();
-        move |f: F| {
-            let (f, handle) = Handle::init_future(f, gauge, executor.cfg.catch_panics);
-
-            // Spawn the task
-            executor.runtime.spawn(f);
-            handle
-        }
-    }
-
-    fn spawn_blocking<F, T>(self, dedicated: bool, f: F) -> Handle<T>
-    where
-        F: FnOnce(Self) -> T + Send + 'static,
-        T: Send + 'static,
-    {
-        // Ensure a context only spawns one task
-        assert!(!self.spawned, "already spawned");
-
-        // Get metrics
-        let (_, gauge) = spawn_metrics!(self, blocking, dedicated);
-
-        // Set up the task
-        let executor = self.executor.clone();
-        let (f, handle) = Handle::init_blocking(|| f(self), gauge, executor.cfg.catch_panics);
-
-        // Spawn the blocking task
-        if dedicated {
-            std::thread::spawn(f);
+        let future: BoxFuture<T> = if is_instrumented {
+            f(self)
+                .instrument(info_span!("task", name = %label.name()))
+                .boxed()
         } else {
-            executor.runtime.spawn_blocking(f);
+            f(self).boxed()
+        };
+        let (f, handle) = Handle::init(
+            future,
+            metric,
+            executor.panicker.clone(),
+            Arc::clone(&parent),
+        );
+
+        if matches!(past, Execution::Dedicated) {
+            thread::spawn({
+                // Ensure the task can access the tokio runtime
+                let handle = executor.runtime.handle().clone();
+                move || {
+                    handle.block_on(f);
+                }
+            });
+        } else if matches!(past, Execution::Shared(true)) {
+            executor.runtime.spawn_blocking({
+                // Ensure the task can access the tokio runtime
+                let handle = executor.runtime.handle().clone();
+                move || {
+                    handle.block_on(f);
+                }
+            });
+        } else {
+            executor.runtime.spawn(f);
         }
+
+        // Register the task on the parent
+        if let Some(aborter) = handle.aborter() {
+            parent.register(aborter);
+        }
+
         handle
     }
 
-    fn spawn_blocking_ref<F, T>(&mut self, dedicated: bool) -> impl FnOnce(F) -> Handle<T> + 'static
-    where
-        F: FnOnce() -> T + Send + 'static,
-        T: Send + 'static,
-    {
-        // Ensure a context only spawns one task
-        assert!(!self.spawned, "already spawned");
-        self.spawned = true;
+    async fn stop(self, value: i32, timeout: Option<Duration>) -> Result<(), Error> {
+        let stop_resolved = {
+            let mut shutdown = self.executor.shutdown.lock().unwrap();
+            shutdown.stop(value)
+        };
 
-        // Get metrics
-        let (_, gauge) = spawn_metrics!(self, blocking, dedicated);
-
-        // Set up the task
-        let executor = self.executor.clone();
-        move |f: F| {
-            let (f, handle) = Handle::init_blocking(f, gauge, executor.cfg.catch_panics);
-
-            // Spawn the blocking task
-            if dedicated {
-                std::thread::spawn(f);
-            } else {
-                executor.runtime.spawn_blocking(f);
+        // Wait for all tasks to complete or the timeout to fire
+        let timeout_future = match timeout {
+            Some(duration) => futures::future::Either::Left(self.sleep(duration)),
+            None => futures::future::Either::Right(futures::future::pending()),
+        };
+        select! {
+            result = stop_resolved => {
+                result.map_err(|_| Error::Closed)?;
+                Ok(())
+            },
+            _ = timeout_future => {
+                Err(Error::Timeout)
             }
-            handle
         }
-    }
-
-    fn stop(&self, value: i32) {
-        self.executor.signaler.lock().unwrap().signal(value);
     }
 
     fn stopped(&self) -> Signal {
-        self.executor.signal.clone()
+        self.executor.shutdown.lock().unwrap().stopped()
     }
 }
 
@@ -459,7 +522,7 @@ impl crate::Metrics for Context {
             if prefix.is_empty() {
                 label.to_string()
             } else {
-                format!("{}_{}", prefix, label)
+                format!("{prefix}_{label}")
             }
         };
         assert!(
@@ -468,10 +531,7 @@ impl crate::Metrics for Context {
         );
         Self {
             name,
-            spawned: false,
-            executor: self.executor.clone(),
-            storage: self.storage.clone(),
-            network: self.network.clone(),
+            ..self.clone()
         }
     }
 
@@ -520,6 +580,22 @@ impl Clock for Context {
         };
         let target_instant = tokio::time::Instant::now() + duration_until_deadline;
         tokio::time::sleep_until(target_instant)
+    }
+}
+
+#[cfg(feature = "external")]
+impl Pacer for Context {
+    fn pace<'a, F, T>(
+        &'a self,
+        _latency: Duration,
+        future: F,
+    ) -> impl Future<Output = T> + Send + 'a
+    where
+        F: Future<Output = T> + Send + 'a,
+        T: Send + 'a,
+    {
+        // Execute the future immediately
+        future
     }
 }
 

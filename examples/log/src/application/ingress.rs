@@ -1,14 +1,21 @@
-use commonware_consensus::{simplex::types::Context, Automaton as Au, Relay as Re};
-use commonware_cryptography::Digest;
+use commonware_consensus::{simplex::types::Context, types::Epoch, Automaton as Au, Relay as Re};
+use commonware_cryptography::{ed25519::PublicKey, Digest};
 use futures::{
     channel::{mpsc, oneshot},
     SinkExt,
 };
 
 pub enum Message<D: Digest> {
-    Genesis { response: oneshot::Sender<D> },
-    Propose { response: oneshot::Sender<D> },
-    Verify { response: oneshot::Sender<bool> },
+    Genesis {
+        epoch: Epoch,
+        response: oneshot::Sender<D>,
+    },
+    Propose {
+        response: oneshot::Sender<D>,
+    },
+    Verify {
+        response: oneshot::Sender<bool>,
+    },
 }
 
 /// Mailbox for the application.
@@ -25,18 +32,21 @@ impl<D: Digest> Mailbox<D> {
 
 impl<D: Digest> Au for Mailbox<D> {
     type Digest = D;
-    type Context = Context<Self::Digest>;
+    type Context = Context<Self::Digest, PublicKey>;
 
-    async fn genesis(&mut self) -> Self::Digest {
+    async fn genesis(&mut self, epoch: Epoch) -> Self::Digest {
         let (response, receiver) = oneshot::channel();
         self.sender
-            .send(Message::Genesis { response })
+            .send(Message::Genesis { epoch, response })
             .await
             .expect("Failed to send genesis");
         receiver.await.expect("Failed to receive genesis")
     }
 
-    async fn propose(&mut self, _: Context<Self::Digest>) -> oneshot::Receiver<Self::Digest> {
+    async fn propose(
+        &mut self,
+        _: Context<Self::Digest, PublicKey>,
+    ) -> oneshot::Receiver<Self::Digest> {
         // If we linked payloads to their parent, we would include
         // the parent in the `Context` in the payload.
         let (response, receiver) = oneshot::channel();
@@ -49,7 +59,7 @@ impl<D: Digest> Au for Mailbox<D> {
 
     async fn verify(
         &mut self,
-        _: Context<Self::Digest>,
+        _: Context<Self::Digest, PublicKey>,
         _: Self::Digest,
     ) -> oneshot::Receiver<bool> {
         // Digests are already verified by consensus, so we don't need to check they are valid.

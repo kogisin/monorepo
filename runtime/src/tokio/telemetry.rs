@@ -11,6 +11,7 @@ use axum::{
     routing::get,
     serve, Extension, Router,
 };
+use cfg_if::cfg_if;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tracing::Level;
@@ -30,6 +31,9 @@ pub struct Logging {
 }
 
 /// Initialize telemetry with the given configuration.
+///
+/// If `metrics` is provided, starts serving metrics at the given address at `/metrics`.
+/// If `traces` is provided, enables OpenTelemetry trace export.
 pub fn init(
     context: Context,
     logging: Logging,
@@ -50,7 +54,7 @@ pub fn init(
     let log_layer = if logging.json {
         log_layer.json().boxed()
     } else {
-        log_layer.pretty().boxed()
+        log_layer.compact().boxed()
     };
 
     // Create OpenTelemetry layer for tracing
@@ -59,11 +63,24 @@ pub fn init(
         tracing_opentelemetry::layer().with_tracer(tracer)
     });
 
+    // Create tracing registry.
+    cfg_if! {
+        if #[cfg(feature = "tokio-console")] {
+            let console_layer = console_subscriber::spawn();
+            let registry = Registry::default()
+                .with(filter)
+                .with(log_layer)
+                .with(trace_layer)
+                .with(console_layer);
+        } else {
+            let registry = Registry::default()
+                .with(filter)
+                .with(log_layer)
+                .with(trace_layer);
+        }
+    }
+
     // Set the global subscriber
-    let registry = Registry::default()
-        .with(filter)
-        .with(log_layer)
-        .with(trace_layer);
     tracing::subscriber::set_global_default(registry).expect("Failed to set subscriber");
 
     // Expose metrics over HTTP

@@ -14,10 +14,14 @@ use super::{
     Error,
 };
 use crate::bls12381::primitives::poly::{compute_weights, prepare_evaluations};
+#[cfg(not(feature = "std"))]
+use alloc::{borrow::Cow, collections::BTreeMap, vec, vec::Vec};
 use commonware_codec::Encode;
 use commonware_utils::union_unique;
-use rand::RngCore;
+use rand_core::CryptoRngCore;
+#[cfg(feature = "std")]
 use rayon::{prelude::*, ThreadPoolBuilder};
+#[cfg(feature = "std")]
 use std::{borrow::Cow, collections::BTreeMap};
 
 /// Computes the public key from the private key.
@@ -28,8 +32,8 @@ pub fn compute_public<V: Variant>(private: &Scalar) -> V::Public {
 }
 
 /// Returns a new keypair derived from the provided randomness.
-pub fn keypair<R: RngCore, V: Variant>(rng: &mut R) -> (group::Private, V::Public) {
-    let private = group::Private::rand(rng);
+pub fn keypair<R: CryptoRngCore, V: Variant>(rng: &mut R) -> (group::Private, V::Public) {
+    let private = group::Private::from_rand(rng);
     let public = compute_public::<V>(&private);
     (private, public)
 }
@@ -39,6 +43,18 @@ pub fn keypair<R: RngCore, V: Variant>(rng: &mut R) -> (group::Private, V::Publi
 pub fn hash_message<V: Variant>(dst: DST, message: &[u8]) -> V::Signature {
     let mut hm = V::Signature::zero();
     hm.map(dst, message);
+    hm
+}
+
+/// Hashes the provided message with the domain separation tag (DST) and namespace to
+/// the curve.
+pub fn hash_message_namespace<V: Variant>(
+    dst: DST,
+    namespace: &[u8],
+    message: &[u8],
+) -> V::Signature {
+    let mut hm = V::Signature::zero();
+    hm.map(dst, &union_unique(namespace, message));
     hm
 }
 
@@ -238,10 +254,9 @@ where
     // Sum the hashed messages
     let mut hm_sum = V::Signature::zero();
     for (namespace, msg) in messages {
-        let mut hm = V::Signature::zero();
-        match namespace {
-            Some(namespace) => hm.map(V::MESSAGE, &union_unique(namespace, msg)),
-            None => hm.map(V::MESSAGE, msg),
+        let hm = match namespace {
+            Some(namespace) => hash_message_namespace::<V>(V::MESSAGE, namespace, msg),
+            None => hash_message::<V>(V::MESSAGE, msg),
         };
         hm_sum.add(&hm);
     }
@@ -457,6 +472,7 @@ where
 pub fn threshold_signature_recover_multiple<'a, V, I>(
     threshold: u32,
     mut many_evals: Vec<I>,
+    #[cfg_attr(not(feature = "std"), allow(unused_variables))] concurrency: usize,
 ) -> Result<Vec<V::Signature>, Error>
 where
     V: Variant,
@@ -487,18 +503,53 @@ where
         .collect::<Vec<_>>();
     let weights = compute_weights(indices)?;
 
-    // Recover signatures
-    let mut signatures = Vec::with_capacity(prepared_evals.len());
-    for evals in prepared_evals {
-        let signature = threshold_signature_recover_with_weights::<V, _>(&weights, evals)?;
-        signatures.push(signature);
+    #[cfg(not(feature = "std"))]
+    return prepared_evals
+        .into_iter()
+        .map(|evals| {
+            threshold_signature_recover_with_weights::<V, _>(&weights, evals.iter().cloned())
+        })
+        .collect();
+
+    #[cfg(feature = "std")]
+    {
+        let concurrency = core::cmp::min(concurrency, prepared_evals.len());
+        if concurrency == 1 {
+            return prepared_evals
+                .into_iter()
+                .map(|evals| {
+                    threshold_signature_recover_with_weights::<V, _>(
+                        &weights,
+                        evals.iter().cloned(),
+                    )
+                })
+                .collect();
+        }
+
+        // Build a thread pool with the specified concurrency
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(concurrency)
+            .build()
+            .expect("Unable to build thread pool");
+
+        // Recover signatures
+        pool.install(move || {
+            prepared_evals
+                .par_iter()
+                .map(|evals| {
+                    threshold_signature_recover_with_weights::<V, _>(
+                        &weights,
+                        evals.iter().cloned(),
+                    )
+                })
+                .collect()
+        })
     }
-    Ok(signatures)
 }
 
 /// Recovers a pair of signatures from two sets of at least `threshold` partial signatures.
 ///
-/// This is just a wrapper around `threshold_signature_recover_multiple`.
+/// This is just a wrapper around `threshold_signature_recover_multiple` with concurrency set to 2.
 pub fn threshold_signature_recover_pair<'a, V, I>(
     threshold: u32,
     first: I,
@@ -509,7 +560,7 @@ where
     I: IntoIterator<Item = &'a PartialSignature<V>>,
     V::Signature: 'a,
 {
-    let mut sigs = threshold_signature_recover_multiple::<V, _>(threshold, vec![first, second])?;
+    let mut sigs = threshold_signature_recover_multiple::<V, _>(threshold, vec![first, second], 2)?;
     let second_sig = sigs.pop().unwrap();
     let first_sig = sigs.pop().unwrap();
     Ok((first_sig, second_sig))
@@ -601,45 +652,33 @@ pub fn aggregate_verify_multiple_messages<'a, V, I>(
     public: &V::Public,
     messages: I,
     signature: &V::Signature,
-    concurrency: usize,
+    #[cfg_attr(not(feature = "std"), allow(unused_variables))] concurrency: usize,
 ) -> Result<(), Error>
 where
     V: Variant,
-    I: IntoIterator<Item = &'a (Option<&'a [u8]>, &'a [u8])>
-        + IntoParallelIterator<Item = &'a (Option<&'a [u8]>, &'a [u8])>
-        + Send
-        + Sync,
+    I: IntoIterator<Item = &'a (Option<&'a [u8]>, &'a [u8])> + Send + Sync,
+    I::IntoIter: Send + Sync,
 {
+    #[cfg(not(feature = "std"))]
+    let hm_sum = compute_hm_sum::<V, I>(messages);
+
+    #[cfg(feature = "std")]
     let hm_sum = if concurrency == 1 {
-        // Avoid pool overhead when concurrency is 1
-        let mut hm_sum = V::Signature::zero();
-        for (namespace, msg) in messages {
-            let mut hm = V::Signature::zero();
-            match namespace {
-                Some(namespace) => hm.map(V::MESSAGE, &union_unique(namespace, msg)),
-                None => hm.map(V::MESSAGE, msg),
-            };
-            hm_sum.add(&hm);
-        }
-        hm_sum
+        compute_hm_sum::<V, I>(messages)
     } else {
-        // Build a thread pool with the specified concurrency
         let pool = ThreadPoolBuilder::new()
             .num_threads(concurrency)
             .build()
             .expect("Unable to build thread pool");
 
-        // Perform hashing to curve and summation of messages in parallel
+        // TODO(#1496): Revisit use of `.par_bridge()`
         pool.install(move || {
             messages
-                .into_par_iter()
-                .map(|(namespace, msg)| {
-                    let mut hm = V::Signature::zero();
-                    match namespace {
-                        Some(namespace) => hm.map(V::MESSAGE, &union_unique(namespace, msg)),
-                        None => hm.map(V::MESSAGE, msg),
-                    };
-                    hm
+                .into_iter()
+                .par_bridge()
+                .map(|(namespace, msg)| match namespace {
+                    Some(namespace) => hash_message_namespace::<V>(V::MESSAGE, namespace, msg),
+                    None => hash_message::<V>(V::MESSAGE, msg),
                 })
                 .reduce(V::Signature::zero, |mut sum, hm| {
                     sum.add(&hm);
@@ -648,8 +687,24 @@ where
         })
     };
 
-    // Verify the signature
     V::verify(public, &hm_sum, signature)
+}
+
+/// Computes the sum over the hash of each message.
+fn compute_hm_sum<'a, V, I>(messages: I) -> V::Signature
+where
+    V: Variant,
+    I: IntoIterator<Item = &'a (Option<&'a [u8]>, &'a [u8])>,
+{
+    let mut hm_sum = V::Signature::zero();
+    for (namespace, msg) in messages {
+        let hm = match namespace {
+            Some(namespace) => hash_message_namespace::<V>(V::MESSAGE, namespace, msg),
+            None => hash_message::<V>(V::MESSAGE, msg),
+        };
+        hm_sum.add(&hm);
+    }
+    hm_sum
 }
 
 #[cfg(test)]
@@ -1589,7 +1644,7 @@ mod tests {
 
         // Corrupt a share
         let share = shares.get_mut(3).unwrap();
-        share.private = Private::rand(&mut rand::thread_rng());
+        share.private = Private::from_rand(&mut rand::thread_rng());
 
         // Generate the partial signatures
         let namespace = Some(&b"test"[..]);
@@ -1654,7 +1709,7 @@ mod tests {
 
         // Corrupt the second share's private key
         let corrupted_index = 1;
-        shares[corrupted_index].private = Private::rand(&mut rng);
+        shares[corrupted_index].private = Private::from_rand(&mut rng);
 
         // Generate partial signatures
         let partials: Vec<_> = shares
@@ -1701,7 +1756,7 @@ mod tests {
         // Corrupt shares at indices 1 and 3
         let corrupted_indices = vec![1, 3];
         for &idx in &corrupted_indices {
-            shares[idx].private = Private::rand(&mut rng);
+            shares[idx].private = Private::from_rand(&mut rng);
         }
 
         // Generate partial signatures
@@ -1814,7 +1869,7 @@ mod tests {
         let namespace = Some(&b"test"[..]);
         let msg = b"hello";
 
-        shares[0].private = Private::rand(&mut rng);
+        shares[0].private = Private::from_rand(&mut rng);
 
         let partials: Vec<_> = shares
             .iter()
@@ -1850,7 +1905,7 @@ mod tests {
         let msg = b"hello";
 
         let corrupted_index = n - 1;
-        shares[corrupted_index as usize].private = Private::rand(&mut rng);
+        shares[corrupted_index as usize].private = Private::from_rand(&mut rng);
 
         let partials: Vec<_> = shares
             .iter()
@@ -2366,5 +2421,97 @@ mod tests {
         // Fail batch verification with a manipulated signature
         signatures[0].add(&<MinPk as Variant>::Signature::one());
         assert!(MinPk::batch_verify(&mut OsRng, &publics, &hms, &signatures).is_err());
+    }
+
+    fn threshold_derive_missing_partials<V: Variant>() {
+        // Helper to compute the Lagrange basis polynomial l_i(x) evaluated at a specific point `eval_at_x`.
+        fn lagrange_coeff(eval_x: u32, i_x: u32, x_coords: &[u32]) -> Scalar {
+            // Initialize the numerator and denominator.
+            let mut num = Scalar::one();
+            let mut den = Scalar::one();
+
+            // Initialize the evaluation point and the index.
+            let eval_x = Scalar::from_index(eval_x);
+            let xi = Scalar::from_index(i_x);
+
+            // Compute the Lagrange coefficients.
+            for &j_x in x_coords {
+                // Skip if the index is the same.
+                if i_x == j_x {
+                    continue;
+                }
+
+                // Initialize the other index.
+                let xj = Scalar::from_index(j_x);
+
+                // Numerator: product over j!=i of (eval_x - x_j)
+                let mut term = eval_x.clone();
+                term.sub(&xj);
+                num.mul(&term);
+
+                // Denominator: product over j!=i of (x_i - x_j)
+                let mut diff = xi.clone();
+                diff.sub(&xj);
+                den.mul(&diff);
+            }
+
+            // The result is num / den
+            num.mul(&den.inverse().expect("should not have duplicate indices"));
+            num
+        }
+
+        // Generate the public polynomial and the private shares for n participants.
+        let mut rng = StdRng::seed_from_u64(0);
+        let (n, t) = (5, quorum(5));
+        let (public, shares) = generate_shares::<_, V>(&mut rng, None, n, t);
+
+        // Produce partial signatures for every participant.
+        let namespace = Some(&b"test"[..]);
+        let msg = b"hello";
+        let all_partials: Vec<_> = shares
+            .iter()
+            .map(|s| partial_sign_message::<V>(s, namespace, msg))
+            .collect();
+
+        // Take the first `t` partials to use for deriving the others.
+        let recovery_partials: Vec<_> = all_partials.iter().take(t as usize).collect();
+        let recovery_indices: Vec<u32> = recovery_partials.iter().map(|p| p.index).collect();
+
+        // For each participant, derive their partial signature from the recovery set.
+        //
+        // The derived signature is a linear combination of the recovery signatures:
+        // s_target = sum_{i in recovery_set} s_i * l_i(target_x)
+        for target in &shares {
+            // Get the target index.
+            let target = target.index;
+
+            // Compute the Lagrange coefficients (the scalars) for this combination.
+            let scalars: Vec<Scalar> = recovery_indices
+                .iter()
+                .map(|&recovery_index| lagrange_coeff(target, recovery_index, &recovery_indices))
+                .collect();
+
+            // We then use MSM (Multi-Scalar Multiplication) to compute the sum efficiently.
+            let points: Vec<_> = recovery_partials.iter().map(|p| p.value).collect();
+            let derived = <V as Variant>::Signature::msm(&points, &scalars);
+            let derived = Eval {
+                index: target,
+                value: derived,
+            };
+
+            // Verify that the derived partial signature is cryptographically valid.
+            partial_verify_message::<V>(&public, namespace, msg, &derived)
+                .expect("derived signature should be valid");
+
+            // Verify that the derived signature matches the one originally created.
+            let original = all_partials.iter().find(|p| p.index == target).unwrap();
+            assert_eq!(derived.value, original.value);
+        }
+    }
+
+    #[test]
+    fn test_threshold_derive_missing_partials() {
+        threshold_derive_missing_partials::<MinPk>();
+        threshold_derive_missing_partials::<MinSig>();
     }
 }

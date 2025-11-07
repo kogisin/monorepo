@@ -8,8 +8,8 @@
 //! `usize` is the lone exception: since most values refer to a length or size
 //! of an object in memory, values are biased towards smaller values. Therefore,
 //! it uses variable-length (varint) encoding to save space.  This means that
-//! it **does not implement [`FixedSize`]**.  When decoding a `usize`, callers
-//! must supply a [`RangeCfg`] to bound the allowable value — this protects
+//! it **does not implement [FixedSize]**.  When decoding a `usize`, callers
+//! must supply a [RangeCfg] to bound the allowable value — this protects
 //! against denial-of-service attacks that would allocate oversized buffers.
 //!
 //! ## Safety & portability
@@ -37,13 +37,13 @@ macro_rules! impl_numeric {
             type Cfg = ();
             #[inline]
             fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, Error> {
-                at_least(buf, std::mem::size_of::<$type>())?;
+                at_least(buf, core::mem::size_of::<$type>())?;
                 Ok(buf.$read_method())
             }
         }
 
         impl FixedSize for $type {
-            const SIZE: usize = std::mem::size_of::<$type>();
+            const SIZE: usize = core::mem::size_of::<$type>();
         }
     };
 }
@@ -71,7 +71,7 @@ impl Write for usize {
 }
 
 impl Read for usize {
-    type Cfg = RangeCfg;
+    type Cfg = RangeCfg<usize>;
 
     #[inline]
     fn read_cfg(buf: &mut impl Buf, range: &Self::Cfg) -> Result<Self, Error> {
@@ -140,6 +140,24 @@ impl<const N: usize> FixedSize for [u8; N] {
     const SIZE: usize = N;
 }
 
+impl Write for () {
+    #[inline]
+    fn write(&self, _buf: &mut impl BufMut) {}
+}
+
+impl Read for () {
+    type Cfg = ();
+
+    #[inline]
+    fn read_cfg(_buf: &mut impl Buf, _cfg: &Self::Cfg) -> Result<Self, Error> {
+        Ok(())
+    }
+}
+
+impl FixedSize for () {
+    const SIZE: usize = 0;
+}
+
 // Option implementation
 impl<T: Write> Write for Option<T> {
     #[inline]
@@ -187,7 +205,7 @@ mod tests {
             paste! {
                 #[test]
                 fn [<test_ $type>]() {
-                    let expected_len = std::mem::size_of::<$type>();
+                    let expected_len = core::mem::size_of::<$type>();
                     let values: [$type; 5] =
                         [0 as $type, 1 as $type, 42 as $type, <$type>::MAX, <$type>::MIN];
                     for value in values.iter() {
@@ -299,6 +317,13 @@ mod tests {
         let none: Option<u32> = None;
         assert_eq!(none.encode_size(), 1);
         assert_eq!(none.encode().len(), 1);
+    }
+
+    #[test]
+    fn test_unit() {
+        let x = ();
+        // Not using an equality check, since that will always pass.
+        assert!(<()>::decode(x.encode()).is_ok());
     }
 
     #[test]

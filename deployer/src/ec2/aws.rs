@@ -1,22 +1,26 @@
 //! AWS EC2 SDK function wrappers
 
-use super::{MEMLEAK_PORT, METRICS_PORT, SYSTEM_PORT};
+use super::{METRICS_PORT, SYSTEM_PORT};
 use crate::ec2::{
     utils::{exact_cidr, DEPLOYER_MAX_PORT, DEPLOYER_MIN_PORT, DEPLOYER_PROTOCOL, RETRY_INTERVAL},
     PortConfig,
 };
 use aws_config::BehaviorVersion;
 pub use aws_config::Region;
-use aws_sdk_ec2::error::BuildError;
-use aws_sdk_ec2::primitives::Blob;
-use aws_sdk_ec2::types::{
-    BlockDeviceMapping, EbsBlockDevice, Filter, InstanceStateName, ResourceType, SecurityGroup,
-    SummaryStatus, Tag, TagSpecification, VpcPeeringConnectionStateReasonCode,
-};
 pub use aws_sdk_ec2::types::{InstanceType, IpPermission, IpRange, UserIdGroupPair, VolumeType};
-use aws_sdk_ec2::{Client as Ec2Client, Error as Ec2Error};
-use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use aws_sdk_ec2::{
+    error::BuildError,
+    primitives::Blob,
+    types::{
+        BlockDeviceMapping, EbsBlockDevice, Filter, InstanceStateName, ResourceType, SecurityGroup,
+        SummaryStatus, Tag, TagSpecification, VpcPeeringConnectionStateReasonCode,
+    },
+    Client as Ec2Client, Error as Ec2Error,
+};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 use tokio::time::sleep;
 
 /// Creates an EC2 client for the specified AWS region
@@ -244,7 +248,7 @@ pub async fn create_security_group_binary(
 ) -> Result<String, Ec2Error> {
     let sg_resp = client
         .create_security_group()
-        .group_name(format!("{}-binary", tag))
+        .group_name(format!("{tag}-binary"))
         .description("Security group for binary instances")
         .vpc_id(vpc_id)
         .tag_specifications(
@@ -284,18 +288,6 @@ pub async fn create_security_group_binary(
                 .ip_protocol("tcp")
                 .from_port(SYSTEM_PORT as i32)
                 .to_port(SYSTEM_PORT as i32)
-                .ip_ranges(
-                    IpRange::builder()
-                        .cidr_ip(exact_cidr(monitoring_ip))
-                        .build(),
-                )
-                .build(),
-        )
-        .ip_permissions(
-            IpPermission::builder()
-                .ip_protocol("tcp")
-                .from_port(MEMLEAK_PORT as i32)
-                .to_port(MEMLEAK_PORT as i32)
                 .ip_ranges(
                     IpRange::builder()
                         .cidr_ip(exact_cidr(monitoring_ip))
@@ -858,8 +850,7 @@ pub async fn assert_arm64_support(
     for instance_type in instance_types {
         if !supported_instance_types.contains(instance_type) {
             return Err(Ec2Error::from(BuildError::other(format!(
-                "instance type {} not ARM64-based",
-                instance_type
+                "instance type {instance_type} not ARM64-based"
             ))));
         }
     }
@@ -912,8 +903,7 @@ pub async fn find_availability_zone(
 
     // If no availability zone supports all instance types, return an error
     Err(Ec2Error::from(BuildError::other(format!(
-        "no availability zone supports all required instance types: {:?}",
-        instance_types
+        "no availability zone supports all required instance types: {instance_types:?}"
     ))))
 }
 

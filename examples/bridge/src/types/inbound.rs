@@ -1,7 +1,8 @@
 use super::block::BlockFormat;
+use crate::Scheme;
 use bytes::{Buf, BufMut};
 use commonware_codec::{EncodeSize, Error, FixedSize, Read, ReadExt, Write};
-use commonware_consensus::threshold_simplex::types::Finalization;
+use commonware_consensus::simplex::types::Finalization;
 use commonware_cryptography::{
     bls12381::primitives::variant::{MinSig, Variant},
     Digest,
@@ -152,7 +153,7 @@ pub struct PutFinalization<D: Digest> {
     /// The network identifier for which the finality certificate belongs.
     pub network: <MinSig as Variant>::Public,
     /// The finality certificate
-    pub finalization: Finalization<MinSig, D>,
+    pub finalization: Finalization<Scheme, D>,
 }
 
 impl<D: Digest> Write for PutFinalization<D> {
@@ -213,12 +214,12 @@ impl EncodeSize for GetFinalization {
 mod tests {
     use super::*;
     use commonware_codec::{DecodeExt, Encode};
-    use commonware_consensus::threshold_simplex::types::Proposal;
+    use commonware_consensus::{
+        simplex::{signing_scheme::bls12381_threshold, types::Proposal},
+        types::Round,
+    };
     use commonware_cryptography::{
-        bls12381::primitives::{
-            group::{self, Element},
-            variant::MinSig,
-        },
+        bls12381::primitives::group::{self, Element},
         sha256::Digest as Sha256Digest,
     };
     use rand::thread_rng;
@@ -233,25 +234,27 @@ mod tests {
 
     fn new_group_public() -> <MinSig as Variant>::Public {
         let mut result = <MinSig as Variant>::Public::one();
-        let scalar = group::Scalar::rand(&mut thread_rng());
+        let scalar = group::Scalar::from_rand(&mut thread_rng());
         result.mul(&scalar);
         result
     }
 
-    fn new_finalization() -> Finalization<MinSig, Sha256Digest> {
-        let scalar = group::Scalar::rand(&mut thread_rng());
+    fn new_finalization() -> Finalization<Scheme, Sha256Digest> {
+        let scalar = group::Scalar::from_rand(&mut thread_rng());
         let mut proposal_signature = <MinSig as Variant>::Signature::one();
         proposal_signature.mul(&scalar);
         let mut seed_signature = <MinSig as Variant>::Signature::one();
         seed_signature.mul(&scalar);
         Finalization {
             proposal: Proposal {
-                view: 12345,
+                round: Round::new(333, 12345),
                 parent: 54321,
                 payload: new_digest(),
             },
-            proposal_signature,
-            seed_signature,
+            certificate: bls12381_threshold::Signature::<MinSig> {
+                vote_signature: proposal_signature,
+                seed_signature,
+            },
         }
     }
 
